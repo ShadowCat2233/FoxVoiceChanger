@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "components": [
+    {
+      "id": "fox-engine-windowsml",
+      "version": "0.1.0",
+      "kind": "engine",
+      "backend": "windowsMl",
+      "installDirectory": "engines/windowsml/0.1.0",
+      "conflictGroup": "realtime-engine",
+      "required": true,
+      "supportedVendors": ["nvidia", "amd", "intel", "unknown"],
+      "artifacts": []
+    },
+    {
+      "id": "fox-engine-tensorrt",
+      "version": "0.1.0",
+      "kind": "engine",
+      "backend": "tensorRt",
+      "installDirectory": "engines/tensorrt/0.1.0",
+      "conflictGroup": "realtime-engine",
+      "required": false,
+      "supportedVendors": ["nvidia"],
+      "artifacts": []
+    },
+    {
+      "id": "fox-engine-cuda",
+      "version": "0.1.0",
+      "kind": "engine",
+      "backend": "cuda",
+      "installDirectory": "engines/cuda/0.1.0",
+      "conflictGroup": "realtime-engine",
+      "required": false,
+      "supportedVendors": ["nvidia"],
+      "artifacts": []
+    },
+    {
+      "id": "fox-model-converter",
+      "version": "0.1.0",
+      "kind": "tool",
+      "backend": null,
+      "installDirectory": "tools/model-converter/0.1.0",
+      "conflictGroup": null,
+      "required": false,
+      "supportedVendors": ["nvidia", "amd", "intel", "unknown"],
+      "artifacts": []
+    }
+  ]
+}
+
