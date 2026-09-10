@@ -17,4 +17,9 @@ foxvoice-ipc = { path = "../foxvoice-ipc" }
 foxvoice-models = { path = "../foxvoice-models" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+ureq = "3.4.1"
+
+[dev-dependencies]
+tempfile = "3.23.0"

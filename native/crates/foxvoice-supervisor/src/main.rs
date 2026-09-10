@@ -1,4 +1,7 @@
-use std::{env, io::Cursor, path::PathBuf, thread, time::Duration};
+use std::{env, io::Cursor, path::PathBuf};
+
+#[cfg(feature = "wasapi")]
+use std::{thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use foxvoice_audio::audio_ring_buffer;
@@ -8,7 +11,10 @@ use foxvoice_contracts::{
 };
 use foxvoice_ipc::{read_frame, write_frame};
 use foxvoice_models::ModelLibrary;
-use foxvoice_supervisor::{ComponentManifest, GameGuard, detect_hardware, recommend_engine};
+use foxvoice_supervisor::{
+    ComponentManifest, GameGuard, detect_hardware, foundation_model_status, foundation_root,
+    install_foundation_models, recommend_engine,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -43,6 +49,7 @@ fn run() -> Result<()> {
         "ipc-demo" => print_ipc_demo(),
         "audio-buffer-demo" => print_audio_buffer_demo(),
         "models" => run_models_command(),
+        "foundation-models" => run_foundation_models_command(),
         #[cfg(feature = "wasapi")]
         "audio-devices" => print_audio_devices(),
         #[cfg(feature = "wasapi")]
@@ -50,7 +57,7 @@ fn run() -> Result<()> {
         #[cfg(feature = "wasapi")]
         "bypass-run" => run_bypass_forever(),
         _ => bail!(
-            "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo, models{}",
+            "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo, models, foundation-models{}",
             if cfg!(feature = "wasapi") {
                 ", audio-devices, bypass-test, bypass-run"
             } else {
@@ -58,6 +65,21 @@ fn run() -> Result<()> {
             }
         ),
     }
+}
+
+fn run_foundation_models_command() -> Result<()> {
+    let action = env::args().nth(2).unwrap_or_else(|| "status".into());
+    let root = foundation_root()?;
+    let states = match action.as_str() {
+        "status" => foundation_model_status(&root)?,
+        "install" => install_foundation_models(
+            &root,
+            env::args().any(|argument| argument == "--accept-gpl"),
+        )?,
+        _ => bail!("用法: foxvoice-supervisor foundation-models status|install --accept-gpl"),
+    };
+    println!("{}", serde_json::to_string_pretty(&states)?);
+    Ok(())
 }
 
 fn availability() -> EngineAvailability {

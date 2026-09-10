@@ -44,6 +44,8 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- audio-buff
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models list
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models import C:\path\voice.onnx
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models huggingface https://huggingface.co/owner/repo/resolve/main/voice.onnx
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models status
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models install --accept-gpl
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
 ```
 
@@ -71,3 +73,5 @@ commit: 2c3b57661c4a38f56e64c521a71e65dc68db5895
 ```
 
 在完成 API、许可证和实时性能审计前，不直接将上游 `main` 作为可变构建依赖。
+RVC 基础模型默认位于 `%LOCALAPPDATA%\FoxVoice\components\rvc-foundation`。安装命令只在
+显式传入 `--accept-gpl` 后执行，并校验上游公布的文件大小和 SHA-256；权重不进入发布包。

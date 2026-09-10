@@ -25,10 +25,13 @@ public partial class MainWindow : Window
     private bool _recovering;
     private bool _ready;
     private bool _suppressDeviceSelection;
+    private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
+    private readonly Button _installFoundationButton = new() { Content = "安装基础模型", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
 
     public MainWindow()
     {
         InitializeComponent();
+        AddFoundationModelsCard();
         _settings = UserSettings.Load();
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
@@ -81,6 +84,8 @@ public partial class MainWindow : Window
         catch (Exception error) { failures.Add($"模型库：{FriendlyError(error)}"); }
         try { await RefreshDoctorAsync(); }
         catch (Exception error) { failures.Add($"硬件诊断：{FriendlyError(error)}"); }
+        try { await RefreshFoundationModelsAsync(applyPaths: true); }
+        catch (Exception error) { failures.Add($"基础模型：{FriendlyError(error)}"); }
 
         if (failures.Count == 0)
         {
@@ -155,6 +160,87 @@ public partial class MainWindow : Window
         HardwareText.Text = string.Join(" · ", adapters!);
         var allOk = root.GetProperty("checks").EnumerateArray().All(check => check.GetProperty("ok").GetBoolean());
         DoctorStateText.Text = allOk ? "自检通过" : "需要处理";
+    }
+
+    private async Task<bool> RefreshFoundationModelsAsync(bool applyPaths)
+    {
+        using var document = JsonDocument.Parse(await RunSupervisorAsync("foundation-models", "status"));
+        var entries = document.RootElement.EnumerateArray().ToList();
+        var contentVec = entries.First(item => item.GetProperty("id").GetString() == "contentvec");
+        var rmvpe = entries.First(item => item.GetProperty("id").GetString() == "rmvpe");
+        var ready = contentVec.GetProperty("verified").GetBoolean()
+            && rmvpe.GetProperty("verified").GetBoolean();
+        _foundationStateText.Text = ready ? "已校验" : "未安装";
+        _foundationStateText.Foreground = ready
+            ? (Brush)FindResource("SuccessBrush")
+            : new SolidColorBrush(Color.FromRgb(249, 200, 106));
+        _installFoundationButton.Content = ready ? "重新校验" : "安装基础模型";
+        if (ready && applyPaths)
+        {
+            EmbedderPath.Text = contentVec.GetProperty("path").GetString() ?? "";
+            F0Path.Text = rmvpe.GetProperty("path").GetString() ?? "";
+            TrySaveSettings();
+        }
+        return ready;
+    }
+
+    private async void InstallFoundationModels_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (await RefreshFoundationModelsAsync(applyPaths: true))
+            {
+                FooterStatus.Text = "ContentVec 与 RMVPE 文件和 SHA-256 均已校验";
+                return;
+            }
+            var answer = MessageBox.Show(this,
+                "将从 Hugging Face 的 wok000/weights_gpl 仓库下载 ContentVec 与 RMVPE，共约 741 MB。\n\n" +
+                "这些权重采用 GPL-3.0，不属于 FoxVoice 的 MIT 代码，也不会打包进 FoxVoice。继续表示你接受上游许可。",
+                "安装 RVC 基础模型", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+            if (answer != MessageBoxResult.OK) return;
+            _installFoundationButton.IsEnabled = false;
+            FooterStatus.Text = "正在下载并校验基础模型（约 741 MB），请勿关闭程序…";
+            await RunSupervisorAsync("foundation-models", "install", "--accept-gpl");
+            await RefreshFoundationModelsAsync(applyPaths: true);
+            FooterStatus.Text = "RVC 基础模型安装完成，来源、大小与 SHA-256 已校验";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+        finally { _installFoundationButton.IsEnabled = true; }
+    }
+
+    private void AddFoundationModelsCard()
+    {
+        _installFoundationButton.Click += InstallFoundationModels_Click;
+        var copy = new StackPanel { Margin = new Thickness(12, 0, 0, 0) };
+        copy.Children.Add(new TextBlock { Text = "RVC 基础模型", FontWeight = FontWeights.SemiBold, FontSize = 16 });
+        copy.Children.Add(new TextBlock
+        {
+            Text = "ContentVec + RMVPE · 上游 GPL-3.0 · 按需下载并校验",
+            Foreground = (Brush)FindResource("TextSecondary")
+        });
+        var action = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
+        action.Children.Add(_foundationStateText);
+        action.Children.Add(_installFoundationButton);
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+        var icon = new TextBlock
+        {
+            Text = "\uE8F1", FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 23,
+            Foreground = (Brush)FindResource("AccentPurple"), VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(copy, 1);
+        Grid.SetColumn(action, 2);
+        grid.Children.Add(icon);
+        grid.Children.Add(copy);
+        grid.Children.Add(action);
+        var card = new Border
+        {
+            Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 0, 0, 10), Child = grid
+        };
+        if (ComponentsView.Content is StackPanel root && root.Children.OfType<StackPanel>().LastOrDefault() is StackPanel list)
+            list.Children.Insert(1, card);
     }
 
     private void Navigation_Checked(object sender, RoutedEventArgs e)
