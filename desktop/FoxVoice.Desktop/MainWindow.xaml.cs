@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Microsoft.Win32;
 
 namespace FoxVoice.Desktop;
@@ -15,6 +16,7 @@ public partial class MainWindow : Window
     private const double DefaultProcessingBudgetMs = 160.0;
     private readonly UserSettings _settings;
     private readonly SemaphoreSlim _engineInputLock = new(1, 1);
+    private readonly DispatcherTimer _deviceRefreshTimer = new() { Interval = TimeSpan.FromSeconds(10) };
     private Process? _audioProcess;
     private Process? _monitorProcess;
     private StreamWriter? _engineInput;
@@ -33,6 +35,7 @@ public partial class MainWindow : Window
     private ulong _guardLastUnderruns;
     private ulong _guardLastStreamErrors;
     private bool _guardCommandPending;
+    private bool _refreshingDevices;
     private AudioDevice? _virtualCableInput;
     private readonly ComboBox _monitorDeviceCombo = new() { DisplayMemberPath = "Name", Margin = new Thickness(0, 6, 0, 12) };
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
@@ -56,11 +59,13 @@ public partial class MainWindow : Window
         MonitorToggle.IsEnabled = false;
         MonitorToggle.ToolTip = "选择虚拟声卡为主输出后，可独立监听到物理耳机";
         UpdateLiveControlLabels();
+        _deviceRefreshTimer.Tick += DeviceRefreshTimer_Tick;
 
         Loaded += MainWindow_Loaded;
         Closing += (_, _) =>
         {
             TrySaveSettings();
+            _deviceRefreshTimer.Stop();
             StopAudioProcess();
             StopMonitorProcess();
         };
@@ -70,6 +75,16 @@ public partial class MainWindow : Window
     {
         _ready = true;
         await RefreshAllAsync();
+        _deviceRefreshTimer.Start();
+    }
+
+    private async void DeviceRefreshTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_refreshingDevices || _audioProcess is { HasExited: false } || DeviceOverlay.Visibility == Visibility.Visible) return;
+        _refreshingDevices = true;
+        try { await RefreshDevicesAsync(); }
+        catch (Exception error) { FooterStatus.Text = $"设备热插拔检测失败：{FriendlyError(error)}"; }
+        finally { _refreshingDevices = false; }
     }
 
     private async Task RefreshAllAsync()
