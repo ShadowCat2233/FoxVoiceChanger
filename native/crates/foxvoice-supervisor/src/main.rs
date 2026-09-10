@@ -7,6 +7,7 @@ use foxvoice_contracts::{
     IPC_PROTOCOL_VERSION, PerformanceSample,
 };
 use foxvoice_ipc::{read_frame, write_frame};
+use foxvoice_models::ModelLibrary;
 use foxvoice_supervisor::{ComponentManifest, GameGuard, detect_hardware, recommend_engine};
 
 fn main() {
@@ -41,12 +42,13 @@ fn run() -> Result<()> {
         "guard-demo" => print_guard_demo(),
         "ipc-demo" => print_ipc_demo(),
         "audio-buffer-demo" => print_audio_buffer_demo(),
+        "models" => run_models_command(),
         #[cfg(feature = "wasapi")]
         "audio-devices" => print_audio_devices(),
         #[cfg(feature = "wasapi")]
         "bypass-test" => run_bypass_test(),
         _ => bail!(
-            "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo{}",
+            "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo, models{}",
             if cfg!(feature = "wasapi") {
                 ", audio-devices, bypass-test"
             } else {
@@ -146,6 +148,44 @@ fn print_audio_buffer_demo() -> Result<()> {
         })
     );
     Ok(())
+}
+
+fn run_models_command() -> Result<()> {
+    let action = env::args().nth(2).unwrap_or_else(|| "list".into());
+    let library = ModelLibrary::open(model_library_path()?)?;
+    match action.as_str() {
+        "list" => println!("{}", serde_json::to_string_pretty(&library.list()?)?),
+        "import" => {
+            let path = env::args().nth(3).map(PathBuf::from).context(
+                "用法: foxvoice-supervisor models import <model.onnx|model.pth|model.index>",
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.import_file(&path, None)?)?
+            );
+        }
+        "recycle" => {
+            let id = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models recycle <model-id>")?;
+            println!(
+                "{}",
+                serde_json::json!({"ok": true, "recycledTo": library.recycle(&id)?})
+            );
+        }
+        _ => bail!("未知模型命令。可用命令: models list, models import, models recycle"),
+    }
+    Ok(())
+}
+
+fn model_library_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("FOXVOICE_DATA_DIR") {
+        return Ok(PathBuf::from(path).join("models"));
+    }
+    let local_app_data = env::var_os("LOCALAPPDATA").context("系统缺少 LOCALAPPDATA")?;
+    Ok(PathBuf::from(local_app_data)
+        .join("FoxVoice")
+        .join("models"))
 }
 
 #[cfg(feature = "wasapi")]

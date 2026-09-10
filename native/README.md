@@ -41,7 +41,14 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- recommend
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- validate-components native/config/components.json
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- ipc-demo
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- audio-buffer-demo
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models list
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models import C:\path\voice.onnx
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
 ```
+
+模型库默认位于 `%LOCALAPPDATA%\FoxVoice\models`。测试和便携运行可通过
+`FOXVOICE_DATA_DIR` 改写数据根目录。导入使用 SHA-256 内容 ID 去重并原子提交；删除只移动到
+`.recycle`，不会立即永久删除。
 
 WASAPI 使用可选特性，防止纯 Rust 测试机被 Windows SDK/链接器阻塞。正式的
 Windows x64 构建应在已安装 Visual Studio Build Tools 的 MSVC 环境执行：

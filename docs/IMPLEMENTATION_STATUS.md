@@ -16,6 +16,7 @@
 - WASAPI 设备枚举与无模型安全旁路实现（可选 `wasapi` 特性）；
 - 自动安装并验证微软签名的 Visual Studio Build Tools、Windows SDK 与 MSVC Rust 工具链；
 - 本机 WASAPI 设备枚举和 2 秒真实音频流旁路自检；
+- 本地 RVC 模型库：`.onnx`、`.pth`、`.index` 分类导入、SHA-256 去重、原子提交、清单列表和可恢复删除；
 - `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
 - Rust 开发依赖下载与 SHA-256 校验脚本；
 - 13 个原生层单元测试、格式检查和 Clippy 零警告。
@@ -35,11 +36,11 @@
 
 ## 下一实施切片
 
-1. 消除旁路启动阶段的短暂欠载，并建立持续运行的延迟/漂移统计；
-2. 将进程内无锁缓冲升级为 Audio Router 与 Engine Process 的共享内存数据面；
-3. 接入音频设备变化通知、自动重连与默认设备迁移；
-4. 固定 `vc-rs` 上游 commit 并实现 WindowsML 适配层；
-5. 把 `doctor`、音频设备和实时指标接入桌面工作台。
+1. 接入 ONNX 结构验证与固定 `vc-rs` 推理核心；
+2. 消除旁路启动阶段的短暂欠载，并建立持续运行的延迟/漂移统计；
+3. 将进程内无锁缓冲升级为 Audio Router 与 Engine Process 的共享内存数据面；
+4. 接入音频设备变化通知、自动重连与默认设备迁移；
+5. 把模型库、`doctor`、音频设备和实时指标接入桌面工作台。
 
 此阶段不会加入训练、FAISS 检索或自研虚拟驱动，先保证音频闭环和故障恢复稳定。
 

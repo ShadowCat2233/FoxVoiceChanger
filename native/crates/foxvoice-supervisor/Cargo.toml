@@ -14,6 +14,7 @@ anyhow.workspace = true
 foxvoice-audio = { path = "../foxvoice-audio" }
 foxvoice-contracts = { path = "../foxvoice-contracts" }
 foxvoice-ipc = { path = "../foxvoice-ipc" }
+foxvoice-models = { path = "../foxvoice-models" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
