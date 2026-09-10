@@ -18,6 +18,8 @@
 - 本机 WASAPI 设备枚举和 2 秒真实音频流旁路自检；
 - 本地 RVC 模型库：`.onnx`、`.pth`、`.index` 分类导入、SHA-256 去重、原子提交、清单列表和可恢复删除；
 - 固定 `vc-rs` commit，并直接复用 `vc-core` 的 ONNX protobuf/RVC 输入输出结构检查器；
+- Windows WPF 桌面工作台，连接真实硬件诊断、音频设备、模型库、旁路进程和实时指标；
+- `win-x64` 自包含发布流程，终端用户无需安装 .NET、Rust 或 Visual Studio；
 - `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
 - Rust 开发依赖下载与 SHA-256 校验脚本；
 - 13 个原生层单元测试、格式检查和 Clippy 零警告。

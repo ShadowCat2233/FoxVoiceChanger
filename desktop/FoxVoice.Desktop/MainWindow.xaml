@@ -1,0 +1,88 @@
+<Window x:Class="FoxVoice.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="狐声 FoxVoice" Width="1040" Height="720" MinWidth="860" MinHeight="600"
+        Background="{StaticResource BackgroundBrush}" Foreground="#E9EDF5"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="狐声" FontSize="30" FontWeight="Bold" />
+                <TextBlock Text="FoxVoice · 本地实时变声工作台" Foreground="#99A4B7" Margin="0,3,0,0" />
+            </StackPanel>
+            <Border Grid.Column="1" Background="#202938" CornerRadius="14" Padding="14,7" VerticalAlignment="Center">
+                <TextBlock x:Name="BackendStatus" Text="正在连接原生引擎…" />
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="1" Background="{StaticResource PanelBrush}" CornerRadius="12" Padding="16" Margin="0,20,0,16">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+                <StackPanel><TextBlock Text="音频状态" Foreground="#99A4B7"/><TextBlock x:Name="AudioStatus" Text="已停止" FontSize="18" FontWeight="SemiBold"/></StackPanel>
+                <StackPanel Grid.Column="1"><TextBlock Text="采样率" Foreground="#99A4B7"/><TextBlock x:Name="SampleRateText" Text="—" FontSize="18"/></StackPanel>
+                <StackPanel Grid.Column="2"><TextBlock Text="欠载采样" Foreground="#99A4B7"/><TextBlock x:Name="UnderrunText" Text="0" FontSize="18"/></StackPanel>
+                <StackPanel Grid.Column="3"><TextBlock Text="流错误" Foreground="#99A4B7"/><TextBlock x:Name="StreamErrorText" Text="0" FontSize="18"/></StackPanel>
+            </Grid>
+        </Border>
+
+        <TabControl Grid.Row="2" Background="{StaticResource PanelBrush}" BorderThickness="0">
+            <TabItem Header="实时变声">
+                <Grid Margin="20">
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <StackPanel Orientation="Horizontal">
+                        <Button x:Name="StartButton" Content="启动安全旁路" Click="StartBypass_Click" />
+                        <Button x:Name="StopButton" Content="停止" Click="StopBypass_Click" Background="#394254" IsEnabled="False" />
+                        <Button Content="刷新设备" Click="Refresh_Click" Background="#394254" />
+                    </StackPanel>
+                    <Grid Grid.Row="1" Margin="0,18,0,0">
+                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+                        <StackPanel Margin="0,0,10,0">
+                            <TextBlock Text="输入设备" FontWeight="SemiBold" Margin="0,0,0,8" />
+                            <ListBox x:Name="InputDevices" Background="#0F131B" Foreground="White" BorderThickness="0" MinHeight="180" DisplayMemberPath="Name" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                            <TextBlock Text="输出设备" FontWeight="SemiBold" Margin="0,0,0,8" />
+                            <ListBox x:Name="OutputDevices" Background="#0F131B" Foreground="White" BorderThickness="0" MinHeight="180" DisplayMemberPath="Name" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </TabItem>
+            <TabItem Header="模型库">
+                <Grid Margin="20">
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="导入 RVC 模型" Click="ImportModel_Click" />
+                        <Button Content="刷新" Click="RefreshModels_Click" Background="#394254" />
+                    </StackPanel>
+                    <DataGrid Grid.Row="1" x:Name="ModelsGrid" Margin="0,16,0,0" AutoGenerateColumns="False" IsReadOnly="True"
+                              Background="#0F131B" Foreground="White" RowBackground="#0F131B" AlternatingRowBackground="#151A23"
+                              BorderThickness="0" GridLinesVisibility="Horizontal">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="名称" Binding="{Binding DisplayName}" Width="2*" />
+                            <DataGridTextColumn Header="格式" Binding="{Binding Format}" Width="*" />
+                            <DataGridTextColumn Header="状态" Binding="{Binding State}" Width="*" />
+                            <DataGridTextColumn Header="大小" Binding="{Binding SizeText}" Width="*" />
+                            <DataGridTextColumn Header="SHA-256" Binding="{Binding ShortHash}" Width="2*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+            <TabItem Header="系统诊断">
+                <Grid Margin="20">
+                    <TextBox x:Name="DoctorText" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                             FontFamily="Consolas" Background="#0F131B" Foreground="#C9D2E3" BorderThickness="0" Padding="14" />
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <TextBlock Grid.Row="3" x:Name="FooterStatus" Text="准备就绪" Foreground="#99A4B7" Margin="0,12,0,0" />
+    </Grid>
+</Window>
