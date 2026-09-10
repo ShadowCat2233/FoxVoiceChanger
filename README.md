@@ -26,7 +26,8 @@
 .\scripts\build-release.ps1
 ```
 
-成品位于 `artifacts\FoxVoice-win-x64`，运行 `FoxVoice.exe`。
+成品位于 `artifacts\FoxVoice-win-x64`，运行 `FoxVoice.exe`。发布脚本同时生成可直接分享的
+`FoxVoice-win-x64.zip` 和对应 `.sha256` 文件。
 
 ## 目录
 

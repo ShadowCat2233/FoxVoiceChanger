@@ -50,4 +50,10 @@ $hashes = Get-ChildItem -LiteralPath $outputDirectory -File | Where-Object Name 
     [pscustomobject]@{ File = $_.Name; SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash }
 }
 $hashes | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $outputDirectory 'SHA256SUMS.json')
+$archivePath = Join-Path $projectRoot 'artifacts\FoxVoice-win-x64.zip'
+if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
+Compress-Archive -Path (Join-Path $outputDirectory '*') -DestinationPath $archivePath -CompressionLevel Optimal
+$archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash
+Set-Content -Encoding ascii -LiteralPath "$archivePath.sha256" -Value "$archiveHash  FoxVoice-win-x64.zip"
 Write-Host "FoxVoice release is ready: $outputDirectory"
+Write-Host "Portable archive: $archivePath"

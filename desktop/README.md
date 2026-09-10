@@ -17,5 +17,6 @@ Self-contained release:
 .\scripts\build-release.ps1
 ```
 
-The output in `artifacts\FoxVoice-win-x64` includes `FoxVoice.exe`, the native supervisor and a
-SHA-256 manifest. End users do not need Rust, Visual Studio or .NET installed.
+The output in `artifacts\FoxVoice-win-x64` includes `FoxVoice.exe`, both native processes and a
+SHA-256 manifest. The script also creates `FoxVoice-win-x64.zip` plus its SHA-256 file. End users
+do not need Rust, Visual Studio or .NET installed.
