@@ -55,6 +55,16 @@ pub struct HuggingFaceFile {
     pub download_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuggingFaceRepositoryInfo {
+    pub repository: String,
+    pub revision: String,
+    pub license: Option<String>,
+    pub gated: bool,
+    pub private: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelLibrary {
     root: PathBuf,
@@ -241,6 +251,44 @@ impl ModelLibrary {
         Ok(files)
     }
 
+    pub fn huggingface_repository_info(
+        &self,
+        repository_url: &str,
+    ) -> Result<HuggingFaceRepositoryInfo> {
+        let (repository, revision) = parse_huggingface_repository(repository_url)?;
+        let mut api_url = Url::parse("https://huggingface.co")?;
+        api_url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("无法构造 Hugging Face API URL"))?
+            .extend(["api", "models"])
+            .extend(repository.split('/'));
+        let mut response = http_agent()?
+            .get(api_url.as_str())
+            .call()
+            .context("无法读取 Hugging Face 仓库元数据")?;
+        let metadata: serde_json::Value = serde_json::from_reader(response.body_mut().as_reader())
+            .context("Hugging Face 仓库元数据响应无效")?;
+        let license = metadata
+            .get("cardData")
+            .and_then(|value| value.get("license"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        Ok(HuggingFaceRepositoryInfo {
+            repository,
+            revision,
+            license,
+            gated: metadata.get("gated").is_some_and(|value| match value {
+                serde_json::Value::Bool(state) => *state,
+                serde_json::Value::String(state) => state != "false" && !state.is_empty(),
+                _ => false,
+            }),
+            private: metadata
+                .get("private")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        })
+    }
+
     pub fn list(&self) -> Result<Vec<ModelRecord>> {
         let mut records = Vec::new();
         for entry in fs::read_dir(&self.root).context("无法读取模型库")? {
@@ -299,10 +347,12 @@ fn parse_huggingface_repository(repository_url: &str) -> Result<(String, String)
         .filter(|part| !part.is_empty())
         .collect();
     anyhow::ensure!(
-        segments.len() == 2 || (segments.len() == 4 && segments[2] == "tree"),
-        "请使用 https://huggingface.co/作者/仓库 或其 tree/分支地址"
+        segments.len() == 2
+            || (segments.len() == 4 && segments[2] == "tree")
+            || (segments.len() >= 5 && segments[2] == "resolve"),
+        "请使用 huggingface.co 的仓库、tree/分支或 resolve 文件地址"
     );
-    let revision = if segments.len() == 4 {
+    let revision = if segments.len() >= 4 {
         segments[3]
     } else {
         "main"
@@ -504,6 +554,13 @@ mod tests {
             parse_huggingface_repository("https://huggingface.co/owner/voice-model/tree/dev")
                 .unwrap(),
             ("owner/voice-model".into(), "dev".into())
+        );
+        assert_eq!(
+            parse_huggingface_repository(
+                "https://huggingface.co/owner/voice-model/resolve/release/models/voice.onnx"
+            )
+            .unwrap(),
+            ("owner/voice-model".into(), "release".into())
         );
         assert!(parse_huggingface_repository("https://example.com/owner/model").is_err());
         assert!(parse_huggingface_repository("https://huggingface.co/owner").is_err());

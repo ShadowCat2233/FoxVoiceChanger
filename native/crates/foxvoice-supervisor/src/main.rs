@@ -206,6 +206,15 @@ fn run_models_command() -> Result<()> {
                 serde_json::to_string_pretty(&library.list_huggingface_files(&url)?)?
             );
         }
+        "huggingface-info" => {
+            let url = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models huggingface-info <repository-url>")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.huggingface_repository_info(&url)?)?
+            );
+        }
         "recycle" => {
             let id = env::args()
                 .nth(3)

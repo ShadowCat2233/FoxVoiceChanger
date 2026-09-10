@@ -804,12 +804,34 @@ public partial class MainWindow : Window
         }
         if (url.Contains("/resolve/", StringComparison.OrdinalIgnoreCase))
         {
+            try
+            {
+                using var infoDocument = JsonDocument.Parse(await RunSupervisorAsync("models", "huggingface-info", url));
+                var info = HuggingFaceRepositoryInfo.FromJson(infoDocument.RootElement);
+                if (info.Private || info.Gated)
+                {
+                    FooterStatus.Text = "该 Hugging Face 仓库是私有或受限仓库；FoxVoice 当前不接收访问令牌";
+                    return;
+                }
+                var answer = MessageBox.Show(this,
+                    $"来源：{info.Repository}\n分支：{info.Revision}\n许可证：{info.License ?? "未声明"}\n\n请确认你有权下载和使用此模型。",
+                    "确认模型来源", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+                if (answer != MessageBoxResult.OK) return;
+            }
+            catch (Exception error) { FooterStatus.Text = FriendlyError(error); return; }
             await ImportModelAsync(["models", "huggingface", url], "正在从 Hugging Face 下载并校验…");
             return;
         }
         try
         {
             FooterStatus.Text = "正在读取 Hugging Face 仓库文件…";
+            using var infoDocument = JsonDocument.Parse(await RunSupervisorAsync("models", "huggingface-info", url));
+            var repositoryInfo = HuggingFaceRepositoryInfo.FromJson(infoDocument.RootElement);
+            if (repositoryInfo.Private || repositoryInfo.Gated)
+            {
+                FooterStatus.Text = "该 Hugging Face 仓库是私有或受限仓库；FoxVoice 当前不接收访问令牌";
+                return;
+            }
             using var document = JsonDocument.Parse(await RunSupervisorAsync("models", "huggingface-files", url));
             var files = document.RootElement.EnumerateArray().Select(HuggingFaceFileItem.FromJson).ToList();
             if (files.Count == 0)
@@ -817,7 +839,7 @@ public partial class MainWindow : Window
                 FooterStatus.Text = "此仓库没有 .onnx、.pth 或 .index 文件";
                 return;
             }
-            var selected = files.Count == 1 ? files[0] : ChooseHuggingFaceFile(files);
+            var selected = ChooseHuggingFaceFile(files, repositoryInfo);
             if (selected is null) { FooterStatus.Text = "已取消仓库导入"; return; }
             HuggingFaceUrl.Text = selected.DownloadUrl;
             await ImportModelAsync(["models", "huggingface", selected.DownloadUrl], $"正在下载 {selected.Path} 并校验…");
@@ -825,7 +847,7 @@ public partial class MainWindow : Window
         catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
 
-    private HuggingFaceFileItem? ChooseHuggingFaceFile(IReadOnlyList<HuggingFaceFileItem> files)
+    private HuggingFaceFileItem? ChooseHuggingFaceFile(IReadOnlyList<HuggingFaceFileItem> files, HuggingFaceRepositoryInfo info)
     {
         HuggingFaceFileItem? selected = null;
         var list = new ListBox { ItemsSource = files, DisplayMemberPath = nameof(HuggingFaceFileItem.DisplayLabel), Margin = new Thickness(0, 14, 0, 14) };
@@ -840,6 +862,13 @@ public partial class MainWindow : Window
         var title = new TextBlock { Text = "仓库中可导入的模型文件", FontSize = 20, FontWeight = FontWeights.SemiBold };
         DockPanel.SetDock(title, Dock.Top);
         root.Children.Add(title);
+        var license = new TextBlock
+        {
+            Text = $"{info.Repository} · {info.Revision} · 许可证：{info.License ?? "未声明"}",
+            Foreground = (Brush)FindResource("TextSecondary"), Margin = new Thickness(0, 5, 0, 0)
+        };
+        DockPanel.SetDock(license, Dock.Top);
+        root.Children.Add(license);
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var cancel = new Button { Content = "取消", Padding = new Thickness(16, 7, 16, 7), Margin = new Thickness(0, 0, 8, 0) };
         var confirm = new Button { Content = "下载并导入", Padding = new Thickness(16, 7, 16, 7), IsDefault = true };
@@ -1522,6 +1551,18 @@ public partial class MainWindow : Window
             value.GetProperty("path").GetString() ?? "",
             value.GetProperty("sizeBytes").GetInt64(),
             value.GetProperty("downloadUrl").GetString() ?? "");
+    }
+
+    private sealed record HuggingFaceRepositoryInfo(
+        string Repository, string Revision, string? License, bool Gated, bool Private)
+    {
+        public static HuggingFaceRepositoryInfo FromJson(JsonElement value) => new(
+            value.GetProperty("repository").GetString() ?? "未知仓库",
+            value.GetProperty("revision").GetString() ?? "main",
+            value.TryGetProperty("license", out var license) && license.ValueKind == JsonValueKind.String
+                ? license.GetString() : null,
+            value.GetProperty("gated").GetBoolean(),
+            value.GetProperty("private").GetBoolean());
     }
 
     private sealed record EngineSnapshot(
