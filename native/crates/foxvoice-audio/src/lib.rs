@@ -170,8 +170,8 @@ mod wasapi {
             )
             .context("无法创建 WASAPI 输出流")?;
 
-        output_stream.play().context("无法启动 WASAPI 输出流")?;
         input_stream.play().context("无法启动 WASAPI 输入流")?;
+        output_stream.play().context("无法启动 WASAPI 输出流")?;
 
         Ok(RunningBypass {
             _input_stream: input_stream,

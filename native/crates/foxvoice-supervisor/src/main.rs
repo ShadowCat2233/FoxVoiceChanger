@@ -1,4 +1,4 @@
-use std::{env, io::Cursor, path::PathBuf};
+use std::{env, io::Cursor, path::PathBuf, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use foxvoice_audio::audio_ring_buffer;
@@ -43,10 +43,12 @@ fn run() -> Result<()> {
         "audio-buffer-demo" => print_audio_buffer_demo(),
         #[cfg(feature = "wasapi")]
         "audio-devices" => print_audio_devices(),
+        #[cfg(feature = "wasapi")]
+        "bypass-test" => run_bypass_test(),
         _ => bail!(
             "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo{}",
             if cfg!(feature = "wasapi") {
-                ", audio-devices"
+                ", audio-devices, bypass-test"
             } else {
                 "（audio-devices 需使用 --features wasapi 构建）"
             }
@@ -151,6 +153,41 @@ fn print_audio_devices() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&foxvoice_audio::enumerate_devices()?)?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "wasapi")]
+fn run_bypass_test() -> Result<()> {
+    let seconds = env::args()
+        .nth(2)
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .context("旁路测试时长必须是整数秒")?
+        .unwrap_or(2);
+    anyhow::ensure!(
+        (1..=10).contains(&seconds),
+        "旁路测试时长必须在 1–10 秒之间"
+    );
+
+    let bypass = foxvoice_audio::start_safe_bypass(None, None, 80)?;
+    thread::sleep(Duration::from_secs(seconds));
+    let metrics = bypass.metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "durationSeconds": seconds,
+            "sampleRate": bypass.sample_rate,
+            "inputChannels": bypass.input_channels,
+            "outputChannels": bypass.output_channels,
+            "bufferMs": bypass.buffer_ms,
+            "metrics": {
+                "inputOverruns": metrics.input_overruns,
+                "outputUnderruns": metrics.output_underruns,
+                "streamErrors": metrics.stream_errors
+            }
+        })
     );
     Ok(())
 }

@@ -18,7 +18,14 @@ FoxVoice 的 Windows 原生监督层。当前阶段负责：
 .\scripts\bootstrap-native.ps1
 ```
 
-默认使用 Windows 正式开发所需的 MSVC 工具链。只进行纯 Rust 逻辑验证时可以使用：
+默认使用 Windows 正式开发所需的 MSVC 工具链；缺少 Visual Studio Build Tools 时会从
+微软官网下载、验证发布者签名并自动安装 C++ 工作负载。若只想检查环境而不允许安装：
+
+```powershell
+.\scripts\bootstrap-native.ps1 -SkipBuildToolsInstall
+```
+
+只进行纯 Rust 逻辑验证时可以使用：
 
 ```powershell
 .\scripts\bootstrap-native.ps1 -Toolchain gnu
@@ -41,6 +48,7 @@ Windows x64 构建应在已安装 Visual Studio Build Tools 的 MSVC 环境执�
 
 ```powershell
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor --features wasapi -- audio-devices
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor --features wasapi -- bypass-test 2
 ```
 
 GNU 工具链只用于协议、状态机和缓冲算法的快速验证，不作为发布工具链。
