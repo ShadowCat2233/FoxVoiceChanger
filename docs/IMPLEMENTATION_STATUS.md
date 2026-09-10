@@ -17,6 +17,7 @@
 - 自动安装并验证微软签名的 Visual Studio Build Tools、Windows SDK 与 MSVC Rust 工具链；
 - 本机 WASAPI 设备枚举和 2 秒真实音频流旁路自检；
 - 本地 RVC 模型库：`.onnx`、`.pth`、`.index` 分类导入、SHA-256 去重、原子提交、清单列表和可恢复删除；
+- 固定 `vc-rs` commit，并直接复用 `vc-core` 的 ONNX protobuf/RVC 输入输出结构检查器；
 - `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
 - Rust 开发依赖下载与 SHA-256 校验脚本；
 - 13 个原生层单元测试、格式检查和 Clippy 零警告。
@@ -46,6 +47,6 @@
 
 ## 当前验证边界
 
-本机已使用 MSVC 编译完整 `wasapi` 特性，15 个测试、格式检查和 Clippy 均通过，并完成真实
+本机已使用 MSVC 编译完整 `wasapi` 特性，19 个测试、格式检查和 Clippy 均通过，并完成真实
 设备枚举与短时旁路。当前仍是共享模式原型：尚未实现设备热插拔恢复、跨进程共享内存、时钟
 漂移补偿和 RVC 推理，因此不能视为游戏场景的最终低延迟验收。

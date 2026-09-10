@@ -73,6 +73,10 @@ impl ModelLibrary {
             .context("模型文件名不是有效 UTF-8")?
             .to_owned();
         let (format, state) = classify(source_path)?;
+        if format == ModelFormat::Onnx {
+            vc_core::model_rvc::inspect_model(source_path)
+                .context("ONNX 文件不是受支持的 RVC 模型")?;
+        }
         let sha256 = sha256_file(source_path)?;
         let id = format!("model-{}", &sha256[..16]);
         let destination_directory = self.root.join(&id);
@@ -204,8 +208,8 @@ mod tests {
     #[test]
     fn imports_lists_deduplicates_and_recycles() {
         let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("voice.onnx");
-        fs::write(&source, b"fake-onnx-for-library-test").unwrap();
+        let source = temporary.path().join("voice.pth");
+        fs::write(&source, b"fake-pth-for-library-test").unwrap();
         let library = ModelLibrary::open(temporary.path().join("models")).unwrap();
 
         let first = library
@@ -239,5 +243,16 @@ mod tests {
     #[test]
     fn rejects_path_traversal_as_model_id() {
         assert!(validate_id("../model-deadbeefdeadbeef").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_onnx_before_copying_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("broken.onnx");
+        fs::write(&source, b"not-an-onnx-model").unwrap();
+        let model_root = temporary.path().join("models");
+        let library = ModelLibrary::open(&model_root).unwrap();
+        assert!(library.import_file(&source, None).is_err());
+        assert!(library.list().unwrap().is_empty());
     }
 }

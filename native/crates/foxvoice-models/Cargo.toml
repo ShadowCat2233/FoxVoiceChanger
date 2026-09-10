@@ -10,6 +10,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895" }
 
 [dev-dependencies]
 tempfile = "3.23.0"
