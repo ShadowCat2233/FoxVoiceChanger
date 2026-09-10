@@ -37,7 +37,7 @@
 - Windows UI Automation 已点击验证五个导航、设备弹窗、无模型启动引导、旁路启停和音高调整；
 - 发布目录与纯单文件隔离启动都保持响应，内嵌的三个原生组件及 Windows ML bootstrapper 能够自动提取；
 - Rust 工作区 27 个测试通过，Clippy 使用 `-D warnings` 通过；
-- 当前本机模型库有 1 个可用 ONNX Generator 和其来源 `.pth`；DirectML 三模型真实自检稳态 160 ms 块推理 49.3 ms，非静音输出成功；Generator 来源许可证仍需用户自行确认。
+- 当前本机模型库有 1 个可用 ONNX Generator 和其来源 `.pth`；DirectML 三模型 100 帧真实基准平均 28.2 ms、P95 30.7 ms、P99/最大 35.2 ms，非静音输出成功；Generator 来源许可证仍需用户自行确认。
 - 组件中心已接入 ContentVec/RMVPE 的按需安装、GPL-3.0 确认、临时下载、长度/SHA-256 强校验与自动路径配置；基础权重仍不随发布包分发。
 - VB-CABLE 已被枚举；“麦克风 -> RVC -> CABLE Input”短时真实链路运行 12 秒，稳态处理 34–41 ms。到具体游戏的设备选择、听感和本地监听仍待人工验收。
 

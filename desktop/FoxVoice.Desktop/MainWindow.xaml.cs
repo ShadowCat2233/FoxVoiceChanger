@@ -446,7 +446,7 @@ public partial class MainWindow : Window
             var modelPath = resolved.RootElement.GetProperty("path").GetString()
                 ?? throw new InvalidOperationException("模型路径解析失败");
             using var report = JsonDocument.Parse(await RunEngineCommandAsync(
-                "validate-rvc", "--provider", "nvtrtx", "--model", modelPath,
+                "validate-rvc", "--provider", "nvtrtx", "--frames", "20", "--model", modelPath,
                 "--embedder", EmbedderPath.Text, "--f0", F0Path.Text));
             _settings.PreferredProvider = "nvtrtx";
             TrySaveSettings();
@@ -1678,19 +1678,21 @@ public partial class MainWindow : Window
         try
         {
             _rvcSelfTestButton.IsEnabled = false;
-            FooterStatus.Text = "正在用 WindowsML/DirectML 加载三模型并执行一帧推理…";
+            FooterStatus.Text = "正在用 WindowsML/DirectML 加载三模型并执行预热与 20 帧基准…";
             using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
             var modelPath = resolved.RootElement.GetProperty("path").GetString()
                 ?? throw new InvalidOperationException("模型路径解析失败");
-            var raw = await RunEngineCommandAsync("validate-rvc", "--model", modelPath,
+            var raw = await RunEngineCommandAsync("validate-rvc", "--frames", "20", "--model", modelPath,
                 "--embedder", EmbedderPath.Text, "--f0", F0Path.Text);
             using var report = JsonDocument.Parse(raw);
             var root = report.RootElement;
             var loadMs = root.GetProperty("loadMs").GetDouble();
             var inferenceMs = root.GetProperty("inferenceMs").GetDouble();
+            var p95Ms = root.GetProperty("p95Ms").GetDouble();
+            var p99Ms = root.GetProperty("p99Ms").GetDouble();
             var outputSamples = root.GetProperty("outputSamples").GetInt32();
-            DoctorText.Text = $"RVC 三模型自检通过\n\n后端：WindowsML / DirectML\n模型加载：{loadMs:N0} ms\n单帧推理：{inferenceMs:N1} ms\n输出采样：{outputSamples:N0}\n\n" + DoctorText.Text;
-            FooterStatus.Text = $"RVC 自检通过：加载 {loadMs:N0} ms，单帧推理 {inferenceMs:N1} ms";
+            DoctorText.Text = $"RVC 三模型自检通过\n\n后端：WindowsML / DirectML\n模型加载：{loadMs:N0} ms\n20 帧平均：{inferenceMs:N1} ms\nP95 / P99：{p95Ms:N1} / {p99Ms:N1} ms\n输出采样：{outputSamples:N0}\n\n" + DoctorText.Text;
+            FooterStatus.Text = $"RVC 自检通过：平均 {inferenceMs:N1} ms，P95 {p95Ms:N1} ms，P99 {p99Ms:N1} ms";
         }
         catch (Exception error)
         {

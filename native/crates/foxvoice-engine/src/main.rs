@@ -353,6 +353,15 @@ fn validate_rvc() -> Result<()> {
     let f0_model = required_path(&arguments, "--f0")?;
     let provider = selected_provider(&arguments)?;
     let provider_label = provider.label();
+    let frames = option_value(&arguments, "--frames")
+        .map(str::parse)
+        .transpose()
+        .context("--frames 必须是整数")?
+        .unwrap_or(1_usize);
+    anyhow::ensure!(
+        (1..=1000).contains(&frames),
+        "--frames 必须在 1 到 1000 之间"
+    );
     let worker = thread::Builder::new()
         .name("foxvoice-rvc-self-test".into())
         .stack_size(64 * 1024 * 1024)
@@ -396,14 +405,25 @@ fn validate_rvc() -> Result<()> {
             let warmup_started = Instant::now();
             pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
             let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
-            let inference_started = Instant::now();
-            let result = pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
-            let inference_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
+            let mut timings = Vec::with_capacity(frames);
+            let mut output_rate = sample_rate;
+            let mut voiced_ratio = 0.0;
+            for _ in 0..frames {
+                let inference_started = Instant::now();
+                let result = pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
+                timings.push(inference_started.elapsed().as_secs_f64() * 1000.0);
+                output_rate = result.sample_rate;
+                voiced_ratio = result.voiced_ratio;
+            }
+            timings.sort_by(f64::total_cmp);
+            let inference_ms = timings.iter().sum::<f64>() / timings.len() as f64;
             Ok(json!({
                 "ok": true, "provider": provider_label, "loadMs": load_ms,
                 "warmupMs": warmup_ms, "inferenceMs": inference_ms, "inputSamples": input.len(),
-                "outputSamples": audio.len(), "modelSampleRate": result.sample_rate,
-                "voicedRatio": result.voiced_ratio
+                "frames": frames, "p50Ms": percentile_sorted(&timings, 0.50),
+                "p95Ms": percentile_sorted(&timings, 0.95), "p99Ms": percentile_sorted(&timings, 0.99),
+                "maxMs": timings[timings.len() - 1], "outputSamples": audio.len(),
+                "modelSampleRate": output_rate, "voicedRatio": voiced_ratio
             }))
         })
         .context("无法启动 RVC 自检线程")?;
@@ -412,6 +432,11 @@ fn validate_rvc() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("RVC 自检线程异常终止"))??;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
+    values[index.min(values.len() - 1)]
 }
 
 fn list_devices() -> Result<()> {
@@ -655,6 +680,14 @@ mod tests {
         let input = vec![0.0_f32; 44_100];
         assert_eq!(resample_linear(&input, 44_100, 48_000).len(), 48_000);
         assert_eq!(resample_linear(&input, 44_100, 44_100).len(), 44_100);
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_without_exceeding_bounds() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile_sorted(&values, 0.50), 3.0);
+        assert_eq!(percentile_sorted(&values, 0.95), 5.0);
+        assert_eq!(percentile_sorted(&values, 1.0), 5.0);
     }
 
     #[test]
