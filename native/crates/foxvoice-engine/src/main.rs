@@ -11,7 +11,14 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 use vc_app::{AudioHost, DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig};
-use vc_core::Provider;
+use vc_core::{
+    Provider,
+    model_rvc::{
+        F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+        VoiceModel,
+    },
+    validation::RvcChunkTiming,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -25,8 +32,72 @@ fn run() -> Result<()> {
         "devices" => list_devices(),
         "passthrough" => run_engine(true),
         "rvc" => run_engine(false),
-        _ => bail!("可用命令: devices, passthrough, rvc"),
+        "validate-rvc" => validate_rvc(),
+        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc"),
     }
+}
+
+fn validate_rvc() -> Result<()> {
+    let arguments: Vec<String> = env::args().collect();
+    let model = required_path(&arguments, "--model")?;
+    let embedder = required_path(&arguments, "--embedder")?;
+    let f0_model = required_path(&arguments, "--f0")?;
+    let worker = thread::Builder::new()
+        .name("foxvoice-rvc-self-test".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || -> Result<serde_json::Value> {
+            let sample_rate = 48_000;
+            let timing = RvcChunkTiming::from_ms(160, sample_rate)?;
+            let load_started = Instant::now();
+            let mut pipeline = RvcPipeline::load(RvcPipelineConfig {
+                model: &model,
+                embedder: &embedder,
+                embedder_output: None,
+                f0_model: &f0_model,
+                provider: windows_provider()?,
+                gpu_priority: vc_core::model_rvc::GpuPriority::High,
+                gpu_device_id: 0,
+                sample_rate,
+                chunk_samples: timing.input_chunk_samples,
+                speaker_id: 0,
+                pitch_shift: 0.0,
+                f0: F0Config::default(),
+                input_gain: 1.0,
+                noise_gate_enabled: false,
+                noise_gate_threshold: 0.01,
+                noise_gate_shaping: NoiseGateShaping::default(),
+                output_extra_ms: 60,
+                volume_excluded_ms: 40,
+                extra_convert_ms: 80,
+                output_gain: 1.0,
+                output_dynamics: OutputDynamicsConfig::default(),
+                progress: None,
+            })?;
+            let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+            let input: Vec<f32> = (0..timing.input_chunk_samples)
+                .map(|index| {
+                    ((index as f32 * 220.0 * std::f32::consts::TAU / sample_rate as f32).sin())
+                        * 0.05
+                })
+                .collect();
+            let mut audio = Vec::new();
+            let mut pitch = Vec::new();
+            let inference_started = Instant::now();
+            let result = pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
+            let inference_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
+            Ok(json!({
+                "ok": true, "provider": "windowsml-directml", "loadMs": load_ms,
+                "inferenceMs": inference_ms, "inputSamples": input.len(),
+                "outputSamples": audio.len(), "modelSampleRate": result.sample_rate,
+                "voicedRatio": result.voiced_ratio
+            }))
+        })
+        .context("无法启动 RVC 自检线程")?;
+    let report = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("RVC 自检线程异常终止"))??;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn list_devices() -> Result<()> {

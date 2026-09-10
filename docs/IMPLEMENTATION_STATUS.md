@@ -14,6 +14,7 @@
 - Hugging Face 单个 `resolve` 文件地址下载与导入；
 - 启用 F0 的 RVC v2 `.pth` 可通过独立纯 Rust sidecar 转换为流式 ONNX，并重新经过结构门禁和哈希导入；
 - ContentVec、RMVPE 和 Generator 路径进入固定版本 `vc-app`/`vc-core` 推理链；
+- 设置页的三模型自检不打开音频设备，直接在 WindowsML/DirectML 上建立 RVC 管线并执行一帧非静音推理，输出加载/推理耗时；
 - 硬件诊断、后端推荐与虚拟音频设备检测；
 - 引擎异常后的安全旁路恢复；
 - 游戏保护已接入真实遥测闭环：连续超载依次切换稳定档、保生存档和保护旁路，持续恢复后逐级回到标准档；

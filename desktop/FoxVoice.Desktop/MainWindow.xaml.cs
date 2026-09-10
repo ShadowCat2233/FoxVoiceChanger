@@ -37,6 +37,7 @@ public partial class MainWindow : Window
     private readonly ComboBox _monitorDeviceCombo = new() { DisplayMemberPath = "Name", Margin = new Thickness(0, 6, 0, 12) };
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
     private readonly Button _installFoundationButton = new() { Content = "安装基础模型", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
+    private readonly Button _rvcSelfTestButton = new() { Content = "运行 RVC 三模型自检", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 10, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
 
     public MainWindow()
     {
@@ -44,6 +45,7 @@ public partial class MainWindow : Window
         AddFoundationModelsCard();
         AddMonitorDevicePicker();
         AddVirtualCableInstallAction();
+        AddRvcSelfTestAction();
         _settings = UserSettings.Load();
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
@@ -846,6 +848,49 @@ public partial class MainWindow : Window
         grid.Children.Add(action);
     }
 
+    private void AddRvcSelfTestAction()
+    {
+        _rvcSelfTestButton.Click += RvcSelfTest_Click;
+        if (EmbedderPath.Parent is Grid { Parent: StackPanel panel }) panel.Children.Add(_rvcSelfTestButton);
+    }
+
+    private async void RvcSelfTest_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selectedModel is null)
+        {
+            ModelsNav.IsChecked = true;
+            FooterStatus.Text = "请先选择一个可用的 ONNX RVC Generator";
+            return;
+        }
+        if (!File.Exists(EmbedderPath.Text) || !File.Exists(F0Path.Text))
+        {
+            FooterStatus.Text = "请先安装或选择 ContentVec 与 RMVPE";
+            return;
+        }
+        try
+        {
+            _rvcSelfTestButton.IsEnabled = false;
+            FooterStatus.Text = "正在用 WindowsML/DirectML 加载三模型并执行一帧推理…";
+            using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
+            var modelPath = resolved.RootElement.GetProperty("path").GetString()
+                ?? throw new InvalidOperationException("模型路径解析失败");
+            var raw = await RunEngineCommandAsync("validate-rvc", "--model", modelPath,
+                "--embedder", EmbedderPath.Text, "--f0", F0Path.Text);
+            using var report = JsonDocument.Parse(raw);
+            var root = report.RootElement;
+            var loadMs = root.GetProperty("loadMs").GetDouble();
+            var inferenceMs = root.GetProperty("inferenceMs").GetDouble();
+            var outputSamples = root.GetProperty("outputSamples").GetInt32();
+            DoctorText.Text = $"RVC 三模型自检通过\n\n后端：WindowsML / DirectML\n模型加载：{loadMs:N0} ms\n单帧推理：{inferenceMs:N1} ms\n输出采样：{outputSamples:N0}\n\n" + DoctorText.Text;
+            FooterStatus.Text = $"RVC 自检通过：加载 {loadMs:N0} ms，单帧推理 {inferenceMs:N1} ms";
+        }
+        catch (Exception error)
+        {
+            FooterStatus.Text = $"RVC 自检失败：{FriendlyError(error)}";
+        }
+        finally { _rvcSelfTestButton.IsEnabled = true; }
+    }
+
     private void OpenDevices_Click(object sender, RoutedEventArgs e) => DeviceOverlay.Visibility = Visibility.Visible;
     private void CloseDevices_Click(object sender, RoutedEventArgs e) => DeviceOverlay.Visibility = Visibility.Collapsed;
     private void OverlayBackground_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) => DeviceOverlay.Visibility = Visibility.Collapsed;
@@ -918,6 +963,20 @@ public partial class MainWindow : Window
         var output = await outputTask;
         var error = await errorTask;
         if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "控制服务执行失败" : error.Trim());
+        return output;
+    }
+
+    private async Task<string> RunEngineCommandAsync(params string[] arguments)
+    {
+        if (_enginePath is null) throw new InvalidOperationException("原生推理引擎尚未连接");
+        using var process = new Process { StartInfo = CreateStartInfo(_enginePath, arguments, redirectInput: false) };
+        process.Start();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var output = await outputTask;
+        var error = await errorTask;
+        if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "推理自检失败" : error.Trim());
         return output;
     }
 
