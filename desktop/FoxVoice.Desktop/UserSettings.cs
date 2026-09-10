@@ -17,6 +17,8 @@ internal sealed class UserSettings
     public bool GameGuardEnabled { get; set; } = true;
     public string PreferredProvider { get; set; } = "directml";
     public List<string> SoundboardFiles { get; set; } = [];
+    public Dictionary<string, string> SoundboardGroups { get; set; } = [];
+    public List<string> SoundboardLoopFiles { get; set; } = [];
     public double SoundboardGainDb { get; set; } = -3;
 
     private static string SettingsPath => Path.Combine(

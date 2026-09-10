@@ -25,6 +25,7 @@ public partial class MainWindow : Window
     private Process? _trainingProcess;
     private Process? _modelTransferProcess;
     private readonly HashSet<Process> _soundProcesses = [];
+    private readonly Dictionary<string, Process> _loopingSoundProcesses = new(StringComparer.OrdinalIgnoreCase);
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
     private string? _enginePath;
@@ -58,6 +59,7 @@ public partial class MainWindow : Window
     private readonly Button _installTensorRtButton = new() { Content = "安装并自检", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
     private readonly Button _cancelModelTransferButton = new() { Content = "取消下载", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
     private readonly WrapPanel _soundboardPanel = new();
+    private readonly ComboBox _soundboardGroupFilter = new() { Width = 120, Margin = new Thickness(0, 0, 12, 0) };
     private readonly Slider _soundboardGain = new() { Minimum = -36, Maximum = 12, Width = 180, TickFrequency = 3, IsSnapToTickEnabled = false };
     private readonly TextBlock _trainingStateText = new() { Text = "检测中", TextWrapping = TextWrapping.Wrap };
     private readonly Button _installCudaTrainingButton = new() { Content = "安装 NVIDIA CUDA 训练环境", Padding = new Thickness(14, 8, 14, 8) };
@@ -779,6 +781,12 @@ public partial class MainWindow : Window
     {
         _settings.SoundboardFiles = _settings.SoundboardFiles
             .Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).Take(24).ToList();
+        _settings.SoundboardLoopFiles = _settings.SoundboardLoopFiles
+            .Where(path => _settings.SoundboardFiles.Contains(path, StringComparer.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        _settings.SoundboardGroups = _settings.SoundboardGroups
+            .Where(pair => _settings.SoundboardFiles.Contains(pair.Key, StringComparer.OrdinalIgnoreCase))
+            .ToDictionary(pair => pair.Key, pair => NormalizeSoundGroup(pair.Value), StringComparer.OrdinalIgnoreCase);
         _soundboardGain.Value = Math.Clamp(_settings.SoundboardGainDb, -36, 12);
         _soundboardGain.ValueChanged += (_, _) =>
         {
@@ -794,11 +802,17 @@ public partial class MainWindow : Window
         var title = new StackPanel();
         title.Children.Add(new TextBlock { Text = "SOUNDBOARD", Style = (Style)FindResource("Eyebrow") });
         title.Children.Add(new TextBlock { Text = "音效板", Style = (Style)FindResource("SectionTitle") });
-        var add = new Button { Content = "＋ 添加音效", Style = (Style)FindResource("PrimaryButton"), HorizontalAlignment = HorizontalAlignment.Right };
+        _soundboardGroupFilter.ItemsSource = SoundGroups.Prepend("全部").ToList();
+        _soundboardGroupFilter.SelectedIndex = 0;
+        _soundboardGroupFilter.SelectionChanged += (_, _) => RefreshSoundboardCards();
+        var add = new Button { Content = "＋ 添加音效", Style = (Style)FindResource("PrimaryButton") };
         add.Click += AddSound_Click;
+        var headerActions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        headerActions.Children.Add(_soundboardGroupFilter);
+        headerActions.Children.Add(add);
         var header = new Grid();
         header.Children.Add(title);
-        header.Children.Add(add);
+        header.Children.Add(headerActions);
         root.Children.Add(header);
 
         var mixer = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 18, 0, 16), Padding = new Thickness(18) };
@@ -832,7 +846,11 @@ public partial class MainWindow : Window
         foreach (var path in dialog.FileNames)
         {
             if (_settings.SoundboardFiles.Count >= 24) break;
-            if (!_settings.SoundboardFiles.Contains(path, StringComparer.OrdinalIgnoreCase)) _settings.SoundboardFiles.Add(path);
+            if (!_settings.SoundboardFiles.Contains(path, StringComparer.OrdinalIgnoreCase))
+            {
+                _settings.SoundboardFiles.Add(path);
+                _settings.SoundboardGroups[path] = "常用";
+            }
         }
         TrySaveSettings();
         RefreshSoundboardCards();
@@ -841,14 +859,26 @@ public partial class MainWindow : Window
     private void RefreshSoundboardCards()
     {
         _soundboardPanel.Children.Clear();
+        var selectedGroup = _soundboardGroupFilter.SelectedItem as string ?? "全部";
         foreach (var (path, index) in _settings.SoundboardFiles.ToList().Select((path, index) => (path, index)))
         {
             if (!File.Exists(path)) { _settings.SoundboardFiles.Remove(path); continue; }
+            var group = _settings.SoundboardGroups.TryGetValue(path, out var configuredGroup) ? NormalizeSoundGroup(configuredGroup) : "常用";
+            if (selectedGroup != "全部" && selectedGroup != group) continue;
             var card = new Border { Style = (Style)FindResource("Panel"), Width = 220, Margin = new Thickness(0, 0, 12, 12), Padding = new Thickness(14) };
             var stack = new StackPanel();
             stack.Children.Add(new TextBlock { Text = Path.GetFileNameWithoutExtension(path), FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis });
             stack.Children.Add(new TextBlock { Text = Path.GetFileName(path), Foreground = (Brush)FindResource("TextSecondary"), FontSize = 10, Margin = new Thickness(0, 3, 0, 12), TextTrimming = TextTrimming.CharacterEllipsis });
             if (index < 8) stack.Children.Add(new TextBlock { Text = $"Ctrl + Alt + F{index + 1}", Foreground = (Brush)FindResource("AccentBrush"), FontSize = 10, Margin = new Thickness(0, 0, 0, 8) });
+            var options = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 9) };
+            var groupBox = new ComboBox { ItemsSource = SoundGroups, SelectedItem = group, Width = 92, Tag = path };
+            groupBox.SelectionChanged += SoundGroup_Changed;
+            var loop = new CheckBox { Content = "循环", IsChecked = _settings.SoundboardLoopFiles.Contains(path, StringComparer.OrdinalIgnoreCase), Tag = path, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 0, 0) };
+            loop.Checked += SoundLoop_Changed;
+            loop.Unchecked += SoundLoop_Changed;
+            options.Children.Add(groupBox);
+            options.Children.Add(loop);
+            stack.Children.Add(options);
             var actions = new StackPanel { Orientation = Orientation.Horizontal };
             var play = new Button { Content = "▶ 播放", Tag = path, Padding = new Thickness(12, 6, 12, 6) };
             play.Click += PlaySound_Click;
@@ -869,6 +899,9 @@ public partial class MainWindow : Window
     {
         if (sender is not Button { Tag: string path }) return;
         _settings.SoundboardFiles.RemoveAll(value => value.Equals(path, StringComparison.OrdinalIgnoreCase));
+        _settings.SoundboardLoopFiles.RemoveAll(value => value.Equals(path, StringComparison.OrdinalIgnoreCase));
+        _settings.SoundboardGroups.Remove(path);
+        StopLoopingSound(path);
         TrySaveSettings();
         RefreshSoundboardCards();
     }
@@ -881,7 +914,15 @@ public partial class MainWindow : Window
     private void PlaySound(string path)
     {
         if (_enginePath is null || !File.Exists(path)) return;
+        var looping = _settings.SoundboardLoopFiles.Contains(path, StringComparer.OrdinalIgnoreCase);
+        if (looping && _loopingSoundProcesses.ContainsKey(path))
+        {
+            StopLoopingSound(path);
+            FooterStatus.Text = $"已停止循环：{Path.GetFileNameWithoutExtension(path)}";
+            return;
+        }
         var arguments = new List<string> { "play-audio", "--file", path, "--gain-db", _soundboardGain.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) };
+        if (looping) arguments.Add("--loop");
         if (OutputDeviceCombo.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
         var process = new Process { StartInfo = CreateStartInfo(_enginePath, arguments, redirectInput: false), EnableRaisingEvents = true };
         process.OutputDataReceived += (_, _) => { };
@@ -889,17 +930,50 @@ public partial class MainWindow : Window
         {
             if (!string.IsNullOrWhiteSpace(args.Data)) Dispatcher.BeginInvoke(() => FooterStatus.Text = $"音效播放失败：{args.Data}");
         };
-        process.Exited += (_, _) => Dispatcher.BeginInvoke(() => { _soundProcesses.Remove(process); process.Dispose(); });
+        process.Exited += (_, _) => Dispatcher.BeginInvoke(() =>
+        {
+            _soundProcesses.Remove(process);
+            if (_loopingSoundProcesses.TryGetValue(path, out var active) && ReferenceEquals(active, process))
+                _loopingSoundProcesses.Remove(path);
+            process.Dispose();
+        });
         try
         {
             process.Start();
-            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+            try { process.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
             _soundProcesses.Add(process);
+            if (looping) _loopingSoundProcesses[path] = process;
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             FooterStatus.Text = $"正在播放音效：{Path.GetFileNameWithoutExtension(path)}";
         }
         catch (Exception error) { process.Dispose(); FooterStatus.Text = FriendlyError(error); }
+    }
+
+    private static readonly string[] SoundGroups = ["常用", "语音", "音乐", "其他"];
+
+    private static string NormalizeSoundGroup(string? group) => SoundGroups.Contains(group) ? group! : "常用";
+
+    private void SoundGroup_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender is not ComboBox { Tag: string path, SelectedItem: string group }) return;
+        _settings.SoundboardGroups[path] = NormalizeSoundGroup(group);
+        TrySaveSettings();
+    }
+
+    private void SoundLoop_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is not CheckBox { Tag: string path } toggle) return;
+        _settings.SoundboardLoopFiles.RemoveAll(value => value.Equals(path, StringComparison.OrdinalIgnoreCase));
+        if (toggle.IsChecked == true) _settings.SoundboardLoopFiles.Add(path);
+        else StopLoopingSound(path);
+        TrySaveSettings();
+    }
+
+    private void StopLoopingSound(string path)
+    {
+        if (!_loopingSoundProcesses.Remove(path, out var process)) return;
+        try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
     }
 
     private void StopSoundboardProcesses()
@@ -910,6 +984,7 @@ public partial class MainWindow : Window
             process.Dispose();
         }
         _soundProcesses.Clear();
+        _loopingSoundProcesses.Clear();
     }
 
     private void InitializeSoundboardHotkeys()

@@ -212,11 +212,13 @@ fn play_audio() -> Result<()> {
         .transpose()
         .context("--gain-db 必须是数字")?
         .unwrap_or(0.0_f32);
+    let looping = arguments.iter().any(|argument| argument == "--loop");
     anyhow::ensure!(
         (-36.0..=12.0).contains(&gain_db),
         "--gain-db 必须在 -36 到 +12 dB 之间"
     );
     let (source, source_rate) = read_audio_mono(&path)?;
+    anyhow::ensure!(!source.is_empty(), "音效文件没有音频采样");
     let host = cpal::default_host();
     let requested = option_value(&arguments, "--output");
     let device = if let Some(name) = requested {
@@ -240,48 +242,42 @@ fn play_audio() -> Result<()> {
     let gain = db_to_gain(gain_db);
     let mut prepared = resample_linear(&source, source_rate, sample_rate);
     apply_soundboard_dsp(&mut prepared, gain, sample_rate);
-    let samples = Arc::new(prepared);
-    let position = Arc::new(AtomicUsize::new(0));
-    let failed = Arc::new(AtomicBool::new(false));
+    let playback = SoundPlayback {
+        samples: Arc::new(prepared),
+        position: Arc::new(AtomicUsize::new(0)),
+        failed: Arc::new(AtomicBool::new(false)),
+        looping,
+    };
     let config: StreamConfig = supported.into();
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => build_sound_stream::<f32>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            Arc::clone(&position),
-            Arc::clone(&failed),
-            |v| v,
-        )?,
-        SampleFormat::I16 => build_sound_stream::<i16>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            Arc::clone(&position),
-            Arc::clone(&failed),
-            |v| (v * i16::MAX as f32) as i16,
-        )?,
-        SampleFormat::U16 => build_sound_stream::<u16>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            Arc::clone(&position),
-            Arc::clone(&failed),
-            |v| ((v * 0.5 + 0.5) * u16::MAX as f32) as u16,
-        )?,
+        SampleFormat::F32 => {
+            build_sound_stream::<f32>(&device, &config, channels, playback.clone(), |v| v)?
+        }
+        SampleFormat::I16 => {
+            build_sound_stream::<i16>(&device, &config, channels, playback.clone(), |v| {
+                (v * i16::MAX as f32) as i16
+            })?
+        }
+        SampleFormat::U16 => {
+            build_sound_stream::<u16>(&device, &config, channels, playback.clone(), |v| {
+                ((v * 0.5 + 0.5) * u16::MAX as f32) as u16
+            })?
+        }
         other => bail!("当前音效板不支持输出格式 {other}"),
     };
     stream.play().context("无法启动音效输出")?;
-    while position.load(Ordering::Relaxed) < samples.len() && !failed.load(Ordering::Relaxed) {
+    while (looping || playback.position.load(Ordering::Relaxed) < playback.samples.len())
+        && !playback.failed.load(Ordering::Relaxed)
+    {
         thread::sleep(Duration::from_millis(10));
     }
-    anyhow::ensure!(!failed.load(Ordering::Relaxed), "音效播放期间设备发生错误");
+    anyhow::ensure!(
+        !playback.failed.load(Ordering::Relaxed),
+        "音效播放期间设备发生错误"
+    );
     println!(
         "{}",
-        json!({"ok": true, "file": path, "sampleRate": sample_rate, "samples": samples.len()})
+        json!({"ok": true, "file": path, "sampleRate": sample_rate, "samples": playback.samples.len()})
     );
     Ok(())
 }
@@ -394,24 +390,30 @@ fn apply_soundboard_dsp(samples: &mut [f32], gain: f32, sample_rate: u32) {
     }
 }
 
+#[derive(Clone)]
+struct SoundPlayback {
+    samples: std::sync::Arc<Vec<f32>>,
+    position: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    looping: bool,
+}
+
 fn build_sound_stream<T: cpal::SizedSample + Send + 'static>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    samples: std::sync::Arc<Vec<f32>>,
-    position: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    playback: SoundPlayback,
     convert: fn(f32) -> T,
 ) -> Result<cpal::Stream> {
     use std::sync::atomic::Ordering;
-    let error_flag = std::sync::Arc::clone(&failed);
+    let error_flag = std::sync::Arc::clone(&playback.failed);
     device
         .build_output_stream::<T, _, _>(
             *config,
             move |output, _| {
                 for frame in output.chunks_mut(channels) {
-                    let index = position.fetch_add(1, Ordering::Relaxed);
-                    let value = samples.get(index).copied().unwrap_or(0.0);
+                    let index = playback.position.fetch_add(1, Ordering::Relaxed);
+                    let value = sound_sample(&playback.samples, index, playback.looping);
                     frame.fill_with(|| convert(value));
                 }
             },
@@ -421,6 +423,14 @@ fn build_sound_stream<T: cpal::SizedSample + Send + 'static>(
             None,
         )
         .context("无法创建音效输出流")
+}
+
+fn sound_sample(samples: &[f32], index: usize, looping: bool) -> f32 {
+    if looping && !samples.is_empty() {
+        samples[index % samples.len()]
+    } else {
+        samples.get(index).copied().unwrap_or(0.0)
+    }
 }
 
 fn read_wav_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
@@ -844,5 +854,14 @@ mod tests {
         assert_eq!(samples[500], 1.0);
         assert!(samples[999] > 0.0 && samples[999] < 0.02);
         assert!(samples.iter().all(|sample| (-1.0..=1.0).contains(sample)));
+    }
+
+    #[test]
+    fn looping_sound_wraps_while_one_shot_becomes_silent() {
+        let samples = [0.25, 0.5];
+        assert_eq!(sound_sample(&samples, 2, true), 0.25);
+        assert_eq!(sound_sample(&samples, 3, true), 0.5);
+        assert_eq!(sound_sample(&samples, 2, false), 0.0);
+        assert_eq!(sound_sample(&[], 10, true), 0.0);
     }
 }
