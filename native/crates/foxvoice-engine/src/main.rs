@@ -83,7 +83,7 @@ fn run_engine(passthrough: bool) -> Result<()> {
         chunk_ms: if monitoring { 60 } else { 160 },
         crossfade_ms: if monitoring { 10 } else { 40 },
         sola_search_ms: if monitoring { 5 } else { 12 },
-        extra_convert_ms: if monitoring { 0 } else { 80 },
+        extra_convert_ms: if monitoring { 20 } else { 80 },
         // Keep the lightweight gate stage available so the UI can toggle it
         // through live parameters without rebuilding the model pipeline.
         denoiser_mode: DenoiserMode::NoiseGate,
@@ -96,7 +96,9 @@ fn run_engine(passthrough: bool) -> Result<()> {
     }
     config.input_device = option_value(&arguments, "--input").map(ToOwned::to_owned);
     config.output_device = option_value(&arguments, "--output").map(ToOwned::to_owned);
+    let mut active_config = config.clone();
     controller.apply_config(config)?;
+    let mut guard_profile = "normal";
 
     let (command_tx, command_rx) = mpsc::channel();
     thread::Builder::new()
@@ -126,6 +128,34 @@ fn run_engine(passthrough: bool) -> Result<()> {
                         controller.set_live_params(live);
                     }
                 }
+                Ok(EngineCommand::Guard { level }) => {
+                    let (chunk_ms, crossfade_ms, sola_search_ms, extra_convert_ms) =
+                        match level.as_str() {
+                            "normal" => (160, 40, 12, 80),
+                            "stable" => (240, 50, 10, 60),
+                            "survival" => (320, 60, 8, 40),
+                            "bypass" => {
+                                controller.set_passthrough(true);
+                                guard_profile = "bypass";
+                                continue;
+                            }
+                            _ => {
+                                eprintln!("忽略未知游戏保护级别: {level}");
+                                continue;
+                            }
+                        };
+                    controller.set_passthrough(passthrough);
+                    active_config.chunk_ms = if monitoring { 60 } else { chunk_ms };
+                    active_config.crossfade_ms = if monitoring { 10 } else { crossfade_ms };
+                    active_config.sola_search_ms = if monitoring { 5 } else { sola_search_ms };
+                    active_config.extra_convert_ms = if monitoring { 20 } else { extra_convert_ms };
+                    controller.apply_config(active_config.clone())?;
+                    guard_profile = match level.as_str() {
+                        "stable" => "stable",
+                        "survival" => "survival",
+                        _ => "normal",
+                    };
+                }
                 Err(error) => eprintln!("忽略无效实时参数: {error}"),
             }
         }
@@ -139,7 +169,8 @@ fn run_engine(passthrough: bool) -> Result<()> {
             "{}",
             json!({
                 "event": "engineStatus", "state": format!("{:?}", status.state),
-                "passthrough": passthrough,
+                "passthrough": passthrough || guard_profile == "bypass",
+                "guardProfile": guard_profile, "chunkMs": active_config.chunk_ms,
                 "message": status.message, "detail": status.detail,
                 "inputDevice": status.input_device, "outputDevice": status.output_device,
                 "inputSampleRate": status.input_sample_rate, "outputSampleRate": status.output_sample_rate,
@@ -163,6 +194,9 @@ enum EngineCommand {
         pitch: f32,
         output_gain_db: f32,
         noise_gate_enabled: bool,
+    },
+    Guard {
+        level: String,
     },
 }
 

@@ -12,7 +12,7 @@ namespace FoxVoice.Desktop;
 
 public partial class MainWindow : Window
 {
-    private const double ProcessingBudgetMs = 112.0;
+    private const double DefaultProcessingBudgetMs = 160.0;
     private readonly UserSettings _settings;
     private readonly SemaphoreSlim _engineInputLock = new(1, 1);
     private Process? _audioProcess;
@@ -27,6 +27,12 @@ public partial class MainWindow : Window
     private bool _recovering;
     private bool _ready;
     private bool _suppressDeviceSelection;
+    private string _guardProfile = "normal";
+    private int _guardOverloadStreak;
+    private int _guardRecoveryStreak;
+    private ulong _guardLastUnderruns;
+    private ulong _guardLastStreamErrors;
+    private bool _guardCommandPending;
     private AudioDevice? _virtualCableInput;
     private readonly ComboBox _monitorDeviceCombo = new() { DisplayMemberPath = "Name", Margin = new Thickness(0, 6, 0, 12) };
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
@@ -474,6 +480,7 @@ public partial class MainWindow : Window
 
         _stoppingAudio = false;
         _recovering = false;
+        ResetGameGuardState();
         var startInfo = CreateStartInfo(_enginePath, arguments, redirectInput: true);
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         _audioProcess = process;
@@ -544,12 +551,14 @@ public partial class MainWindow : Window
         if (snapshot.OutputSampleRate > 0) SampleRateText.Text = $"{snapshot.OutputSampleRate / 1000.0:0.#} kHz";
         UnderrunText.Text = snapshot.OutputUnderruns.ToString("N0");
         StreamErrorText.Text = snapshot.StreamErrors.ToString("N0");
+        UpdateGameGuard(snapshot);
         if (snapshot.ProcessingUs > 0)
         {
             var milliseconds = snapshot.ProcessingUs / 1000.0;
+            var budget = snapshot.ChunkMs > 0 ? snapshot.ChunkMs : DefaultProcessingBudgetMs;
             LatencyText.Text = $"{milliseconds:0.0} ms";
-            BudgetText.Text = $"{milliseconds:0.0} / {ProcessingBudgetMs:0} ms";
-            BudgetProgress.Value = Math.Clamp(milliseconds / ProcessingBudgetMs * 100.0, 0, 100);
+            BudgetText.Text = $"{milliseconds:0.0} / {budget:0} ms";
+            BudgetProgress.Value = Math.Clamp(milliseconds / budget * 100.0, 0, 100);
         }
     }
 
@@ -598,7 +607,7 @@ public partial class MainWindow : Window
         {
             SampleRateText.Text = "—";
             LatencyText.Text = "-- ms";
-            BudgetText.Text = $"-- / {ProcessingBudgetMs:0} ms";
+            BudgetText.Text = $"-- / {DefaultProcessingBudgetMs:0} ms";
             BudgetProgress.Value = 0;
         }
     }
@@ -651,7 +660,93 @@ public partial class MainWindow : Window
             try { _audioProcess.PriorityClass = enabled ? ProcessPriorityClass.High : ProcessPriorityClass.Normal; }
             catch { }
         }
+        if (!enabled)
+        {
+            ResetGameGuardState();
+            _ = SendGuardProfileAsync("normal");
+        }
         TrySaveSettings();
+    }
+
+    private void ResetGameGuardState()
+    {
+        _guardProfile = "normal";
+        _guardOverloadStreak = 0;
+        _guardRecoveryStreak = 0;
+        _guardLastUnderruns = 0;
+        _guardLastStreamErrors = 0;
+        _guardCommandPending = false;
+        if (IsInitialized) GuardStateText.Text = GameGuardToggle.IsChecked == true ? "资源保护已启用" : "资源保护已关闭";
+    }
+
+    private void UpdateGameGuard(EngineSnapshot snapshot)
+    {
+        if (GameGuardToggle.IsChecked != true || snapshot.State != "Running" || _guardCommandPending) return;
+        var newFault = snapshot.OutputUnderruns > _guardLastUnderruns || snapshot.StreamErrors > _guardLastStreamErrors;
+        _guardLastUnderruns = snapshot.OutputUnderruns;
+        _guardLastStreamErrors = snapshot.StreamErrors;
+        var budgetUs = (ulong)Math.Max(snapshot.ChunkMs, 1) * 1000;
+        var overloaded = !snapshot.Passthrough && (snapshot.ProcessingUs >= budgetUs * 85 / 100 || newFault);
+        var recovered = snapshot.Passthrough ? !newFault : snapshot.ProcessingUs > 0 && snapshot.ProcessingUs <= budgetUs / 2 && !newFault;
+        if (overloaded)
+        {
+            _guardOverloadStreak++;
+            _guardRecoveryStreak = 0;
+        }
+        else if (recovered)
+        {
+            _guardRecoveryStreak++;
+            _guardOverloadStreak = 0;
+        }
+        else
+        {
+            _guardOverloadStreak = 0;
+            _guardRecoveryStreak = 0;
+        }
+
+        var next = _guardProfile;
+        if (_guardOverloadStreak >= (_guardProfile == "survival" ? 5 : 3))
+            next = _guardProfile switch { "normal" => "stable", "stable" => "survival", "survival" => "bypass", _ => _guardProfile };
+        else if (_guardRecoveryStreak >= (_guardProfile == "bypass" ? 20 : 30))
+            next = _guardProfile switch { "bypass" => "survival", "survival" => "stable", "stable" => "normal", _ => _guardProfile };
+        if (next == _guardProfile) return;
+        _guardOverloadStreak = 0;
+        _guardRecoveryStreak = 0;
+        _ = SendGuardProfileAsync(next);
+    }
+
+    private async Task SendGuardProfileAsync(string level)
+    {
+        if (_audioProcess is not { HasExited: false } || _engineInput is null) return;
+        _guardCommandPending = true;
+        var command = JsonSerializer.Serialize(new { type = "guard", level });
+        await _engineInputLock.WaitAsync();
+        try
+        {
+            await _engineInput.WriteLineAsync(command);
+            await _engineInput.FlushAsync();
+            _guardProfile = level;
+            GuardStateText.Text = level switch
+            {
+                "stable" => "稳定档 · 240 ms",
+                "survival" => "保生存档 · 320 ms",
+                "bypass" => "保护旁路 · 等待恢复",
+                _ => "资源保护已启用"
+            };
+            FooterStatus.Text = level switch
+            {
+                "stable" => "检测到连续超载：已切换稳定档，主链路重新装载中",
+                "survival" => "负载仍高：已扩大实时缓冲并减少上下文",
+                "bypass" => "持续无法满足预算：已进入保护旁路，避免游戏语音中断",
+                _ => "负载持续稳定：已恢复标准实时配置"
+            };
+        }
+        catch (IOException) { }
+        finally
+        {
+            _engineInputLock.Release();
+            _guardCommandPending = false;
+        }
     }
 
     private void Monitor_Changed(object sender, RoutedEventArgs e)
@@ -912,6 +1007,7 @@ public partial class MainWindow : Window
         bool Passthrough,
         int OutputSampleRate,
         ulong ProcessingUs,
+        int ChunkMs,
         ulong OutputUnderruns,
         ulong StreamErrors)
     {
@@ -923,12 +1019,13 @@ public partial class MainWindow : Window
             var sampleRate = root.TryGetProperty("outputSampleRate", out var rateValue) ? rateValue.GetInt32()
                 : root.TryGetProperty("sampleRate", out rateValue) ? rateValue.GetInt32() : 0;
             var processing = root.TryGetProperty("processingUs", out var processingValue) ? processingValue.GetUInt64() : 0;
+            var chunkMs = root.TryGetProperty("chunkMs", out var chunkValue) ? chunkValue.GetInt32() : (int)DefaultProcessingBudgetMs;
             var underruns = root.TryGetProperty("outputUnderruns", out var underrunValue) ? underrunValue.GetUInt64() : 0;
             var streamErrors = root.TryGetProperty("streamErrors", out var errorValue) ? errorValue.GetUInt64() : 0;
             var passthrough = eventName == "audioStarted"
                 || (root.TryGetProperty("passthrough", out var passthroughValue) && passthroughValue.GetBoolean())
                 || (root.TryGetProperty("mode", out var modeValue) && modeValue.GetString() == "safeBypass");
-            return new(state, message, passthrough, sampleRate, processing, underruns, streamErrors);
+            return new(state, message, passthrough, sampleRate, processing, chunkMs, underruns, streamErrors);
         }
     }
 }
