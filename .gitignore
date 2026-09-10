@@ -44,6 +44,7 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+/build/convert-test-*/
 desktop/**/bin/
 desktop/**/obj/
 artifacts/

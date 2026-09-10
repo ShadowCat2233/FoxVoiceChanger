@@ -47,11 +47,16 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models hug
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models status
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models install --accept-gpl
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models convert model-0123456789abcdef
 ```
 
 模型库默认位于 `%LOCALAPPDATA%\FoxVoice\models`。测试和便携运行可通过
 `FOXVOICE_DATA_DIR` 改写数据根目录。导入使用 SHA-256 内容 ID 去重并原子提交；删除只移动到
 `.recycle`，不会立即永久删除。
+
+`.pth` 转换在独立的 `foxvoice-converter` 进程中完成，当前上游转换器只支持启用 F0 的
+RVC v2 检查点。输出采用 vc-rs 的流式 ONNX 契约，随后再次经过模型库结构校验和 SHA-256
+去重；转换器失败不会终止桌面控制服务。
 
 WASAPI 使用可选特性，防止纯 Rust 测试机被 Windows SDK/链接器阻塞。正式的
 Windows x64 构建应在已安装 Visual Studio Build Tools 的 MSVC 环境执行：

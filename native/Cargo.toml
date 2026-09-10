@@ -7,6 +7,7 @@ members = [
   "crates/foxvoice-audio",
   "crates/foxvoice-models",
   "crates/foxvoice-supervisor",
+  "crates/foxvoice-converter",
 ]
 
 [workspace.package]

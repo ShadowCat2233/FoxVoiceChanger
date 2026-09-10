@@ -30,6 +30,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Native release build failed.' }
     --manifest-path (Join-Path $projectRoot 'native\Cargo.toml') `
     --package foxvoice-engine --features windowsml --release
 if ($LASTEXITCODE -ne 0) { throw 'RVC engine release build failed.' }
+& $cargoPath '+stable-x86_64-pc-windows-msvc' build `
+    --manifest-path (Join-Path $projectRoot 'native\Cargo.toml') `
+    --package foxvoice-converter --release
+if ($LASTEXITCODE -ne 0) { throw 'RVC model converter release build failed.' }
 
 $artifactsDirectory = Join-Path $projectRoot 'artifacts'
 New-Item -ItemType Directory -Force -Path $artifactsDirectory | Out-Null
@@ -61,6 +65,10 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-s
     -Destination (Join-Path $stagingDirectory 'foxvoice-supervisor.exe') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-engine.exe') `
     -Destination (Join-Path $stagingDirectory 'foxvoice-engine.exe') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-converter.exe') `
+    -Destination (Join-Path $stagingDirectory 'foxvoice-converter.exe') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') `
+    -Destination (Join-Path $stagingDirectory 'THIRD_PARTY_NOTICES.md') -Force
 $debugSymbols = Join-Path $stagingDirectory 'FoxVoice.pdb'
 if (Test-Path -LiteralPath $debugSymbols) { Remove-Item -LiteralPath $debugSymbols -Force }
 

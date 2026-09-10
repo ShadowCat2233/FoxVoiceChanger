@@ -152,7 +152,7 @@ fn download_verified(spec: FoundationSpec, temporary: &Path, destination: &Path)
 fn sha256_file(path: &Path) -> Result<String> {
     let mut input = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let length = input.read(&mut buffer)?;
         if length == 0 {

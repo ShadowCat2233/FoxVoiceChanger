@@ -7,9 +7,13 @@ $releaseDirectory = Join-Path $projectRoot 'artifacts\FoxVoice-win-x64'
 $desktop = Join-Path $releaseDirectory 'FoxVoice.exe'
 $supervisor = Join-Path $releaseDirectory 'foxvoice-supervisor.exe'
 $engine = Join-Path $releaseDirectory 'foxvoice-engine.exe'
+$converter = Join-Path $releaseDirectory 'foxvoice-converter.exe'
 
-foreach ($path in @($desktop, $supervisor, $engine)) {
+foreach ($path in @($desktop, $supervisor, $engine, $converter)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing release file: $path" }
+}
+if (-not (Test-Path -LiteralPath (Join-Path $releaseDirectory 'THIRD_PARTY_NOTICES.md'))) {
+    throw 'Missing third-party notices.'
 }
 
 $manifest = Get-Content -Raw -LiteralPath (Join-Path $releaseDirectory 'SHA256SUMS.json') | ConvertFrom-Json
@@ -114,11 +118,13 @@ try {
     if (-not $isolatedReady) { throw 'Isolated single-EXE UI did not start.' }
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         if ((Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-supervisor.exe')) -and
-            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe'))) { break }
+            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe')) -and
+            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe'))) { break }
         Start-Sleep -Milliseconds 250
     }
     if (-not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-supervisor.exe')) -or
-        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe'))) {
+        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe')) -or
+        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe'))) {
         throw 'Embedded native components were not extracted in isolated single-EXE mode.'
     }
 }

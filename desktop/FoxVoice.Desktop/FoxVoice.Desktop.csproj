@@ -15,5 +15,8 @@
     <EmbeddedResource Include="..\..\native\target\release\foxvoice-engine.exe"
                       LogicalName="FoxVoice.Native.foxvoice-engine.exe"
                       Condition="Exists('..\..\native\target\release\foxvoice-engine.exe')" />
+    <EmbeddedResource Include="..\..\native\target\release\foxvoice-converter.exe"
+                      LogicalName="FoxVoice.Native.foxvoice-converter.exe"
+                      Condition="Exists('..\..\native\target\release\foxvoice-converter.exe')" />
   </ItemGroup>
 </Project>

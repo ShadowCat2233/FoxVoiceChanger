@@ -1,4 +1,4 @@
-use std::{env, io::Cursor, path::PathBuf};
+use std::{env, fs, io::Cursor, path::PathBuf, process::Command};
 
 #[cfg(feature = "wasapi")]
 use std::{thread, time::Duration};
@@ -212,11 +212,63 @@ fn run_models_command() -> Result<()> {
                 .context("用法: foxvoice-supervisor models resolve <model-id>")?;
             println!("{}", serde_json::json!({"path": library.model_file(&id)?}));
         }
+        "convert" => {
+            let id = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models convert <model-id>")?;
+            let source = library.model_file(&id)?;
+            anyhow::ensure!(
+                source
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("pth")),
+                "只有 .pth 检查点需要转换"
+            );
+            let converter = converter_executable()?;
+            let output = Command::new(&converter)
+                .arg(&source)
+                .output()
+                .with_context(|| format!("无法启动模型转换器: {}", converter.display()))?;
+            anyhow::ensure!(
+                output.status.success(),
+                "模型转换失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let response: serde_json::Value =
+                serde_json::from_slice(&output.stdout).context("模型转换器返回了无效结果")?;
+            let onnx = response
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .context("模型转换器没有返回输出路径")?;
+            let result = library.import_file(&onnx, Some(format!("converted-from:{id}")));
+            if onnx.is_file() {
+                let _ = fs::remove_file(&onnx);
+            }
+            println!("FOXVOICE_RESULT_JSON={}", serde_json::to_string(&result?)?);
+        }
         _ => bail!(
-            "未知模型命令。可用命令: models list, models import, models huggingface, models recycle, models resolve"
+            "未知模型命令。可用命令: models list, models import, models huggingface, models recycle, models resolve, models convert"
         ),
     }
     Ok(())
+}
+
+fn converter_executable() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("FOXVOICE_CONVERTER") {
+        let path = PathBuf::from(path);
+        anyhow::ensure!(path.is_file(), "FOXVOICE_CONVERTER 指向的文件不存在");
+        return Ok(path);
+    }
+    let current = env::current_exe().context("无法定位控制服务")?;
+    let name = if cfg!(windows) {
+        "foxvoice-converter.exe"
+    } else {
+        "foxvoice-converter"
+    };
+    let path = current.parent().context("控制服务缺少父目录")?.join(name);
+    anyhow::ensure!(path.is_file(), "模型转换组件未安装: {}", path.display());
+    Ok(path)
 }
 
 fn model_library_path() -> Result<PathBuf> {

@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
     private string? _enginePath;
+    private string? _converterPath;
     private ModelItem? _selectedModel;
     private List<ModelItem> _models = [];
     private bool _stoppingAudio;
@@ -70,6 +71,7 @@ public partial class MainWindow : Window
         {
             _supervisorPath ??= FindNativeExecutable("FOXVOICE_SUPERVISOR", "foxvoice-supervisor.exe");
             _enginePath ??= FindNativeExecutable("FOXVOICE_ENGINE", "foxvoice-engine.exe");
+            _converterPath ??= FindNativeExecutable("FOXVOICE_CONVERTER", "foxvoice-converter.exe");
             TopEngineText.Text = "DirectML";
             EngineBadgeText.Text = "DirectML 已就绪";
             EngineDot.Fill = (Brush)FindResource("SuccessBrush");
@@ -325,14 +327,30 @@ public partial class MainWindow : Window
         if (sender is Button { Tag: ModelItem model }) SelectModel(model, persist: true);
     }
 
-    private void UseModel_Click(object sender, RoutedEventArgs e)
+    private async void UseModel_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: ModelItem model }) return;
         if (!model.IsUsable)
         {
-            FooterStatus.Text = model.Format == "pytorchCheckpoint"
-                ? "此 .pth 模型需要先转换为 ONNX"
-                : ".index 已保存，但游戏实时模式不会执行检索";
+            if (model.Format == "pytorchCheckpoint")
+            {
+                try
+                {
+                    FooterStatus.Text = "正在隔离转换 RVC v2 F0 检查点，请稍候…";
+                    var output = await RunSupervisorAsync("models", "convert", model.Id);
+                    var marker = "FOXVOICE_RESULT_JSON=";
+                    var markerIndex = output.LastIndexOf(marker, StringComparison.Ordinal);
+                    if (markerIndex < 0) throw new InvalidOperationException("模型转换器没有返回结果");
+                    using var converted = JsonDocument.Parse(output[(markerIndex + marker.Length)..].Trim());
+                    var convertedId = converted.RootElement.GetProperty("id").GetString();
+                    await RefreshModelsAsync();
+                    SelectModel(_models.FirstOrDefault(item => item.Id == convertedId), persist: true);
+                    StudioNav.IsChecked = true;
+                    FooterStatus.Text = "转换完成，流式 ONNX 模型已通过结构校验并选中";
+                }
+                catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+            }
+            else FooterStatus.Text = ".index 已保存，但游戏实时模式不会执行检索";
             return;
         }
         SelectModel(model, persist: true);
