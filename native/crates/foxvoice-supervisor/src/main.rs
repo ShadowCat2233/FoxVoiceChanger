@@ -12,9 +12,9 @@ use foxvoice_contracts::{
 use foxvoice_ipc::{read_frame, write_frame};
 use foxvoice_models::ModelLibrary;
 use foxvoice_supervisor::{
-    ComponentManifest, GameGuard, detect_hardware, foundation_model_status, foundation_root,
-    install_foundation_models, install_training, launch_training_workbench, recommend_engine,
-    training_outputs, training_root, training_status,
+    ComponentManifest, GameGuard, TrainingRequest, detect_hardware, foundation_model_status,
+    foundation_root, install_foundation_models, install_training, launch_training_workbench,
+    recommend_engine, run_training, training_outputs, training_root, training_status,
 };
 
 fn main() {
@@ -89,6 +89,25 @@ fn run_training_command() -> Result<()> {
             launch_training_workbench(&root)?;
             return Ok(());
         }
+        "run" => {
+            let value = |flag: &str| {
+                env::args()
+                    .skip_while(|argument| argument != flag)
+                    .nth(1)
+                    .with_context(|| format!("缺少参数 {flag}"))
+            };
+            run_training(
+                &root,
+                &TrainingRequest {
+                    dataset: PathBuf::from(value("--dataset")?),
+                    name: value("--name")?,
+                    epochs: value("--epochs")?.parse().context("训练轮数无效")?,
+                    batch_size: value("--batch")?.parse().context("批大小无效")?,
+                    workers: value("--workers")?.parse().context("工作线程数无效")?,
+                },
+            )?;
+            return Ok(());
+        }
         "outputs" => {
             println!(
                 "{}",
@@ -96,7 +115,7 @@ fn run_training_command() -> Result<()> {
             );
             return Ok(());
         }
-        _ => bail!("用法: foxvoice-supervisor training status|install|workbench|outputs"),
+        _ => bail!("用法: foxvoice-supervisor training status|install|run|workbench|outputs"),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

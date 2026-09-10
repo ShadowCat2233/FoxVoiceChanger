@@ -32,6 +32,15 @@ pub struct TrainingOutput {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TrainingRequest {
+    pub dataset: PathBuf,
+    pub name: String,
+    pub epochs: u16,
+    pub batch_size: u8,
+    pub workers: u8,
+}
+
 pub fn training_root() -> Result<PathBuf> {
     let local = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA 不可用")?;
     Ok(PathBuf::from(local).join("FoxVoice").join("training"))
@@ -266,6 +275,50 @@ pub fn launch_workbench(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn run_training(root: &Path, request: &TrainingRequest) -> Result<()> {
+    anyhow::ensure!(request.dataset.is_dir(), "训练数据集目录不存在");
+    anyhow::ensure!(
+        !request.name.is_empty()
+            && request.name.len() <= 64
+            && request
+                .name
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-')),
+        "实验名称只能包含 1-64 个英文字母、数字、下划线或连字符"
+    );
+    anyhow::ensure!(
+        (1..=1200).contains(&request.epochs),
+        "训练轮数必须为 1-1200"
+    );
+    anyhow::ensure!((1..=64).contains(&request.batch_size), "批大小必须为 1-64");
+    anyhow::ensure!((1..=64).contains(&request.workers), "工作线程数必须为 1-64");
+    let report = status(root)?;
+    anyhow::ensure!(report.ready, "训练环境尚未完整安装并通过自检");
+
+    let source = root.join("rvc");
+    let python = root.join("venv").join("Scripts").join("python.exe");
+    let bridge = root.join("foxvoice-training-bridge.py");
+    fs::write(&bridge, include_bytes!("training_bridge.py"))
+        .context("无法写入 FoxVoice 训练桥接脚本")?;
+    let status = Command::new(python)
+        .current_dir(&source)
+        .arg(&bridge)
+        .arg("--dataset")
+        .arg(&request.dataset)
+        .arg("--name")
+        .arg(&request.name)
+        .arg("--epochs")
+        .arg(request.epochs.to_string())
+        .arg("--batch")
+        .arg(request.batch_size.to_string())
+        .arg("--workers")
+        .arg(request.workers.to_string())
+        .status()
+        .context("无法启动一键训练任务")?;
+    anyhow::ensure!(status.success(), "一键训练失败，退出码 {:?}", status.code());
+    Ok(())
+}
+
 pub fn outputs(root: &Path) -> Result<Vec<TrainingOutput>> {
     let source = root.join("rvc");
     let mut found = Vec::new();
@@ -443,5 +496,18 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].kind, "faissIndex");
         assert_eq!(found[1].kind, "pytorchCheckpoint");
+    }
+
+    #[test]
+    fn invalid_training_request_is_rejected_before_launch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let request = TrainingRequest {
+            dataset: temporary.path().to_path_buf(),
+            name: "bad name".into(),
+            epochs: 20,
+            batch_size: 4,
+            workers: 4,
+        };
+        assert!(run_training(temporary.path(), &request).is_err());
     }
 }

@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private bool _guardCommandPending;
     private bool _refreshingDevices;
     private bool _gameDetected;
+    private bool _trainingReady;
     private int _gameDetectionStreak;
     private int _gameReleaseStreak;
     private string _detectedGameName = "";
@@ -62,8 +63,14 @@ public partial class MainWindow : Window
     private readonly Button _installCudaTrainingButton = new() { Content = "安装 NVIDIA CUDA 训练环境", Padding = new Thickness(14, 8, 14, 8) };
     private readonly Button _installCpuTrainingButton = new() { Content = "安装 CPU 训练环境", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
     private readonly Button _cancelTrainingButton = new() { Content = "取消安装", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
-    private readonly Button _launchTrainingButton = new() { Content = "打开训练工作台", Padding = new Thickness(14, 8, 14, 8) };
-    private readonly Button _importTrainingButton = new() { Content = "导入训练结果", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button _launchTrainingButton = new() { Content = "打开训练工作台", Padding = new Thickness(14, 8, 14, 8), IsEnabled = false };
+    private readonly Button _importTrainingButton = new() { Content = "导入训练结果", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
+    private readonly TextBox _trainingDatasetText = new() { MinWidth = 360 };
+    private readonly TextBox _trainingNameText = new() { Text = "foxvoice", Width = 150 };
+    private readonly TextBox _trainingEpochsText = new() { Text = "20", Width = 70 };
+    private readonly TextBox _trainingBatchText = new() { Text = "4", Width = 70 };
+    private readonly Button _browseTrainingDatasetButton = new() { Content = "选择数据集", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button _startTrainingButton = new() { Content = "开始一键训练", Padding = new Thickness(14, 8, 14, 8), IsEnabled = false };
 
     public MainWindow()
     {
@@ -133,7 +140,7 @@ public partial class MainWindow : Window
                 if (_trainingProcess is { HasExited: false })
                 {
                     StopTrainingProcess();
-                    FooterStatus.Text = $"检测到 {candidate}，训练组件安装已暂停；退出游戏后可继续，已下载内容会复用";
+                    FooterStatus.Text = $"检测到 {candidate}，安装或训练任务已停止；下载缓存和训练检查点会保留";
                 }
                 if (_modelTransferProcess is { HasExited: false })
                 {
@@ -488,6 +495,8 @@ public partial class MainWindow : Window
         _cancelTrainingButton.Click += (_, _) => StopTrainingProcess();
         _launchTrainingButton.Click += async (_, _) => await LaunchTrainingWorkbenchAsync();
         _importTrainingButton.Click += async (_, _) => await ImportTrainingOutputsAsync();
+        _browseTrainingDatasetButton.Click += (_, _) => BrowseTrainingDataset();
+        _startTrainingButton.Click += async (_, _) => await RunNativeTrainingAsync();
         TrainingView.Children.Clear();
         var root = new StackPanel { Margin = new Thickness(28, 26, 28, 26) };
         root.Children.Add(new TextBlock { Text = "MODEL TRAINING", Style = (Style)FindResource("Eyebrow") });
@@ -506,6 +515,23 @@ public partial class MainWindow : Window
         actions.Children.Add(_installCpuTrainingButton);
         actions.Children.Add(_cancelTrainingButton);
         content.Children.Add(actions);
+        content.Children.Add(new TextBlock { Text = "应用内一键训练", FontSize = 16, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 22, 0, 8) });
+        content.Children.Add(new TextBlock { Text = "数据集目录（本人授权的干净人声 WAV/FLAC）", Foreground = (Brush)FindResource("TextSecondary") });
+        var datasetRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 10) };
+        datasetRow.Children.Add(_trainingDatasetText);
+        datasetRow.Children.Add(_browseTrainingDatasetButton);
+        content.Children.Add(datasetRow);
+        var parameters = new StackPanel { Orientation = Orientation.Horizontal };
+        parameters.Children.Add(new TextBlock { Text = "名称", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 7, 0) });
+        parameters.Children.Add(_trainingNameText);
+        parameters.Children.Add(new TextBlock { Text = "轮数", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
+        parameters.Children.Add(_trainingEpochsText);
+        parameters.Children.Add(new TextBlock { Text = "批大小", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
+        parameters.Children.Add(_trainingBatchText);
+        content.Children.Add(parameters);
+        var nativeActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+        nativeActions.Children.Add(_startTrainingButton);
+        content.Children.Add(nativeActions);
         var workbenchActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
         workbenchActions.Children.Add(_launchTrainingButton);
         workbenchActions.Children.Add(_importTrainingButton);
@@ -514,10 +540,15 @@ public partial class MainWindow : Window
         root.Children.Add(card);
         root.Children.Add(new TextBlock
         {
-            Text = "安装可能下载数 GB 数据。检测到全屏/无边框游戏时会停止安装进程；Git、pip 与 Hugging Face 缓存允许稍后继续。训练任务向导将在环境完整自检通过后启用。",
+            Text = "安装可能下载数 GB 数据。检测到全屏/无边框游戏时会停止安装或训练进程；检查点会保留，可稍后继续。默认训练 RVC v2、40 kHz、F0/RMVPE，并生成检索索引。",
             Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap
         });
-        TrainingView.Children.Add(root);
+        TrainingView.Children.Add(new ScrollViewer
+        {
+            Content = root,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+        });
     }
 
     private async Task RefreshTrainingStatusAsync()
@@ -530,12 +561,14 @@ public partial class MainWindow : Window
         var torch = root.GetProperty("torchReady").GetBoolean();
         var cuda = root.GetProperty("cudaReady").GetBoolean();
         var models = root.GetProperty("modelsReady").GetBoolean();
+        _trainingReady = ready;
         _trainingStateText.Text = ready
             ? $"环境已就绪 · 源代码 ✓  Python ✓  PyTorch ✓  基础权重 ✓  CUDA {(cuda ? "✓" : "未启用")}"
             : $"尚未就绪 · 源代码 {(source ? "✓" : "—")}  Python {(python ? "✓" : "—")}  PyTorch {(torch ? "✓" : "—")}  基础权重 {(models ? "✓" : "—")}";
         _trainingStateText.Foreground = ready ? (Brush)FindResource("SuccessBrush") : new SolidColorBrush(Color.FromRgb(249, 200, 106));
         _launchTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
         _importTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
+        _startTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
     }
 
     private async Task InstallTrainingAsync(string backend)
@@ -601,8 +634,64 @@ public partial class MainWindow : Window
         _installCudaTrainingButton.IsEnabled = !running;
         _installCpuTrainingButton.IsEnabled = !running;
         _cancelTrainingButton.IsEnabled = running;
-        _launchTrainingButton.IsEnabled = !running;
-        _importTrainingButton.IsEnabled = !running;
+        _launchTrainingButton.IsEnabled = !running && _trainingReady;
+        _importTrainingButton.IsEnabled = !running && _trainingReady;
+        _startTrainingButton.IsEnabled = !running && _trainingReady;
+        _browseTrainingDatasetButton.IsEnabled = !running;
+    }
+
+    private void BrowseTrainingDataset()
+    {
+        var dialog = new OpenFolderDialog { Title = "选择已获授权的训练音频目录", Multiselect = false };
+        if (dialog.ShowDialog(this) == true) _trainingDatasetText.Text = dialog.FolderName;
+    }
+
+    private async Task RunNativeTrainingAsync()
+    {
+        if (RejectHeavyWorkDuringGame("模型训练")) return;
+        if (_trainingProcess is { HasExited: false } || _supervisorPath is null) return;
+        var dataset = _trainingDatasetText.Text.Trim();
+        var name = _trainingNameText.Text.Trim();
+        if (!Directory.Exists(dataset)) { FooterStatus.Text = "请选择有效的训练数据集目录"; return; }
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[A-Za-z0-9_-]{1,64}$")) { FooterStatus.Text = "实验名称只能包含英文、数字、下划线或连字符"; return; }
+        if (!ushort.TryParse(_trainingEpochsText.Text, out var epochs) || epochs is < 1 or > 1200) { FooterStatus.Text = "训练轮数必须为 1-1200"; return; }
+        if (!byte.TryParse(_trainingBatchText.Text, out var batch) || batch is < 1 or > 64) { FooterStatus.Text = "批大小必须为 1-64"; return; }
+        var answer = MessageBox.Show(this, "训练会长时间占用 CPU/GPU。请确认数据集中的声音均已获得授权，训练期间不要启动游戏。", "开始一键训练", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.OK) return;
+        var workers = Math.Clamp(Environment.ProcessorCount / 2, 1, 16);
+        var process = new Process
+        {
+            StartInfo = CreateStartInfo(_supervisorPath, ["training", "run", "--dataset", dataset, "--name", name, "--epochs", epochs.ToString(), "--batch", batch.ToString(), "--workers", workers.ToString()], redirectInput: false),
+            EnableRaisingEvents = true
+        };
+        _trainingProcess = process;
+        SetTrainingButtons(true);
+        var lastError = "";
+        try
+        {
+            process.Start();
+            try { process.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            while (await process.StandardError.ReadLineAsync() is { } line)
+            {
+                lastError = line;
+                if (line.StartsWith("FOXVOICE_TRAINING_STAGE="))
+                    FooterStatus.Text = line["FOXVOICE_TRAINING_STAGE=".Length..];
+            }
+            await process.WaitForExitAsync();
+            await outputTask;
+            if (process.ExitCode != 0) throw new InvalidOperationException(lastError.Length == 0 ? "训练任务失败" : lastError);
+            FooterStatus.Text = "训练完成；正在导入输出模型";
+            await ImportTrainingOutputsAsync(confirm: false);
+        }
+        catch (Exception) when (!ReferenceEquals(_trainingProcess, process)) { FooterStatus.Text = "训练已停止；已有检查点未删除"; }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+        finally
+        {
+            if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
+            process.Dispose();
+            SetTrainingButtons(false);
+        }
     }
 
     private async Task LaunchTrainingWorkbenchAsync()
@@ -659,7 +748,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task ImportTrainingOutputsAsync()
+    private async Task ImportTrainingOutputsAsync(bool confirm = true)
     {
         if (RejectHeavyWorkDuringGame("训练结果导入")) return;
         try
@@ -672,9 +761,12 @@ public partial class MainWindow : Window
                 FooterStatus.Text = "训练工作台尚未生成 .pth 或 .index 结果";
                 return;
             }
-            var answer = MessageBox.Show(this, $"发现 {paths.Count} 个训练结果。将全部经过哈希和格式门禁后导入模型库。",
-                "导入训练结果", MessageBoxButton.OKCancel, MessageBoxImage.Information);
-            if (answer != MessageBoxResult.OK) return;
+            if (confirm)
+            {
+                var answer = MessageBox.Show(this, $"发现 {paths.Count} 个训练结果。将全部经过哈希和格式门禁后导入模型库。",
+                    "导入训练结果", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+                if (answer != MessageBoxResult.OK) return;
+            }
             foreach (var path in paths) await RunSupervisorAsync("models", "import", path);
             await RefreshModelsAsync();
             ModelsNav.IsChecked = true;
