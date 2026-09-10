@@ -8,8 +8,9 @@ $desktop = Join-Path $releaseDirectory 'FoxVoice.exe'
 $supervisor = Join-Path $releaseDirectory 'foxvoice-supervisor.exe'
 $engine = Join-Path $releaseDirectory 'foxvoice-engine.exe'
 $converter = Join-Path $releaseDirectory 'foxvoice-converter.exe'
+$bootstrap = Join-Path $releaseDirectory 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
 
-foreach ($path in @($desktop, $supervisor, $engine, $converter)) {
+foreach ($path in @($desktop, $supervisor, $engine, $converter, $bootstrap)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing release file: $path" }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $releaseDirectory 'THIRD_PARTY_NOTICES.md'))) {
@@ -27,6 +28,10 @@ if (-not $doctor.profile) { throw 'Doctor output has no hardware profile.' }
 $devices = & $supervisor audio-devices | ConvertFrom-Json
 if (@($devices).Count -eq 0) { throw 'No audio devices were returned.' }
 $models = & $supervisor models list | ConvertFrom-Json
+$providers = & $engine provider-status | ConvertFrom-Json
+if (-not (@($providers) | Where-Object name -Like 'NvTensorRT*ExecutionProvider')) {
+    throw 'Windows ML provider catalog did not expose NvTensorRT RTX.'
+}
 
 $smokeId = [guid]::NewGuid().ToString('N')
 $stdout = Join-Path ([IO.Path]::GetTempPath()) "FoxVoiceEngine-$smokeId.stdout"
@@ -119,13 +124,19 @@ try {
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         if ((Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-supervisor.exe')) -and
             (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe')) -and
-            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe'))) { break }
+            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe')) -and
+            (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'Microsoft.WindowsAppRuntime.Bootstrap.dll'))) { break }
         Start-Sleep -Milliseconds 250
     }
     if (-not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-supervisor.exe')) -or
         -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-engine.exe')) -or
-        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe'))) {
+        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'foxvoice-converter.exe')) -or
+        -not (Test-Path -LiteralPath (Join-Path $isolatedRuntime 'Microsoft.WindowsAppRuntime.Bootstrap.dll'))) {
         throw 'Embedded native components were not extracted in isolated single-EXE mode.'
+    }
+    $isolatedProviders = & (Join-Path $isolatedRuntime 'foxvoice-engine.exe') provider-status | ConvertFrom-Json
+    if (-not (@($isolatedProviders) | Where-Object name -Like 'NvTensorRT*ExecutionProvider')) {
+        throw 'Isolated engine could not initialize Windows ML provider catalog.'
     }
 }
 finally {

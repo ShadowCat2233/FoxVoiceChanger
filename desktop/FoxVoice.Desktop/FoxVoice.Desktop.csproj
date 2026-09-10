@@ -18,5 +18,8 @@
     <EmbeddedResource Include="..\..\native\target\release\foxvoice-converter.exe"
                       LogicalName="FoxVoice.Native.foxvoice-converter.exe"
                       Condition="Exists('..\..\native\target\release\foxvoice-converter.exe')" />
+    <EmbeddedResource Include="..\..\native\target\release\Microsoft.WindowsAppRuntime.Bootstrap.dll"
+                      LogicalName="FoxVoice.Native.Microsoft.WindowsAppRuntime.Bootstrap.dll"
+                      Condition="Exists('..\..\native\target\release\Microsoft.WindowsAppRuntime.Bootstrap.dll')" />
   </ItemGroup>
 </Project>

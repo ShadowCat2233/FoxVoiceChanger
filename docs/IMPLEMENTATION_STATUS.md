@@ -24,27 +24,28 @@
 - 单轨离线转换已接入：从模型库选择 WAV 后使用当前 Generator、ContentVec、RMVPE 与音高执行独立 RVC 转换，结果以临时 WAV 完成后提交；游戏或实时引擎运行时拒绝启动；
 - 训练组件管理已接入：固定官方 RVC commit，按需自动安装 Python 3.12、FFmpeg、隔离 venv、CPU/CUDA PyTorch、依赖和训练权重；状态逐项自检，支持取消，游戏检测会停止后台安装并保留可复用缓存；
 - 训练任务入口已接入：FoxVoice 管理隔离的官方本机训练工作台进程，检测游戏时停止任务；训练生成的 `.pth/.index` 可批量经过现有模型门禁导入并继续转换；
+- Windows ML 发布依赖已修复：固定并校验 Windows App SDK Foundation NuGet，随 ZIP 和单文件内嵌 bootstrapper 及许可证；组件中心可读取系统 EP 目录，并以当前三模型执行真实 TensorRT RTX 安装/自检后才设为首选后端；
 - 单文件自包含启动、原生组件按哈希提取和崩溃日志；
 - 分阶段发布、SHA-256 清单、便携 ZIP 和自动冒烟测试。
 
 ## 本机验证结果
 
 - Windows x64，NVIDIA GeForce RTX 4060 Ti；
-- 5 个 WASAPI 输入/输出端点可枚举；
+- 8 个 WASAPI 输入/输出端点可枚举；
 - DirectML 为当前推荐后端；
 - 安全旁路达到 `Running`，48 kHz，实时参数命令发送后进程继续运行；
 - Windows UI Automation 已点击验证五个导航、设备弹窗、无模型启动引导、旁路启停和音高调整；
-- 发布目录与纯单文件隔离启动都保持响应，内嵌的两个原生组件能够自动提取；
-- Rust 工作区 20 个测试通过，Clippy 使用 `-D warnings` 通过；
-- 当前本机模型库为 0 个模型，未进行特定声音的 RVC 听感验收。
+- 发布目录与纯单文件隔离启动都保持响应，内嵌的三个原生组件及 Windows ML bootstrapper 能够自动提取；
+- Rust 工作区 27 个测试通过，Clippy 使用 `-D warnings` 通过；
+- 当前本机模型库有 1 个可用 ONNX Generator 和其来源 `.pth`；DirectML 三模型真实自检稳态 160 ms 块推理 49.3 ms，非静音输出成功；Generator 来源许可证仍需用户自行确认。
 - 组件中心已接入 ContentVec/RMVPE 的按需安装、GPL-3.0 确认、临时下载、长度/SHA-256 强校验与自动路径配置；基础权重仍不随发布包分发。
-- 双输出路由已实现为“主 RVC -> 虚拟声卡”和“虚拟声卡录音端 -> 物理耳机”的隔离低优先级监听进程；本机尚未安装 VB-CABLE，因此真实驱动联调仍待验收。
+- VB-CABLE 已被枚举；“麦克风 -> RVC -> CABLE Input”短时真实链路运行 12 秒，稳态处理 34–41 ms。到具体游戏的设备选择、听感和本地监听仍待人工验收。
 
 ## 未交付
 
 - FoxVoice 原生表单式一键训练编排（当前使用由 FoxVoice 托管的官方本机训练工作台，产物批量导入已接入）；
-- TensorRT/CUDA 可选组件安装；
-- VB-CABLE 的真实驱动安装/重启后联调（程序提供官方安装入口，不捆绑或静默安装第三方驱动）；
+- TensorRT RTX 仍需在具备合法三模型时完成本机按需下载和听感/压力验收；传统 ORT CUDA 独立发行包尚未提供；
+- VB-CABLE 在具体游戏/Discord 中的设备选择、听感和本地双输出监听人工验收；
 - RVC v1、未启用 F0 或非标准结构 `.pth` 的转换（当前转换器明确拒绝）；
 - 2 小时以上真实游戏压力测试。
 

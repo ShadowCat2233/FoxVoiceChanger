@@ -15,6 +15,7 @@ internal sealed class UserSettings
     public double OutputGainDb { get; set; }
     public bool NoiseGateEnabled { get; set; }
     public bool GameGuardEnabled { get; set; } = true;
+    public string PreferredProvider { get; set; } = "directml";
     public List<string> SoundboardFiles { get; set; } = [];
     public double SoundboardGainDb { get; set; } = -3;
 

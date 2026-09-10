@@ -52,6 +52,8 @@ public partial class MainWindow : Window
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
     private readonly Button _installFoundationButton = new() { Content = "安装基础模型", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
     private readonly Button _rvcSelfTestButton = new() { Content = "运行 RVC 三模型自检", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 10, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
+    private readonly TextBlock _tensorRtStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
+    private readonly Button _installTensorRtButton = new() { Content = "安装并自检", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
     private readonly WrapPanel _soundboardPanel = new();
     private readonly Slider _soundboardGain = new() { Minimum = -36, Maximum = 12, Width = 180, TickFrequency = 3, IsSnapToTickEnabled = false };
     private readonly TextBlock _trainingStateText = new() { Text = "检测中", TextWrapping = TextWrapping.Wrap };
@@ -65,6 +67,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         AddFoundationModelsCard();
+        AddTensorRtAction();
         AddMonitorDevicePicker();
         AddVirtualCableInstallAction();
         AddRvcSelfTestAction();
@@ -218,6 +221,8 @@ public partial class MainWindow : Window
         catch (Exception error) { failures.Add($"基础模型：{FriendlyError(error)}"); }
         try { await RefreshTrainingStatusAsync(); }
         catch (Exception error) { failures.Add($"训练组件：{FriendlyError(error)}"); }
+        try { await RefreshTensorRtStatusAsync(); }
+        catch (Exception error) { failures.Add($"TensorRT RTX：{FriendlyError(error)}"); }
 
         if (failures.Count == 0)
         {
@@ -381,6 +386,70 @@ public partial class MainWindow : Window
         };
         if (ComponentsView.Content is StackPanel root && root.Children.OfType<StackPanel>().LastOrDefault() is StackPanel list)
             list.Children.Insert(1, card);
+    }
+
+    private void AddTensorRtAction()
+    {
+        _installTensorRtButton.Click += InstallTensorRt_Click;
+        var title = FindDescendant<TextBlock>(ComponentsView, value => Equals(value.Text, "TensorRT 高性能引擎"));
+        if (title?.Parent is not StackPanel || VisualTreeHelper.GetParent(title.Parent) is not Grid row) return;
+        var oldState = row.Children.OfType<TextBlock>().FirstOrDefault(value => Grid.GetColumn(value) == 2);
+        if (oldState is not null) row.Children.Remove(oldState);
+        var actions = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
+        actions.Children.Add(_tensorRtStateText);
+        actions.Children.Add(_installTensorRtButton);
+        Grid.SetColumn(actions, 2);
+        row.Children.Add(actions);
+    }
+
+    private async Task RefreshTensorRtStatusAsync()
+    {
+        using var document = JsonDocument.Parse(await RunEngineCommandAsync("provider-status"));
+        var provider = document.RootElement.EnumerateArray().FirstOrDefault(value =>
+            value.GetProperty("name").GetString()?.Contains("NvTensorRT", StringComparison.OrdinalIgnoreCase) == true);
+        var state = provider.ValueKind == JsonValueKind.Undefined
+            ? "不受支持"
+            : provider.GetProperty("readyState").GetString() ?? "未知";
+        var ready = state.Equals("Ready", StringComparison.OrdinalIgnoreCase);
+        _tensorRtStateText.Text = ready ? "已安装" : state == "NotPresent" ? "可按需安装" : state == "NotReady" ? "需要准备" : state;
+        _tensorRtStateText.Foreground = ready ? (Brush)FindResource("SuccessBrush") : new SolidColorBrush(Color.FromRgb(249, 200, 106));
+        _installTensorRtButton.Content = ready ? "重新自检" : "安装并自检";
+        if (ready) _settings.PreferredProvider = "nvtrtx";
+    }
+
+    private async void InstallTensorRt_Click(object sender, RoutedEventArgs e)
+    {
+        if (RejectHeavyWorkDuringGame("TensorRT RTX 安装与自检")) return;
+        if (_selectedModel is null || !File.Exists(EmbedderPath.Text) || !File.Exists(F0Path.Text))
+        {
+            FooterStatus.Text = "TensorRT RTX 真实自检需要先选择 Generator，并安装 ContentVec 与 RMVPE";
+            return;
+        }
+        var answer = MessageBox.Show(this,
+            "Windows ML 将按需获取 NVIDIA TensorRT RTX 执行提供程序。该组件遵循 NVIDIA 软件许可，不随 FoxVoice 打包。\n\n继续后会用当前三模型执行一帧真实推理；只有成功才会设为首选后端。",
+            "安装 TensorRT RTX", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+        if (answer != MessageBoxResult.OK) return;
+        try
+        {
+            _installTensorRtButton.IsEnabled = false;
+            FooterStatus.Text = "正在通过 Windows ML 准备 TensorRT RTX 并执行三模型自检…";
+            using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
+            var modelPath = resolved.RootElement.GetProperty("path").GetString()
+                ?? throw new InvalidOperationException("模型路径解析失败");
+            using var report = JsonDocument.Parse(await RunEngineCommandAsync(
+                "validate-rvc", "--provider", "nvtrtx", "--model", modelPath,
+                "--embedder", EmbedderPath.Text, "--f0", F0Path.Text));
+            _settings.PreferredProvider = "nvtrtx";
+            TrySaveSettings();
+            await RefreshTensorRtStatusAsync();
+            FooterStatus.Text = $"TensorRT RTX 三模型自检通过，单帧 {report.RootElement.GetProperty("inferenceMs").GetDouble():N1} ms";
+        }
+        catch (Exception error)
+        {
+            _settings.PreferredProvider = "directml";
+            FooterStatus.Text = $"TensorRT RTX 未启用：{FriendlyError(error)}";
+        }
+        finally { _installTensorRtButton.IsEnabled = true; }
     }
 
     private void AddMonitorDevicePicker()
@@ -1163,6 +1232,7 @@ public partial class MainWindow : Window
         var arguments = new List<string>
         {
             command,
+            "--provider", _settings.PreferredProvider is "nvtrtx" ? "nvtrtx" : "directml",
             "--pitch", PitchSlider.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture),
             "--output-gain-db", OutputGainSlider.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)
         };
@@ -1704,7 +1774,12 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured)) return configured;
         var bundled = Path.Combine(AppContext.BaseDirectory, fileName);
         if (File.Exists(bundled)) return bundled;
-        try { return NativeBundle.EnsureExtracted(fileName); }
+        try
+        {
+            if (fileName.Equals("foxvoice-engine.exe", StringComparison.OrdinalIgnoreCase))
+                NativeBundle.EnsureExtracted("Microsoft.WindowsAppRuntime.Bootstrap.dll");
+            return NativeBundle.EnsureExtracted(fileName);
+        }
         catch (FileNotFoundException) { }
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
         {

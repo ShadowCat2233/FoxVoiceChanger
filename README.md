@@ -21,6 +21,7 @@
 - 音效板支持最多 24 个 PCM/Float WAV、独立增益、重采样、当前主输出共享混音以及前 8 个音效的系统级 `Ctrl+Alt+F1…F8` 热键；每次播放使用低优先级隔离进程；
 - 模型库可把 PCM/Float WAV 送入同一 RVC 三模型管线离线转换，支持音高设置、单声道下混、重采样和临时文件提交；转换时不会占用麦克风或实时音频设备；
 - 独立 `foxvoice-engine` 进程复用 `vc-app`/`vc-core` 的 RVC、SOLA、重采样和双时钟音频运行时；
+- Windows ML bootstrapper 与再分发许可证经过固定 NuGet SHA-256 后进入发布包和单文件内嵌运行时；NVIDIA RTX 30 系及以上可通过系统 EP 目录按需安装 TensorRT RTX，并以当前三模型真实推理通过后启用；
 - RVC 进程异常退出后刷新设备并自动回退到默认设备安全旁路；
 - 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
 - 模型训练页可按需安装固定版本的官方 RVC 训练源代码、Python 3.12、FFmpeg、隔离 venv、CPU/CUDA PyTorch 和训练基础权重；安装可取消，检测到游戏时自动停止并允许稍后续装。

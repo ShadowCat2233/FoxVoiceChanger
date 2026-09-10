@@ -1,5 +1,11 @@
 # Third-party notices
 
+## Microsoft Windows App SDK Foundation
+
+The Windows release redistributes `Microsoft.WindowsAppRuntime.Bootstrap.dll` from the pinned
+Microsoft.WindowsAppSDK.Foundation NuGet package. Its original redistributable license is included
+as `licenses/WindowsAppSDK-LICENSE.txt` in the release archive.
+
 ## RVC-Project/Retrieval-based-Voice-Conversion-WebUI
 
 FoxVoice can optionally download a pinned upstream checkout for local model training. The training

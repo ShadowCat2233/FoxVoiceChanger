@@ -37,6 +37,34 @@ if ($LASTEXITCODE -ne 0) { throw 'RVC model converter release build failed.' }
 
 $artifactsDirectory = Join-Path $projectRoot 'artifacts'
 New-Item -ItemType Directory -Force -Path $artifactsDirectory | Out-Null
+$dependencyCache = Join-Path $artifactsDirectory '.dependency-cache'
+New-Item -ItemType Directory -Force -Path $dependencyCache | Out-Null
+$windowsAppSdkVersion = '2.3.9'
+$windowsAppSdkHash = '230BC605A3FC9ED689B2117056C5274923BF58B453FA44EDDE18A168BBF628BE'
+$windowsAppSdkPackage = Join-Path $dependencyCache "Microsoft.WindowsAppSDK.Foundation.$windowsAppSdkVersion.nupkg"
+$windowsAppSdkExtract = Join-Path $dependencyCache "Microsoft.WindowsAppSDK.Foundation.$windowsAppSdkVersion"
+if (-not (Test-Path -LiteralPath $windowsAppSdkPackage)) {
+    $partialPackage = "$windowsAppSdkPackage.partial"
+    Invoke-WebRequest -UseBasicParsing `
+        -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.windowsappsdk.foundation/$windowsAppSdkVersion/microsoft.windowsappsdk.foundation.$windowsAppSdkVersion.nupkg" `
+        -OutFile $partialPackage
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $partialPackage).Hash -ne $windowsAppSdkHash) {
+        throw 'Windows App SDK Foundation package SHA-256 mismatch.'
+    }
+    Move-Item -LiteralPath $partialPackage -Destination $windowsAppSdkPackage
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $windowsAppSdkPackage).Hash -ne $windowsAppSdkHash) {
+    throw 'Cached Windows App SDK Foundation package SHA-256 mismatch.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $windowsAppSdkExtract 'runtimes\win-x64\native\Microsoft.WindowsAppRuntime.Bootstrap.dll'))) {
+    Expand-Archive -LiteralPath $windowsAppSdkPackage -DestinationPath $windowsAppSdkExtract -Force
+}
+$windowsMlBootstrap = Join-Path $windowsAppSdkExtract 'runtimes\win-x64\native\Microsoft.WindowsAppRuntime.Bootstrap.dll'
+$windowsAppSdkLicense = Join-Path $windowsAppSdkExtract 'license.txt'
+if (-not (Test-Path -LiteralPath $windowsMlBootstrap) -or -not (Test-Path -LiteralPath $windowsAppSdkLicense)) {
+    throw 'Windows App SDK bootstrapper or redistributable license is missing.'
+}
+Copy-Item -LiteralPath $windowsMlBootstrap -Destination (Join-Path $projectRoot 'native\target\release\Microsoft.WindowsAppRuntime.Bootstrap.dll') -Force
 $outputDirectory = Join-Path $artifactsDirectory 'FoxVoice-win-x64'
 $stagingDirectory = Join-Path $artifactsDirectory ".FoxVoice-win-x64-staging-$PID"
 $archivePath = Join-Path $artifactsDirectory 'FoxVoice-win-x64.zip'
@@ -69,11 +97,17 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-c
     -Destination (Join-Path $stagingDirectory 'foxvoice-converter.exe') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') `
     -Destination (Join-Path $stagingDirectory 'THIRD_PARTY_NOTICES.md') -Force
+Copy-Item -LiteralPath $windowsMlBootstrap `
+    -Destination (Join-Path $stagingDirectory 'Microsoft.WindowsAppRuntime.Bootstrap.dll') -Force
+$licenseDirectory = Join-Path $stagingDirectory 'licenses'
+New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
+Copy-Item -LiteralPath $windowsAppSdkLicense `
+    -Destination (Join-Path $licenseDirectory 'WindowsAppSDK-LICENSE.txt') -Force
 $debugSymbols = Join-Path $stagingDirectory 'FoxVoice.pdb'
 if (Test-Path -LiteralPath $debugSymbols) { Remove-Item -LiteralPath $debugSymbols -Force }
 
-$hashes = Get-ChildItem -LiteralPath $stagingDirectory -File | Where-Object Name -ne 'SHA256SUMS.json' | ForEach-Object {
-    [pscustomobject]@{ File = $_.Name; SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash }
+$hashes = Get-ChildItem -LiteralPath $stagingDirectory -File -Recurse | Where-Object Name -ne 'SHA256SUMS.json' | ForEach-Object {
+    [pscustomobject]@{ File = [IO.Path]::GetRelativePath($stagingDirectory, $_.FullName); SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash }
 }
 $hashes | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $stagingDirectory 'SHA256SUMS.json')
 Compress-Archive -Path (Join-Path $stagingDirectory '*') -DestinationPath $archiveStagingPath -CompressionLevel Optimal

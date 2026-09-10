@@ -37,9 +37,12 @@ fn run() -> Result<()> {
         "passthrough" => run_engine(true),
         "rvc" => run_engine(false),
         "validate-rvc" => validate_rvc(),
+        "provider-status" => provider_status(),
         "convert-wav" => convert_wav(),
         "play-wav" => play_wav(),
-        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc, convert-wav, play-wav"),
+        _ => bail!(
+            "可用命令: devices, passthrough, rvc, validate-rvc, provider-status, convert-wav, play-wav"
+        ),
     }
 }
 
@@ -67,6 +70,7 @@ fn convert_wav() -> Result<()> {
         .transpose()
         .context("--pitch 必须是数字")?
         .unwrap_or(0.0_f32);
+    let provider = selected_provider(&arguments)?;
     anyhow::ensure!(
         (-24.0..=24.0).contains(&pitch_shift),
         "--pitch 必须在 -24 到 +24 半音之间"
@@ -84,7 +88,7 @@ fn convert_wav() -> Result<()> {
                 embedder,
                 f0_model,
                 output,
-                pitch_shift,
+                (pitch_shift, provider),
             )
         })
         .context("无法启动离线转换线程")?;
@@ -102,8 +106,9 @@ fn convert_wav_inner(
     embedder: PathBuf,
     f0_model: PathBuf,
     output: PathBuf,
-    pitch_shift: f32,
+    runtime: (f32, Provider),
 ) -> Result<serde_json::Value> {
+    let (pitch_shift, provider) = runtime;
     let sample_rate = 48_000;
     let timing = RvcChunkTiming::from_ms(160, sample_rate)?;
     let input = resample_linear(&source, source_rate, sample_rate);
@@ -113,7 +118,7 @@ fn convert_wav_inner(
         embedder: &embedder,
         embedder_output: None,
         f0_model: &f0_model,
-        provider: windows_provider()?,
+        provider,
         gpu_priority: vc_core::model_rvc::GpuPriority::Normal,
         gpu_device_id: 0,
         sample_rate,
@@ -346,6 +351,8 @@ fn validate_rvc() -> Result<()> {
     let model = required_path(&arguments, "--model")?;
     let embedder = required_path(&arguments, "--embedder")?;
     let f0_model = required_path(&arguments, "--f0")?;
+    let provider = selected_provider(&arguments)?;
+    let provider_label = provider.label();
     let worker = thread::Builder::new()
         .name("foxvoice-rvc-self-test".into())
         .stack_size(64 * 1024 * 1024)
@@ -358,7 +365,7 @@ fn validate_rvc() -> Result<()> {
                 embedder: &embedder,
                 embedder_output: None,
                 f0_model: &f0_model,
-                provider: windows_provider()?,
+                provider,
                 gpu_priority: vc_core::model_rvc::GpuPriority::High,
                 gpu_device_id: 0,
                 sample_rate,
@@ -386,12 +393,15 @@ fn validate_rvc() -> Result<()> {
                 .collect();
             let mut audio = Vec::new();
             let mut pitch = Vec::new();
+            let warmup_started = Instant::now();
+            pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
+            let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
             let inference_started = Instant::now();
             let result = pipeline.process(&input, sample_rate, &mut audio, &mut pitch)?;
             let inference_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
             Ok(json!({
-                "ok": true, "provider": "windowsml-directml", "loadMs": load_ms,
-                "inferenceMs": inference_ms, "inputSamples": input.len(),
+                "ok": true, "provider": provider_label, "loadMs": load_ms,
+                "warmupMs": warmup_ms, "inferenceMs": inference_ms, "inputSamples": input.len(),
                 "outputSamples": audio.len(), "modelSampleRate": result.sample_rate,
                 "voicedRatio": result.voiced_ratio
             }))
@@ -454,7 +464,7 @@ fn run_engine(passthrough: bool) -> Result<()> {
     let controller = EngineController::new(live);
     let mut config = RealtimeConfig {
         passthrough,
-        provider: windows_provider()?,
+        provider: selected_provider(&arguments)?,
         chunk_ms: if monitoring { 60 } else { 160 },
         crossfade_ms: if monitoring { 10 } else { 40 },
         sola_search_ms: if monitoring { 5 } else { 12 },
@@ -595,10 +605,40 @@ fn option_value<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-fn windows_provider() -> Result<Provider> {
+fn selected_provider(arguments: &[String]) -> Result<Provider> {
     #[cfg(all(windows, feature = "windowsml"))]
     {
-        Ok(Provider::WindowsMlDirectMl)
+        match option_value(arguments, "--provider").unwrap_or("directml") {
+            "directml" => Ok(Provider::WindowsMlDirectMl),
+            "auto" => Ok(Provider::WindowsMl),
+            "nvtrtx" => Ok(Provider::WindowsMlNvTensorRtRtx),
+            value => bail!("未知 Windows ML 后端: {value}；可用值 directml, auto, nvtrtx"),
+        }
+    }
+    #[cfg(not(all(windows, feature = "windowsml")))]
+    {
+        let _ = arguments;
+        bail!("当前构建未启用 WindowsML；请使用 --features windowsml")
+    }
+}
+
+fn provider_status() -> Result<()> {
+    #[cfg(all(windows, feature = "windowsml"))]
+    {
+        let providers = vc_core::windows_ml::list_catalog_providers()?
+            .into_iter()
+            .map(|provider| {
+                json!({
+                    "name": provider.name,
+                    "version": provider.version,
+                    "readyState": provider.ready_state.label(),
+                    "certification": provider.certification,
+                    "libraryPath": provider.library_path
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&providers)?);
+        Ok(())
     }
     #[cfg(not(all(windows, feature = "windowsml")))]
     {
