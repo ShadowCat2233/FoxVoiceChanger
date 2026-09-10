@@ -399,8 +399,11 @@ name = "foxvoice-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
+ "hound",
  "serde",
  "serde_json",
+ "tempfile",
  "vc-app",
  "vc-core",
 ]

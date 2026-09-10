@@ -15,6 +15,8 @@ internal sealed class UserSettings
     public double OutputGainDb { get; set; }
     public bool NoiseGateEnabled { get; set; }
     public bool GameGuardEnabled { get; set; } = true;
+    public List<string> SoundboardFiles { get; set; } = [];
+    public double SoundboardGainDb { get; set; } = -3;
 
     private static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

@@ -11,7 +11,12 @@ windowsml = ["vc-app/windowsml", "vc-core/windowsml"]
 
 [dependencies]
 anyhow.workspace = true
+cpal.workspace = true
+hound = "3.5.1"
 serde.workspace = true
 serde_json.workspace = true
 vc-app = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }
 vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.23.0"

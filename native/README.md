@@ -50,6 +50,7 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models convert model-0123456789abcdef
 cargo run --manifest-path native/Cargo.toml -p foxvoice-engine --features windowsml -- validate-rvc --model voice.onnx --embedder contentvec.onnx --f0 rmvpe.onnx
+cargo run --manifest-path native/Cargo.toml -p foxvoice-engine --features windowsml -- play-wav --file effect.wav --output "CABLE Input" --gain-db -3
 ```
 
 模型库默认位于 `%LOCALAPPDATA%\FoxVoice\models`。测试和便携运行可通过

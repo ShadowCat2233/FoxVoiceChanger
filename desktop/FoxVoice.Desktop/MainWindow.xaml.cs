@@ -1,10 +1,12 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Win32;
@@ -19,6 +21,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _deviceRefreshTimer = new() { Interval = TimeSpan.FromSeconds(10) };
     private Process? _audioProcess;
     private Process? _monitorProcess;
+    private readonly HashSet<Process> _soundProcesses = [];
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
     private string? _enginePath;
@@ -36,11 +39,15 @@ public partial class MainWindow : Window
     private ulong _guardLastStreamErrors;
     private bool _guardCommandPending;
     private bool _refreshingDevices;
+    private IntPtr _windowHandle;
+    private HwndSource? _windowSource;
     private AudioDevice? _virtualCableInput;
     private readonly ComboBox _monitorDeviceCombo = new() { DisplayMemberPath = "Name", Margin = new Thickness(0, 6, 0, 12) };
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
     private readonly Button _installFoundationButton = new() { Content = "安装基础模型", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
     private readonly Button _rvcSelfTestButton = new() { Content = "运行 RVC 三模型自检", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 10, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
+    private readonly WrapPanel _soundboardPanel = new();
+    private readonly Slider _soundboardGain = new() { Minimum = -36, Maximum = 12, Width = 180, TickFrequency = 3, IsSnapToTickEnabled = false };
 
     public MainWindow()
     {
@@ -50,6 +57,7 @@ public partial class MainWindow : Window
         AddVirtualCableInstallAction();
         AddRvcSelfTestAction();
         _settings = UserSettings.Load();
+        BuildSoundboardView();
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
         PitchSlider.Value = _settings.Pitch;
@@ -62,12 +70,15 @@ public partial class MainWindow : Window
         _deviceRefreshTimer.Tick += DeviceRefreshTimer_Tick;
 
         Loaded += MainWindow_Loaded;
+        SourceInitialized += (_, _) => InitializeSoundboardHotkeys();
         Closing += (_, _) =>
         {
             TrySaveSettings();
             _deviceRefreshTimer.Stop();
             StopAudioProcess();
             StopMonitorProcess();
+            StopSoundboardProcesses();
+            ReleaseSoundboardHotkeys();
         };
     }
 
@@ -300,6 +311,187 @@ public partial class MainWindow : Window
         });
         routePanel.Children.Add(_monitorDeviceCombo);
     }
+
+    private void BuildSoundboardView()
+    {
+        _settings.SoundboardFiles = _settings.SoundboardFiles
+            .Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).Take(24).ToList();
+        _soundboardGain.Value = Math.Clamp(_settings.SoundboardGainDb, -36, 12);
+        _soundboardGain.ValueChanged += (_, _) =>
+        {
+            if (!_ready) return;
+            _settings.SoundboardGainDb = _soundboardGain.Value;
+            TrySaveSettings();
+        };
+        SoundboardView.Children.Clear();
+        var root = new Grid { Margin = new Thickness(28, 26, 28, 26) };
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition());
+        var title = new StackPanel();
+        title.Children.Add(new TextBlock { Text = "SOUNDBOARD", Style = (Style)FindResource("Eyebrow") });
+        title.Children.Add(new TextBlock { Text = "音效板", Style = (Style)FindResource("SectionTitle") });
+        var add = new Button { Content = "＋ 添加 WAV", Style = (Style)FindResource("PrimaryButton"), HorizontalAlignment = HorizontalAlignment.Right };
+        add.Click += AddSound_Click;
+        var header = new Grid();
+        header.Children.Add(title);
+        header.Children.Add(add);
+        root.Children.Add(header);
+
+        var mixer = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 18, 0, 16), Padding = new Thickness(18) };
+        var mixerGrid = new Grid();
+        mixerGrid.ColumnDefinitions.Add(new ColumnDefinition());
+        mixerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var copy = new StackPanel();
+        copy.Children.Add(new TextBlock { Text = "共享输出混音", FontWeight = FontWeights.SemiBold });
+        copy.Children.Add(new TextBlock { Text = "音效发送到当前主输出；选择 VB-CABLE 时会与变声一起进入游戏", Foreground = (Brush)FindResource("TextSecondary") });
+        var gain = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        gain.Children.Add(new TextBlock { Text = "音效增益", Margin = new Thickness(0, 0, 10, 0), VerticalAlignment = VerticalAlignment.Center });
+        gain.Children.Add(_soundboardGain);
+        Grid.SetColumn(gain, 1);
+        mixerGrid.Children.Add(copy);
+        mixerGrid.Children.Add(gain);
+        mixer.Child = mixerGrid;
+        Grid.SetRow(mixer, 1);
+        root.Children.Add(mixer);
+
+        var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _soundboardPanel };
+        Grid.SetRow(scroll, 2);
+        root.Children.Add(scroll);
+        SoundboardView.Children.Add(root);
+        RefreshSoundboardCards();
+    }
+
+    private void AddSound_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog { Title = "添加音效", Filter = "WAV 音频 (*.wav)|*.wav", Multiselect = true };
+        if (dialog.ShowDialog(this) != true) return;
+        foreach (var path in dialog.FileNames)
+        {
+            if (_settings.SoundboardFiles.Count >= 24) break;
+            if (!_settings.SoundboardFiles.Contains(path, StringComparer.OrdinalIgnoreCase)) _settings.SoundboardFiles.Add(path);
+        }
+        TrySaveSettings();
+        RefreshSoundboardCards();
+    }
+
+    private void RefreshSoundboardCards()
+    {
+        _soundboardPanel.Children.Clear();
+        foreach (var (path, index) in _settings.SoundboardFiles.ToList().Select((path, index) => (path, index)))
+        {
+            if (!File.Exists(path)) { _settings.SoundboardFiles.Remove(path); continue; }
+            var card = new Border { Style = (Style)FindResource("Panel"), Width = 220, Margin = new Thickness(0, 0, 12, 12), Padding = new Thickness(14) };
+            var stack = new StackPanel();
+            stack.Children.Add(new TextBlock { Text = Path.GetFileNameWithoutExtension(path), FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis });
+            stack.Children.Add(new TextBlock { Text = Path.GetFileName(path), Foreground = (Brush)FindResource("TextSecondary"), FontSize = 10, Margin = new Thickness(0, 3, 0, 12), TextTrimming = TextTrimming.CharacterEllipsis });
+            if (index < 8) stack.Children.Add(new TextBlock { Text = $"Ctrl + Alt + F{index + 1}", Foreground = (Brush)FindResource("AccentBrush"), FontSize = 10, Margin = new Thickness(0, 0, 0, 8) });
+            var actions = new StackPanel { Orientation = Orientation.Horizontal };
+            var play = new Button { Content = "▶ 播放", Tag = path, Padding = new Thickness(12, 6, 12, 6) };
+            play.Click += PlaySound_Click;
+            var remove = new Button { Content = "移除", Tag = path, Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0) };
+            remove.Click += RemoveSound_Click;
+            actions.Children.Add(play);
+            actions.Children.Add(remove);
+            stack.Children.Add(actions);
+            card.Child = stack;
+            _soundboardPanel.Children.Add(card);
+        }
+        if (_soundboardPanel.Children.Count == 0)
+            _soundboardPanel.Children.Add(new TextBlock { Text = "还没有音效。添加 PCM/Float WAV 后，可发送到当前主输出。", Foreground = (Brush)FindResource("TextSecondary"), Margin = new Thickness(8, 28, 0, 0) });
+        RegisterSoundboardHotkeys();
+    }
+
+    private void RemoveSound_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string path }) return;
+        _settings.SoundboardFiles.RemoveAll(value => value.Equals(path, StringComparison.OrdinalIgnoreCase));
+        TrySaveSettings();
+        RefreshSoundboardCards();
+    }
+
+    private void PlaySound_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string path }) PlaySound(path);
+    }
+
+    private void PlaySound(string path)
+    {
+        if (_enginePath is null || !File.Exists(path)) return;
+        var arguments = new List<string> { "play-wav", "--file", path, "--gain-db", _soundboardGain.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) };
+        if (OutputDeviceCombo.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
+        var process = new Process { StartInfo = CreateStartInfo(_enginePath, arguments, redirectInput: false), EnableRaisingEvents = true };
+        process.OutputDataReceived += (_, _) => { };
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data)) Dispatcher.BeginInvoke(() => FooterStatus.Text = $"音效播放失败：{args.Data}");
+        };
+        process.Exited += (_, _) => Dispatcher.BeginInvoke(() => { _soundProcesses.Remove(process); process.Dispose(); });
+        try
+        {
+            process.Start();
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+            _soundProcesses.Add(process);
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            FooterStatus.Text = $"正在播放音效：{Path.GetFileNameWithoutExtension(path)}";
+        }
+        catch (Exception error) { process.Dispose(); FooterStatus.Text = FriendlyError(error); }
+    }
+
+    private void StopSoundboardProcesses()
+    {
+        foreach (var process in _soundProcesses.ToList())
+        {
+            if (!process.HasExited) { try { process.Kill(entireProcessTree: true); } catch { } }
+            process.Dispose();
+        }
+        _soundProcesses.Clear();
+    }
+
+    private void InitializeSoundboardHotkeys()
+    {
+        _windowHandle = new WindowInteropHelper(this).Handle;
+        _windowSource = HwndSource.FromHwnd(_windowHandle);
+        _windowSource?.AddHook(SoundboardWindowHook);
+        RegisterSoundboardHotkeys();
+    }
+
+    private void RegisterSoundboardHotkeys()
+    {
+        if (_windowHandle == IntPtr.Zero) return;
+        for (var index = 0; index < 8; index++)
+        {
+            UnregisterHotKey(_windowHandle, 0x5100 + index);
+            if (index < _settings.SoundboardFiles.Count)
+                RegisterHotKey(_windowHandle, 0x5100 + index, 0x0001 | 0x0002 | 0x4000, (uint)(0x70 + index));
+        }
+    }
+
+    private void ReleaseSoundboardHotkeys()
+    {
+        if (_windowHandle == IntPtr.Zero) return;
+        for (var index = 0; index < 8; index++) UnregisterHotKey(_windowHandle, 0x5100 + index);
+        _windowSource?.RemoveHook(SoundboardWindowHook);
+    }
+
+    private IntPtr SoundboardWindowHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (message != 0x0312) return IntPtr.Zero;
+        var index = wParam.ToInt32() - 0x5100;
+        if ((uint)index < (uint)Math.Min(8, _settings.SoundboardFiles.Count))
+        {
+            PlaySound(_settings.SoundboardFiles[index]);
+            handled = true;
+        }
+        return IntPtr.Zero;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint virtualKey);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnregisterHotKey(IntPtr window, int id);
 
     private void Navigation_Checked(object sender, RoutedEventArgs e)
     {

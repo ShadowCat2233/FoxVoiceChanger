@@ -8,6 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use cpal::{
+    SampleFormat, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
 use serde::Deserialize;
 use serde_json::json;
 use vc_app::{AudioHost, DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig};
@@ -33,8 +37,174 @@ fn run() -> Result<()> {
         "passthrough" => run_engine(true),
         "rvc" => run_engine(false),
         "validate-rvc" => validate_rvc(),
-        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc"),
+        "play-wav" => play_wav(),
+        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc, play-wav"),
     }
+}
+
+fn play_wav() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    let arguments: Vec<String> = env::args().collect();
+    let path = required_path(&arguments, "--file")?;
+    let gain_db = option_value(&arguments, "--gain-db")
+        .map(str::parse)
+        .transpose()
+        .context("--gain-db 必须是数字")?
+        .unwrap_or(0.0_f32);
+    anyhow::ensure!(
+        (-36.0..=12.0).contains(&gain_db),
+        "--gain-db 必须在 -36 到 +12 dB 之间"
+    );
+    let (source, source_rate) = read_wav_mono(&path)?;
+    let host = cpal::default_host();
+    let requested = option_value(&arguments, "--output");
+    let device = if let Some(name) = requested {
+        host.output_devices()
+            .context("无法枚举音效输出设备")?
+            .find(|device| {
+                device
+                    .description()
+                    .is_ok_and(|value| value.name().contains(name))
+            })
+            .with_context(|| format!("音效输出设备不存在: {name}"))?
+    } else {
+        host.default_output_device()
+            .context("系统没有默认音效输出设备")?
+    };
+    let supported = device
+        .default_output_config()
+        .context("无法读取音效输出格式")?;
+    let sample_rate = supported.sample_rate();
+    let channels = usize::from(supported.channels());
+    let gain = db_to_gain(gain_db);
+    let samples = Arc::new(
+        resample_linear(&source, source_rate, sample_rate)
+            .into_iter()
+            .map(|sample| (sample * gain).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>(),
+    );
+    let position = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicBool::new(false));
+    let config: StreamConfig = supported.into();
+    let stream = match supported.sample_format() {
+        SampleFormat::F32 => build_sound_stream::<f32>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(&position),
+            Arc::clone(&failed),
+            |v| v,
+        )?,
+        SampleFormat::I16 => build_sound_stream::<i16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(&position),
+            Arc::clone(&failed),
+            |v| (v * i16::MAX as f32) as i16,
+        )?,
+        SampleFormat::U16 => build_sound_stream::<u16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(&position),
+            Arc::clone(&failed),
+            |v| ((v * 0.5 + 0.5) * u16::MAX as f32) as u16,
+        )?,
+        other => bail!("当前音效板不支持输出格式 {other}"),
+    };
+    stream.play().context("无法启动音效输出")?;
+    while position.load(Ordering::Relaxed) < samples.len() && !failed.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    anyhow::ensure!(!failed.load(Ordering::Relaxed), "音效播放期间设备发生错误");
+    println!(
+        "{}",
+        json!({"ok": true, "file": path, "sampleRate": sample_rate, "samples": samples.len()})
+    );
+    Ok(())
+}
+
+fn build_sound_stream<T: cpal::SizedSample + Send + 'static>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    channels: usize,
+    samples: std::sync::Arc<Vec<f32>>,
+    position: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    convert: fn(f32) -> T,
+) -> Result<cpal::Stream> {
+    use std::sync::atomic::Ordering;
+    let error_flag = std::sync::Arc::clone(&failed);
+    device
+        .build_output_stream::<T, _, _>(
+            *config,
+            move |output, _| {
+                for frame in output.chunks_mut(channels) {
+                    let index = position.fetch_add(1, Ordering::Relaxed);
+                    let value = samples.get(index).copied().unwrap_or(0.0);
+                    frame.fill_with(|| convert(value));
+                }
+            },
+            move |_| {
+                error_flag.store(true, Ordering::Relaxed);
+            },
+            None,
+        )
+        .context("无法创建音效输出流")
+}
+
+fn read_wav_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::open(path).context("无法读取 WAV 文件")?;
+    let spec = reader.spec();
+    anyhow::ensure!(
+        spec.channels > 0 && spec.sample_rate > 0,
+        "WAV 音频格式无效"
+    );
+    let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 32) => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, bits) if bits <= 16 => reader
+            .samples::<i16>()
+            .map(|value| value.map(|sample| sample as f32 / i16::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, bits) if bits <= 32 => {
+            let scale = ((1_i64 << (bits - 1)) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .map(|value| value.map(|sample| sample as f32 / scale))
+                .collect::<Result<_, _>>()?
+        }
+        _ => bail!("不支持此 WAV 位深"),
+    };
+    let channels = usize::from(spec.channels);
+    let mono = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+        .collect();
+    Ok((mono, spec.sample_rate))
+}
+
+fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if input.is_empty() || source_rate == target_rate {
+        return input.to_vec();
+    }
+    let output_len = ((input.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
+    (0..output_len)
+        .map(|index| {
+            let source = index as f64 * source_rate as f64 / target_rate as f64;
+            let left = source.floor() as usize;
+            let right = (left + 1).min(input.len() - 1);
+            let fraction = (source - left as f64) as f32;
+            input[left] + (input[right] - input[left]) * fraction
+        })
+        .collect()
 }
 
 fn validate_rvc() -> Result<()> {
@@ -299,5 +469,40 @@ fn windows_provider() -> Result<Provider> {
     #[cfg(not(all(windows, feature = "windowsml")))]
     {
         bail!("当前构建未启用 WindowsML；请使用 --features windowsml")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_resampler_preserves_duration() {
+        let input = vec![0.0_f32; 44_100];
+        assert_eq!(resample_linear(&input, 44_100, 48_000).len(), 48_000);
+        assert_eq!(resample_linear(&input, 44_100, 44_100).len(), 44_100);
+    }
+
+    #[test]
+    fn wav_reader_downmixes_stereo_pcm() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.write_sample(16_384_i16).unwrap();
+        writer.write_sample(-16_384_i16).unwrap();
+        writer.write_sample(8_192_i16).unwrap();
+        writer.write_sample(8_192_i16).unwrap();
+        writer.finalize().unwrap();
+        let (mono, rate) = read_wav_mono(&path).unwrap();
+        assert_eq!(rate, 48_000);
+        assert_eq!(mono.len(), 2);
+        assert!(mono[0].abs() < 0.0001);
+        assert!((mono[1] - 0.25).abs() < 0.001);
     }
 }
