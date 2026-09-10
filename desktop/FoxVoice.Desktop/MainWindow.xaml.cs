@@ -19,6 +19,7 @@ public partial class MainWindow : Window
     private readonly UserSettings _settings;
     private readonly SemaphoreSlim _engineInputLock = new(1, 1);
     private readonly DispatcherTimer _deviceRefreshTimer = new() { Interval = TimeSpan.FromSeconds(10) };
+    private readonly DispatcherTimer _gameDetectionTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private Process? _audioProcess;
     private Process? _monitorProcess;
     private readonly HashSet<Process> _soundProcesses = [];
@@ -39,6 +40,10 @@ public partial class MainWindow : Window
     private ulong _guardLastStreamErrors;
     private bool _guardCommandPending;
     private bool _refreshingDevices;
+    private bool _gameDetected;
+    private int _gameDetectionStreak;
+    private int _gameReleaseStreak;
+    private string _detectedGameName = "";
     private IntPtr _windowHandle;
     private HwndSource? _windowSource;
     private AudioDevice? _virtualCableInput;
@@ -68,6 +73,7 @@ public partial class MainWindow : Window
         MonitorToggle.ToolTip = "选择虚拟声卡为主输出后，可独立监听到物理耳机";
         UpdateLiveControlLabels();
         _deviceRefreshTimer.Tick += DeviceRefreshTimer_Tick;
+        _gameDetectionTimer.Tick += GameDetectionTimer_Tick;
 
         Loaded += MainWindow_Loaded;
         SourceInitialized += (_, _) => InitializeSoundboardHotkeys();
@@ -75,6 +81,7 @@ public partial class MainWindow : Window
         {
             TrySaveSettings();
             _deviceRefreshTimer.Stop();
+            _gameDetectionTimer.Stop();
             StopAudioProcess();
             StopMonitorProcess();
             StopSoundboardProcesses();
@@ -87,7 +94,73 @@ public partial class MainWindow : Window
         _ready = true;
         await RefreshAllAsync();
         _deviceRefreshTimer.Start();
+        _gameDetectionTimer.Start();
     }
+
+    private void GameDetectionTimer_Tick(object? sender, EventArgs e)
+    {
+        var candidate = GameGuardToggle.IsChecked == true ? DetectForegroundGame() : null;
+        if (candidate is not null)
+        {
+            _gameReleaseStreak = 0;
+            _gameDetectionStreak++;
+            if (_gameDetectionStreak < 2) return;
+            var changed = !_gameDetected || !string.Equals(_detectedGameName, candidate, StringComparison.OrdinalIgnoreCase);
+            _gameDetected = true;
+            _detectedGameName = candidate;
+            if (changed)
+            {
+                GuardStateText.Text = $"游戏保护：已检测到 {candidate}";
+                if (_audioProcess is { HasExited: false } && _guardProfile == "normal")
+                    _ = SendGuardProfileAsync("stable");
+            }
+            return;
+        }
+
+        _gameDetectionStreak = 0;
+        if (!_gameDetected || ++_gameReleaseStreak < 3) return;
+        _gameDetected = false;
+        _gameReleaseStreak = 0;
+        _detectedGameName = "";
+        if (_audioProcess is not { HasExited: false })
+            GuardStateText.Text = "资源保护已启用，等待游戏或实时引擎";
+    }
+
+    private string? DetectForegroundGame()
+    {
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero || foreground == _windowHandle || IsIconic(foreground)) return null;
+        if (!GetWindowRect(foreground, out var windowRect)) return null;
+        var monitor = MonitorFromWindow(foreground, 2);
+        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return null;
+        var monitorWidth = Math.Max(1, info.Monitor.Right - info.Monitor.Left);
+        var monitorHeight = Math.Max(1, info.Monitor.Bottom - info.Monitor.Top);
+        var widthRatio = (double)(windowRect.Right - windowRect.Left) / monitorWidth;
+        var heightRatio = (double)(windowRect.Bottom - windowRect.Top) / monitorHeight;
+        if (widthRatio < 0.90 || heightRatio < 0.90) return null;
+        _ = GetWindowThreadProcessId(foreground, out var processId);
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            var name = process.ProcessName;
+            return IgnoredFullscreenProcesses.Contains(name) ? null : name;
+        }
+        catch { return null; }
+    }
+
+    private bool RejectHeavyWorkDuringGame(string operation)
+    {
+        if (!_gameDetected) return false;
+        FooterStatus.Text = $"已暂停{operation}：{_detectedGameName} 正在全屏或无边框运行；退出游戏画面后重试";
+        return true;
+    }
+
+    private static readonly HashSet<string> IgnoredFullscreenProcesses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "explorer", "dwm", "SearchHost", "StartMenuExperienceHost", "LockApp", "ApplicationFrameHost",
+        "chrome", "msedge", "firefox", "FoxVoice.Desktop"
+    };
 
     private async void DeviceRefreshTimer_Tick(object? sender, EventArgs e)
     {
@@ -235,6 +308,7 @@ public partial class MainWindow : Window
 
     private async void InstallFoundationModels_Click(object sender, RoutedEventArgs e)
     {
+        if (RejectHeavyWorkDuringGame("基础模型下载")) return;
         try
         {
             if (await RefreshFoundationModelsAsync(applyPaths: true))
@@ -493,6 +567,36 @@ public partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr window, int id);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct MonitorInfo
+    {
+        public int Size;
+        public NativeRect Monitor;
+        public NativeRect Work;
+        public uint Flags;
+    }
+
     private void Navigation_Checked(object sender, RoutedEventArgs e)
     {
         if (!IsInitialized) return;
@@ -549,6 +653,7 @@ public partial class MainWindow : Window
         {
             if (model.Format == "pytorchCheckpoint")
             {
+                if (RejectHeavyWorkDuringGame("模型转换")) return;
                 try
                 {
                     FooterStatus.Text = "正在隔离转换 RVC v2 F0 检查点，请稍候…";
@@ -587,6 +692,7 @@ public partial class MainWindow : Window
 
     private async void ImportModel_Click(object sender, RoutedEventArgs e)
     {
+        if (RejectHeavyWorkDuringGame("模型导入与转换")) return;
         var dialog = new OpenFileDialog
         {
             Title = "导入 RVC 模型或索引",
@@ -599,6 +705,7 @@ public partial class MainWindow : Window
 
     private async void ImportHuggingFace_Click(object sender, RoutedEventArgs e)
     {
+        if (RejectHeavyWorkDuringGame("模型下载")) return;
         var url = HuggingFaceUrl.Text.Trim();
         if (string.IsNullOrWhiteSpace(url))
         {
@@ -967,7 +1074,7 @@ public partial class MainWindow : Window
         if (_guardOverloadStreak >= (_guardProfile == "survival" ? 5 : 3))
             next = _guardProfile switch { "normal" => "stable", "stable" => "survival", "survival" => "bypass", _ => _guardProfile };
         else if (_guardRecoveryStreak >= (_guardProfile == "bypass" ? 20 : 30))
-            next = _guardProfile switch { "bypass" => "survival", "survival" => "stable", "stable" => "normal", _ => _guardProfile };
+            next = _guardProfile switch { "bypass" => "survival", "survival" => "stable", "stable" when !_gameDetected => "normal", _ => _guardProfile };
         if (next == _guardProfile) return;
         _guardOverloadStreak = 0;
         _guardRecoveryStreak = 0;
@@ -1113,6 +1220,7 @@ public partial class MainWindow : Window
 
     private async void RvcSelfTest_Click(object sender, RoutedEventArgs e)
     {
+        if (RejectHeavyWorkDuringGame("模型自检")) return;
         if (_selectedModel is null)
         {
             ModelsNav.IsChecked = true;
