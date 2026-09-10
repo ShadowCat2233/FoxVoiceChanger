@@ -8,11 +8,15 @@
 - WASAPI 麦克风与输出设备枚举；
 - 独立原生进程运行安全旁路并持续报告音频指标；
 - `.onnx`、`.pth`、`.index` 模型导入、SHA-256 去重和可恢复删除；
+- Hugging Face `resolve` URL 流式下载、域名/HTTPS/体积限制和下载后结构校验；
 - 使用固定 `vc-core` commit 验证 RVC ONNX 输入输出结构；
 - 硬件后端推荐与游戏压力降级状态机；
 - WPF 桌面工作台：诊断、设备、模型库、旁路启停和实时指标；
 - 独立 `foxvoice-engine` 进程复用 `vc-app`/`vc-core` 的 RVC、SOLA、重采样和双时钟音频运行时；
 - 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
+
+桌面端会把 ContentVec、RMVPE 和音频设备选择保存在
+`%LOCALAPPDATA%\FoxVoice\settings.json`。模型文件保存在相邻的 `models` 目录。
 
 ## 构建
 

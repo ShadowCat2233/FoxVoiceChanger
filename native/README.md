@@ -43,6 +43,7 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- ipc-demo
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- audio-buffer-demo
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models list
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models import C:\path\voice.onnx
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models huggingface https://huggingface.co/owner/repo/resolve/main/voice.onnx
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
 ```
 

@@ -166,6 +166,15 @@ fn run_models_command() -> Result<()> {
                 serde_json::to_string_pretty(&library.import_file(&path, None)?)?
             );
         }
+        "huggingface" => {
+            let url = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models huggingface <resolve-url>")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.import_huggingface(&url)?)?
+            );
+        }
         "recycle" => {
             let id = env::args()
                 .nth(3)
@@ -182,7 +191,7 @@ fn run_models_command() -> Result<()> {
             println!("{}", serde_json::json!({"path": library.model_file(&id)?}));
         }
         _ => bail!(
-            "未知模型命令。可用命令: models list, models import, models recycle, models resolve"
+            "未知模型命令。可用命令: models list, models import, models huggingface, models recycle, models resolve"
         ),
     }
     Ok(())

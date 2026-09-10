@@ -69,6 +69,8 @@
                     <StackPanel Orientation="Horizontal">
                         <Button Content="导入 RVC 模型" Click="ImportModel_Click" />
                         <Button Content="刷新" Click="RefreshModels_Click" Background="#394254" />
+                        <TextBox x:Name="HuggingFaceUrl" Width="390" Margin="14,4,4,4" Padding="9" Background="#0F131B" Foreground="White" BorderThickness="0" ToolTip="Hugging Face resolve URL" />
+                        <Button Content="从 Hugging Face 导入" Click="ImportHuggingFace_Click" Background="#394254" />
                     </StackPanel>
                     <DataGrid Grid.Row="1" x:Name="ModelsGrid" Margin="0,16,0,0" AutoGenerateColumns="False" IsReadOnly="True"
                               Background="#0F131B" Foreground="White" RowBackground="#0F131B" AlternatingRowBackground="#151A23"

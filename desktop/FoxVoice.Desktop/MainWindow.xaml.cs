@@ -11,14 +11,18 @@ public partial class MainWindow : Window
     private Process? _audioProcess;
     private readonly string _supervisorPath;
     private readonly string _enginePath;
+    private readonly UserSettings _settings;
 
     public MainWindow()
     {
         InitializeComponent();
         _supervisorPath = FindNativeExecutable("FOXVOICE_SUPERVISOR", "foxvoice-supervisor.exe");
         _enginePath = FindNativeExecutable("FOXVOICE_ENGINE", "foxvoice-engine.exe");
+        _settings = UserSettings.Load();
+        EmbedderPath.Text = _settings.EmbedderPath;
+        F0Path.Text = _settings.F0Path;
         Loaded += async (_, _) => await RefreshAllAsync();
-        Closing += (_, _) => StopAudioProcess();
+        Closing += (_, _) => { SaveSettings(); StopAudioProcess(); };
     }
 
     private async Task RefreshAllAsync()
@@ -42,8 +46,10 @@ public partial class MainWindow : Window
         var devices = document.RootElement.EnumerateArray().Select(AudioDevice.FromJson).ToList();
         InputDevices.ItemsSource = devices.Where(device => device.Direction == "input").ToList();
         OutputDevices.ItemsSource = devices.Where(device => device.Direction == "output").ToList();
-        InputDevices.SelectedItem = devices.FirstOrDefault(device => device.Direction == "input" && device.IsDefault);
-        OutputDevices.SelectedItem = devices.FirstOrDefault(device => device.Direction == "output" && device.IsDefault);
+        InputDevices.SelectedItem = devices.FirstOrDefault(device => device.Direction == "input" && device.Name == _settings.InputDevice)
+            ?? devices.FirstOrDefault(device => device.Direction == "input" && device.IsDefault);
+        OutputDevices.SelectedItem = devices.FirstOrDefault(device => device.Direction == "output" && device.Name == _settings.OutputDevice)
+            ?? devices.FirstOrDefault(device => device.Direction == "output" && device.IsDefault);
     }
 
     private async Task RefreshModelsAsync()
@@ -84,9 +90,22 @@ public partial class MainWindow : Window
         catch (Exception error) { FooterStatus.Text = error.Message; }
     }
 
+    private async void ImportHuggingFace_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(HuggingFaceUrl.Text)) return;
+        try
+        {
+            FooterStatus.Text = "正在从 Hugging Face 下载、校验并导入…";
+            await RunAsync("models", "huggingface", HuggingFaceUrl.Text.Trim());
+            await RefreshModelsAsync();
+            FooterStatus.Text = "Hugging Face 模型导入完成";
+        }
+        catch (Exception error) { FooterStatus.Text = error.Message; }
+    }
+
     private void StartBypass_Click(object sender, RoutedEventArgs e)
     {
-        StartAudioProcess("passthrough");
+        StartAudioProcess(BuildDeviceArguments("passthrough").ToArray());
     }
 
     private async void StartRvc_Click(object sender, RoutedEventArgs e)
@@ -106,7 +125,10 @@ public partial class MainWindow : Window
             using var resolved = JsonDocument.Parse(await RunAsync("models", "resolve", model.Id));
             var modelPath = resolved.RootElement.GetProperty("path").GetString()
                 ?? throw new InvalidOperationException("模型路径解析失败");
-            StartAudioProcess("rvc", "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text);
+            var arguments = BuildDeviceArguments("rvc");
+            arguments.AddRange(["--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text]);
+            SaveSettings();
+            StartAudioProcess(arguments.ToArray());
         }
         catch (Exception error) { FooterStatus.Text = error.Message; }
     }
@@ -183,6 +205,24 @@ public partial class MainWindow : Window
         StopButton.IsEnabled = running;
         AudioStatus.Text = running ? "正在启动…" : "已停止";
         if (!running) SampleRateText.Text = "—";
+    }
+
+    private List<string> BuildDeviceArguments(string command)
+    {
+        var arguments = new List<string> { command };
+        if (InputDevices.SelectedItem is AudioDevice input) arguments.AddRange(["--input", input.Name]);
+        if (OutputDevices.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
+        SaveSettings();
+        return arguments;
+    }
+
+    private void SaveSettings()
+    {
+        _settings.EmbedderPath = EmbedderPath.Text;
+        _settings.F0Path = F0Path.Text;
+        _settings.InputDevice = (InputDevices.SelectedItem as AudioDevice)?.Name ?? "";
+        _settings.OutputDevice = (OutputDevices.SelectedItem as AudioDevice)?.Name ?? "";
+        _settings.Save();
     }
 
     private async Task<string> RunAsync(params string[] arguments)
