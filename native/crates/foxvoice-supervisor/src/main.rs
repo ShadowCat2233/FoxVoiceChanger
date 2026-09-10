@@ -1,7 +1,12 @@
-use std::{env, path::PathBuf};
+use std::{env, io::Cursor, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use foxvoice_contracts::{DoctorCheck, DoctorReport, EngineAvailability, PerformanceSample};
+use foxvoice_audio::audio_ring_buffer;
+use foxvoice_contracts::{
+    ControlCommand, ControlRequest, DoctorCheck, DoctorReport, EngineAvailability,
+    IPC_PROTOCOL_VERSION, PerformanceSample,
+};
+use foxvoice_ipc::{read_frame, write_frame};
 use foxvoice_supervisor::{ComponentManifest, GameGuard, detect_hardware, recommend_engine};
 
 fn main() {
@@ -34,7 +39,18 @@ fn run() -> Result<()> {
             Ok(())
         }
         "guard-demo" => print_guard_demo(),
-        _ => bail!("未知命令。可用命令: doctor, recommend, validate-components, guard-demo"),
+        "ipc-demo" => print_ipc_demo(),
+        "audio-buffer-demo" => print_audio_buffer_demo(),
+        #[cfg(feature = "wasapi")]
+        "audio-devices" => print_audio_devices(),
+        _ => bail!(
+            "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo{}",
+            if cfg!(feature = "wasapi") {
+                ", audio-devices"
+            } else {
+                "（audio-devices 需使用 --features wasapi 构建）"
+            }
+        ),
     }
 }
 
@@ -98,5 +114,43 @@ fn print_guard_demo() -> Result<()> {
         });
         println!("{}", serde_json::to_string(&decision)?);
     }
+    Ok(())
+}
+
+fn print_ipc_demo() -> Result<()> {
+    let request = ControlRequest {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        request_id: 1,
+        command: ControlCommand::Doctor,
+    };
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &request)?;
+    let decoded: ControlRequest = read_frame(&mut Cursor::new(&bytes))?;
+    println!("{}", serde_json::to_string_pretty(&decoded)?);
+    Ok(())
+}
+
+fn print_audio_buffer_demo() -> Result<()> {
+    let (mut producer, mut consumer, metrics) = audio_ring_buffer(8);
+    producer.push_interleaved_as_mono(&[0.25, 0.75, -0.5, 0.5], 2);
+    let mut output = [0.0_f32; 4];
+    consumer.fill_interleaved(&mut output, 2);
+    println!(
+        "{}",
+        serde_json::json!({
+            "output": output,
+            "overruns": metrics.overruns(),
+            "underruns": metrics.underruns()
+        })
+    );
+    Ok(())
+}
+
+#[cfg(feature = "wasapi")]
+fn print_audio_devices() -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&foxvoice_audio::enumerate_devices()?)?
+    );
     Ok(())
 }

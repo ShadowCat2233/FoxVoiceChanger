@@ -6,7 +6,9 @@ FoxVoice 的 Windows 原生监督层。当前阶段负责：
 - 推理后端推荐；
 - 组件清单与隔离规则校验；
 - 游戏模式性能状态机；
-- 为后续 `vc-core`、WASAPI 和桌面 UI 提供稳定协议。
+- 有大小上限的长度前缀 JSON IPC 帧；
+- 实时线程可用的固定容量无锁 SPSC 音频缓冲；
+- 可选 WASAPI 设备枚举与无模型安全旁路。
 
 ## 开发环境
 
@@ -30,7 +32,18 @@ FoxVoice 的 Windows 原生监督层。当前阶段负责：
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- doctor
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- recommend
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- validate-components native/config/components.json
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- ipc-demo
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- audio-buffer-demo
 ```
+
+WASAPI 使用可选特性，防止纯 Rust 测试机被 Windows SDK/链接器阻塞。正式的
+Windows x64 构建应在已安装 Visual Studio Build Tools 的 MSVC 环境执行：
+
+```powershell
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor --features wasapi -- audio-devices
+```
+
+GNU 工具链只用于协议、状态机和缓冲算法的快速验证，不作为发布工具链。
 
 ## vc-rs 上游基线
 

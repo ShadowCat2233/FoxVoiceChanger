@@ -1,5 +1,5 @@
 [package]
-name = "foxvoice-supervisor"
+name = "foxvoice-audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-wasapi = ["foxvoice-audio/wasapi"]
+wasapi = ["dep:cpal"]
 
 [dependencies]
 anyhow.workspace = true
-foxvoice-audio = { path = "../foxvoice-audio" }
+cpal = { workspace = true, optional = true }
 foxvoice-contracts = { path = "../foxvoice-contracts" }
-foxvoice-ipc = { path = "../foxvoice-ipc" }
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+rtrb.workspace = true

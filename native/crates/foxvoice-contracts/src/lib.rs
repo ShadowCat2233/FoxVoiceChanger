@@ -108,3 +108,82 @@ pub struct DoctorCheck {
     pub ok: bool,
     pub message: String,
 }
+
+pub const IPC_PROTOCOL_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlRequest {
+    pub protocol_version: u16,
+    pub request_id: u64,
+    pub command: ControlCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ControlCommand {
+    Doctor,
+    ListAudioDevices,
+    StartBypass {
+        input_device_id: Option<String>,
+        output_device_id: Option<String>,
+        buffer_ms: u32,
+    },
+    StopAudio,
+    StartVoice {
+        model_id: String,
+    },
+    SetGameGuard {
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ControlEvent {
+    Accepted {
+        request_id: u64,
+    },
+    AudioStateChanged {
+        running: bool,
+        mode: AudioMode,
+    },
+    Performance {
+        sample: PerformanceSample,
+        guard: GuardDecision,
+    },
+    Error {
+        request_id: Option<u64>,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioMode {
+    #[default]
+    Stopped,
+    SafeBypass,
+    VoiceConversion,
+    Muted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioDeviceDirection {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub direction: AudioDeviceDirection,
+    pub is_default: bool,
+    pub channels: Option<u16>,
+    pub sample_rate: Option<u32>,
+    pub sample_format: Option<String>,
+}
