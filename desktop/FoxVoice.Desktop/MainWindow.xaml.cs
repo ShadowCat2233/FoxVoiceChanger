@@ -12,6 +12,7 @@ public partial class MainWindow : Window
     private readonly string _supervisorPath;
     private readonly string _enginePath;
     private readonly UserSettings _settings;
+    private bool _stoppingAudio;
 
     public MainWindow()
     {
@@ -145,17 +146,26 @@ public partial class MainWindow : Window
     private void StartAudioProcess(params string[] arguments)
     {
         if (_audioProcess is { HasExited: false }) return;
+        _stoppingAudio = false;
         var startInfo = CreateStartInfo(_enginePath, arguments);
-        _audioProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        _audioProcess.OutputDataReceived += AudioOutputReceived;
-        _audioProcess.ErrorDataReceived += (_, args) =>
+        var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        _audioProcess = process;
+        process.OutputDataReceived += AudioOutputReceived;
+        process.ErrorDataReceived += (_, args) =>
         {
             if (!string.IsNullOrWhiteSpace(args.Data)) Dispatcher.Invoke(() => FooterStatus.Text = args.Data);
         };
-        _audioProcess.Exited += (_, _) => Dispatcher.Invoke(() => SetAudioRunning(false));
-        _audioProcess.Start();
-        _audioProcess.BeginOutputReadLine();
-        _audioProcess.BeginErrorReadLine();
+        process.Exited += async (_, _) => await Dispatcher.InvokeAsync(async () =>
+        {
+            if (!ReferenceEquals(_audioProcess, process)) return;
+            _audioProcess = null;
+            process.Dispose();
+            SetAudioRunning(false);
+            if (!_stoppingAudio) await RecoverWithSafeBypassAsync();
+        });
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
         SetAudioRunning(true);
     }
 
@@ -192,10 +202,27 @@ public partial class MainWindow : Window
 
     private void StopAudioProcess()
     {
+        _stoppingAudio = true;
         if (_audioProcess is { HasExited: false }) _audioProcess.Kill(entireProcessTree: true);
         _audioProcess?.Dispose();
         _audioProcess = null;
         SetAudioRunning(false);
+    }
+
+    private async Task RecoverWithSafeBypassAsync()
+    {
+        FooterStatus.Text = "推理引擎已退出，正在切换默认设备安全旁路…";
+        await Task.Delay(500);
+        try
+        {
+            await RefreshDevicesAsync();
+            StartAudioProcess("passthrough");
+            FooterStatus.Text = "已切换到默认设备安全旁路";
+        }
+        catch (Exception error)
+        {
+            FooterStatus.Text = $"安全旁路恢复失败：{error.Message}";
+        }
     }
 
     private void SetAudioRunning(bool running)

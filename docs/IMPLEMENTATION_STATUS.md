@@ -24,6 +24,7 @@
 - 桌面端可从模型库选择 Generator，并指定 ContentVec/RMVPE 后启动完整三模型 RVC 管线；
 - Hugging Face 官方域名 `resolve` URL 导入，包含 HTTPS、文件类型、4 GiB 上限、临时文件清理和模型门禁；
 - 桌面设置持久化，所选输入/输出设备会传递给独立引擎；
+- 推理进程异常退出时，桌面控制层刷新设备并自动启动默认设备安全旁路；
 - `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
 - Rust 开发依赖下载与 SHA-256 校验脚本；
 - 13 个原生层单元测试、格式检查和 Clippy 零警告。
