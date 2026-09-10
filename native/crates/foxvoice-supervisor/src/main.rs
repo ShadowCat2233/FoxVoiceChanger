@@ -47,10 +47,12 @@ fn run() -> Result<()> {
         "audio-devices" => print_audio_devices(),
         #[cfg(feature = "wasapi")]
         "bypass-test" => run_bypass_test(),
+        #[cfg(feature = "wasapi")]
+        "bypass-run" => run_bypass_forever(),
         _ => bail!(
             "未知命令。可用命令: doctor, recommend, validate-components, guard-demo, ipc-demo, audio-buffer-demo, models{}",
             if cfg!(feature = "wasapi") {
-                ", audio-devices, bypass-test"
+                ", audio-devices, bypass-test, bypass-run"
             } else {
                 "（audio-devices 需使用 --features wasapi 构建）"
             }
@@ -230,4 +232,33 @@ fn run_bypass_test() -> Result<()> {
         })
     );
     Ok(())
+}
+
+#[cfg(feature = "wasapi")]
+fn run_bypass_forever() -> Result<()> {
+    let bypass = foxvoice_audio::start_safe_bypass(None, None, 80)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "audioStarted",
+            "mode": "safeBypass",
+            "sampleRate": bypass.sample_rate,
+            "inputChannels": bypass.input_channels,
+            "outputChannels": bypass.output_channels,
+            "bufferMs": bypass.buffer_ms
+        })
+    );
+    loop {
+        thread::park_timeout(Duration::from_secs(1));
+        let metrics = bypass.metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "audioMetrics",
+                "inputOverruns": metrics.input_overruns,
+                "outputUnderruns": metrics.output_underruns,
+                "streamErrors": metrics.stream_errors
+            })
+        );
+    }
 }
