@@ -11,7 +11,7 @@
 - 独立 WindowsML/DirectML RVC 引擎进程；
 - 运行中实时调整音高、输出增益和轻量噪声门；
 - 本地 `.onnx`、`.pth`、`.index` 导入、SHA-256 去重、结构门禁和状态展示；
-- Hugging Face 单个 `resolve` 文件地址下载与导入；
+- Hugging Face 单文件或仓库/分支浏览、候选文件选择、Range 断点续传、代理探测与导入；
 - 启用 F0 的 RVC v2 `.pth` 可通过独立纯 Rust sidecar 转换为流式 ONNX，并重新经过结构门禁和哈希导入；
 - ContentVec、RMVPE 和 Generator 路径进入固定版本 `vc-app`/`vc-core` 推理链；
 - 设置页的三模型自检不打开音频设备，直接在 WindowsML/DirectML 上建立 RVC 管线并执行一帧非静音推理，输出加载/推理耗时；
@@ -40,7 +40,6 @@
 - 模型训练；
 - TensorRT/CUDA 可选组件安装；
 - VB-CABLE 的真实驱动安装/重启后联调（程序提供官方安装入口，不捆绑或静默安装第三方驱动）；
-- Hugging Face 仓库级浏览和断点续传；
 - RVC v1、未启用 F0 或非标准结构 `.pth` 的转换（当前转换器明确拒绝）；
 - 设备热插拔、游戏进程感知以及 2 小时以上游戏压力测试。
 

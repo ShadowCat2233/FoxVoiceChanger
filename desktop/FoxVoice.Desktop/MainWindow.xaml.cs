@@ -398,7 +398,57 @@ public partial class MainWindow : Window
             FooterStatus.Text = "请输入 Hugging Face 的 HTTPS resolve 文件地址";
             return;
         }
-        await ImportModelAsync(["models", "huggingface", url], "正在从 Hugging Face 下载并校验…");
+        if (url.Contains("/resolve/", StringComparison.OrdinalIgnoreCase))
+        {
+            await ImportModelAsync(["models", "huggingface", url], "正在从 Hugging Face 下载并校验…");
+            return;
+        }
+        try
+        {
+            FooterStatus.Text = "正在读取 Hugging Face 仓库文件…";
+            using var document = JsonDocument.Parse(await RunSupervisorAsync("models", "huggingface-files", url));
+            var files = document.RootElement.EnumerateArray().Select(HuggingFaceFileItem.FromJson).ToList();
+            if (files.Count == 0)
+            {
+                FooterStatus.Text = "此仓库没有 .onnx、.pth 或 .index 文件";
+                return;
+            }
+            var selected = files.Count == 1 ? files[0] : ChooseHuggingFaceFile(files);
+            if (selected is null) { FooterStatus.Text = "已取消仓库导入"; return; }
+            HuggingFaceUrl.Text = selected.DownloadUrl;
+            await ImportModelAsync(["models", "huggingface", selected.DownloadUrl], $"正在下载 {selected.Path} 并校验…");
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+    }
+
+    private HuggingFaceFileItem? ChooseHuggingFaceFile(IReadOnlyList<HuggingFaceFileItem> files)
+    {
+        HuggingFaceFileItem? selected = null;
+        var list = new ListBox { ItemsSource = files, DisplayMemberPath = nameof(HuggingFaceFileItem.DisplayLabel), Margin = new Thickness(0, 14, 0, 14) };
+        list.SelectedIndex = 0;
+        var dialog = new Window
+        {
+            Owner = this, Title = "选择 Hugging Face 模型文件", Width = 680, Height = 460,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = (Brush)FindResource("AppBackground"),
+            Foreground = (Brush)FindResource("TextPrimary"), ResizeMode = ResizeMode.CanResizeWithGrip
+        };
+        var root = new DockPanel { Margin = new Thickness(22) };
+        var title = new TextBlock { Text = "仓库中可导入的模型文件", FontSize = 20, FontWeight = FontWeights.SemiBold };
+        DockPanel.SetDock(title, Dock.Top);
+        root.Children.Add(title);
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        var cancel = new Button { Content = "取消", Padding = new Thickness(16, 7, 16, 7), Margin = new Thickness(0, 0, 8, 0) };
+        var confirm = new Button { Content = "下载并导入", Padding = new Thickness(16, 7, 16, 7), IsDefault = true };
+        cancel.Click += (_, _) => dialog.Close();
+        confirm.Click += (_, _) => { selected = list.SelectedItem as HuggingFaceFileItem; dialog.DialogResult = selected is not null; };
+        actions.Children.Add(cancel);
+        actions.Children.Add(confirm);
+        DockPanel.SetDock(actions, Dock.Bottom);
+        root.Children.Add(actions);
+        root.Children.Add(list);
+        dialog.Content = root;
+        dialog.ShowDialog();
+        return selected;
     }
 
     private async Task ImportModelAsync(string[] arguments, string progress)
@@ -1058,6 +1108,15 @@ public partial class MainWindow : Window
             value.GetProperty("state").GetString() ?? "",
             value.GetProperty("sizeBytes").GetInt64(),
             value.GetProperty("sha256").GetString() ?? "");
+    }
+
+    private sealed record HuggingFaceFileItem(string Path, long SizeBytes, string DownloadUrl)
+    {
+        public string DisplayLabel => $"{Path}    ({SizeBytes / 1024d / 1024d:N1} MB)";
+        public static HuggingFaceFileItem FromJson(JsonElement value) => new(
+            value.GetProperty("path").GetString() ?? "",
+            value.GetProperty("sizeBytes").GetInt64(),
+            value.GetProperty("downloadUrl").GetString() ?? "");
     }
 
     private sealed record EngineSnapshot(

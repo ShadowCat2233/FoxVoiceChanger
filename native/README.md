@@ -44,6 +44,7 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- audio-buff
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models list
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models import C:\path\voice.onnx
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models huggingface https://huggingface.co/owner/repo/resolve/main/voice.onnx
+cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models huggingface-files https://huggingface.co/owner/repo
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models status
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- foundation-models install --accept-gpl
 cargo run --manifest-path native/Cargo.toml -p foxvoice-supervisor -- models recycle model-0123456789abcdef
@@ -54,6 +55,10 @@ cargo run --manifest-path native/Cargo.toml -p foxvoice-engine --features window
 模型库默认位于 `%LOCALAPPDATA%\FoxVoice\models`。测试和便携运行可通过
 `FOXVOICE_DATA_DIR` 改写数据根目录。导入使用 SHA-256 内容 ID 去重并原子提交；删除只移动到
 `.recycle`，不会立即永久删除。
+
+Hugging Face 仓库浏览只返回 `.onnx`、`.pth` 和 `.index`。下载中断时保留按 URL 稳定命名的
+临时文件，下次使用 `Range` 续传；服务器不接受续传时自动从头覆盖。代理优先读取
+`FOXVOICE_PROXY`，其次读取标准代理环境变量，最后仅在端口连通时探测 `127.0.0.1:7897/7890`。
 
 `.pth` 转换在独立的 `foxvoice-converter` 进程中完成，当前上游转换器只支持启用 F0 的
 RVC v2 检查点。输出采用 vc-rs 的流式 ONNX 契约，随后再次经过模型库结构校验和 SHA-256

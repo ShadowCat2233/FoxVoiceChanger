@@ -2,7 +2,9 @@ use std::{
     env,
     fs::{self, File},
     io::{BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -115,7 +117,8 @@ pub fn install(root: &Path, accepted_gpl: bool) -> Result<Vec<FoundationModelSta
 }
 
 fn download_verified(spec: FoundationSpec, temporary: &Path, destination: &Path) -> Result<()> {
-    let mut response = ureq::get(spec.url)
+    let mut response = http_agent()?
+        .get(spec.url)
         .call()
         .with_context(|| format!("{} 下载失败", spec.id))?;
     if let Some(length) = response
@@ -147,6 +150,42 @@ fn download_verified(spec: FoundationSpec, temporary: &Path, destination: &Path)
     );
     fs::rename(temporary, destination).context("无法原子提交基础模型")?;
     Ok(())
+}
+
+fn http_agent() -> Result<ureq::Agent> {
+    if let Some(proxy) = env::var_os("FOXVOICE_PROXY") {
+        let proxy =
+            ureq::Proxy::new(proxy.to_string_lossy().as_ref()).context("FOXVOICE_PROXY 无效")?;
+        return Ok(ureq::Agent::config_builder()
+            .proxy(Some(proxy))
+            .build()
+            .into());
+    }
+    if [
+        "ALL_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some())
+    {
+        return Ok(ureq::Agent::new_with_defaults());
+    }
+    for port in [7897, 7890] {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok() {
+            let proxy_url = format!("http://127.0.0.1:{port}");
+            let proxy = ureq::Proxy::new(&proxy_url)?;
+            return Ok(ureq::Agent::config_builder()
+                .proxy(Some(proxy))
+                .build()
+                .into());
+        }
+    }
+    Ok(ureq::Agent::new_with_defaults())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

@@ -1,9 +1,11 @@
 use std::{
     cmp::Reverse,
-    fs::{self, File},
+    env,
+    fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +45,14 @@ pub struct ModelRecord {
     pub sha256: String,
     pub imported_at_unix_ms: u64,
     pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuggingFaceFile {
+    pub path: String,
+    pub size_bytes: u64,
+    pub download_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -133,31 +143,102 @@ impl ModelLibrary {
 
         let download_root = self.root.join(".downloads");
         fs::create_dir_all(&download_root).context("无法创建下载临时目录")?;
-        let temporary_path = download_root.join(format!("{}-{file_name}", unix_ms()?));
+        let url_hash = format!("{:x}", Sha256::digest(url.as_str().as_bytes()));
+        let temporary_path = download_root.join(format!(".part-{}-{file_name}", &url_hash[..16]));
+        let mut completed_download = false;
         let result = (|| -> Result<ModelRecord> {
-            let mut response = ureq::get(url.as_str())
-                .call()
-                .context("Hugging Face 下载失败")?;
+            let existing = temporary_path
+                .metadata()
+                .map(|value| value.len())
+                .unwrap_or(0);
+            anyhow::ensure!(existing <= MAX_MODEL_BYTES, "下载临时文件超过 4 GiB 上限");
+            let agent = http_agent()?;
+            let mut request = agent.get(url.as_str());
+            if existing > 0 {
+                request = request.header("Range", format!("bytes={existing}-"));
+            }
+            let mut response = request.call().context("Hugging Face 下载失败")?;
+            let resumed = existing > 0 && response.status().as_u16() == 206;
+            let offset = if resumed { existing } else { 0 };
             if let Some(length) = response
                 .headers()
                 .get("content-length")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
             {
-                anyhow::ensure!(length <= MAX_MODEL_BYTES, "远程模型超过 4 GiB 上限");
+                anyhow::ensure!(
+                    offset.saturating_add(length) <= MAX_MODEL_BYTES,
+                    "远程模型超过 4 GiB 上限"
+                );
             }
             let mut reader = response.body_mut().as_reader();
-            let mut output = File::create(&temporary_path).context("无法创建下载临时文件")?;
-            let copied =
-                std::io::copy(&mut reader.by_ref().take(MAX_MODEL_BYTES + 1), &mut output)?;
-            anyhow::ensure!(copied <= MAX_MODEL_BYTES, "远程模型超过 4 GiB 上限");
+            let mut output = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(resumed)
+                .truncate(!resumed)
+                .open(&temporary_path)
+                .context("无法创建下载临时文件")?;
+            let copied = std::io::copy(
+                &mut reader.by_ref().take(MAX_MODEL_BYTES - offset + 1),
+                &mut output,
+            )?;
+            anyhow::ensure!(
+                offset + copied <= MAX_MODEL_BYTES,
+                "远程模型超过 4 GiB 上限"
+            );
             output.sync_all()?;
+            completed_download = true;
             self.import_file(&temporary_path, Some(url.to_string()))
         })();
-        if temporary_path.exists() {
+        if (result.is_ok() || completed_download) && temporary_path.exists() {
             fs::remove_file(&temporary_path).context("无法清理下载临时文件")?;
         }
         result
+    }
+
+    pub fn list_huggingface_files(&self, repository_url: &str) -> Result<Vec<HuggingFaceFile>> {
+        let (repository, revision) = parse_huggingface_repository(repository_url)?;
+        let (owner, repo) = repository.split_once('/').expect("validated repository id");
+        let mut api_url = Url::parse("https://huggingface.co")?;
+        api_url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("无法构造 Hugging Face API URL"))?
+            .extend(["api", "models", owner, repo, "tree", &revision]);
+        api_url
+            .query_pairs_mut()
+            .append_pair("recursive", "true")
+            .append_pair("expand", "false");
+        let mut response = http_agent()?
+            .get(api_url.as_str())
+            .call()
+            .context("无法读取 Hugging Face 仓库文件")?;
+        let entries: Vec<HuggingFaceTreeEntry> =
+            serde_json::from_reader(response.body_mut().as_reader())
+                .context("Hugging Face 仓库文件响应无效")?;
+        let mut files: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.kind == "file")
+            .filter(|entry| classify(Path::new(&entry.path)).is_ok())
+            .map(|entry| {
+                let mut download = Url::parse("https://huggingface.co").expect("static URL");
+                download
+                    .path_segments_mut()
+                    .expect("base URL")
+                    .extend([owner, repo, "resolve", &revision]);
+                download
+                    .path_segments_mut()
+                    .expect("base URL")
+                    .extend(entry.path.split('/'));
+                HuggingFaceFile {
+                    download_url: download.to_string(),
+                    path: entry.path,
+                    size_bytes: entry.size.unwrap_or(0),
+                }
+            })
+            .collect();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 
     pub fn list(&self) -> Result<Vec<ModelRecord>> {
@@ -195,6 +276,81 @@ impl ModelLibrary {
         anyhow::ensure!(path.is_file(), "模型数据文件缺失: {id}");
         Ok(path)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceTreeEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    size: Option<u64>,
+}
+
+fn parse_huggingface_repository(repository_url: &str) -> Result<(String, String)> {
+    let url = Url::parse(repository_url).context("Hugging Face 仓库 URL 无效")?;
+    anyhow::ensure!(
+        url.scheme() == "https" && url.host_str() == Some("huggingface.co"),
+        "只允许 huggingface.co 的 HTTPS 仓库地址"
+    );
+    let segments: Vec<_> = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect();
+    anyhow::ensure!(
+        segments.len() == 2 || (segments.len() == 4 && segments[2] == "tree"),
+        "请使用 https://huggingface.co/作者/仓库 或其 tree/分支地址"
+    );
+    let revision = if segments.len() == 4 {
+        segments[3]
+    } else {
+        "main"
+    };
+    anyhow::ensure!(
+        segments[0] != "." && segments[0] != ".." && segments[1] != "." && segments[1] != "..",
+        "仓库标识不安全"
+    );
+    Ok((
+        format!("{}/{}", segments[0], segments[1]),
+        revision.to_owned(),
+    ))
+}
+
+fn http_agent() -> Result<ureq::Agent> {
+    if let Some(proxy) = env::var_os("FOXVOICE_PROXY") {
+        let proxy =
+            ureq::Proxy::new(proxy.to_string_lossy().as_ref()).context("FOXVOICE_PROXY 无效")?;
+        return Ok(ureq::Agent::config_builder()
+            .proxy(Some(proxy))
+            .build()
+            .into());
+    }
+    if [
+        "ALL_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some())
+    {
+        return Ok(ureq::Agent::new_with_defaults());
+    }
+    for port in [7897, 7890] {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok() {
+            let proxy_url = format!("http://127.0.0.1:{port}");
+            let proxy = ureq::Proxy::new(&proxy_url)?;
+            return Ok(ureq::Agent::config_builder()
+                .proxy(Some(proxy))
+                .build()
+                .into());
+        }
+    }
+    Ok(ureq::Agent::new_with_defaults())
 }
 
 fn classify(path: &Path) -> Result<(ModelFormat, ModelState)> {
@@ -336,5 +492,20 @@ mod tests {
                 .import_huggingface("https://huggingface.co/a/b/blob/main/a.pth")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_huggingface_repository_and_revision_urls() {
+        assert_eq!(
+            parse_huggingface_repository("https://huggingface.co/owner/voice-model").unwrap(),
+            ("owner/voice-model".into(), "main".into())
+        );
+        assert_eq!(
+            parse_huggingface_repository("https://huggingface.co/owner/voice-model/tree/dev")
+                .unwrap(),
+            ("owner/voice-model".into(), "dev".into())
+        );
+        assert!(parse_huggingface_repository("https://example.com/owner/model").is_err());
+        assert!(parse_huggingface_repository("https://huggingface.co/owner").is_err());
     }
 }
