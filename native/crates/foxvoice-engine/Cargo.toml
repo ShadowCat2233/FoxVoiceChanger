@@ -1,0 +1,16 @@
+[package]
+name = "foxvoice-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+windowsml = ["vc-app/windowsml", "vc-core/windowsml"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+vc-app = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }
+vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }

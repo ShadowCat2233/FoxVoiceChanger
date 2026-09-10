@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/foxvoice-contracts",
+  "crates/foxvoice-engine",
   "crates/foxvoice-ipc",
   "crates/foxvoice-audio",
   "crates/foxvoice-models",

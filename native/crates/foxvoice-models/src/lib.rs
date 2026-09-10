@@ -138,6 +138,15 @@ impl ModelLibrary {
         fs::rename(&source, &destination).context("无法将模型移动到回收区")?;
         Ok(destination)
     }
+
+    pub fn model_file(&self, id: &str) -> Result<PathBuf> {
+        validate_id(id)?;
+        let directory = self.root.join(id);
+        let record = read_manifest(&directory.join(MANIFEST_FILE))?;
+        let path = directory.join(record.file_name);
+        anyhow::ensure!(path.is_file(), "模型数据文件缺失: {id}");
+        Ok(path)
+    }
 }
 
 fn classify(path: &Path) -> Result<(ModelFormat, ModelState)> {
@@ -218,6 +227,10 @@ mod tests {
         let duplicate = library.import_file(&source, None).unwrap();
         assert_eq!(first.id, duplicate.id);
         assert_eq!(library.list().unwrap(), vec![first.clone()]);
+        assert_eq!(
+            library.model_file(&first.id).unwrap(),
+            library.root.join(&first.id).join(&first.file_name)
+        );
 
         let recycled = library.recycle(&first.id).unwrap();
         assert!(recycled.is_dir());

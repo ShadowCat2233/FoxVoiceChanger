@@ -20,6 +20,8 @@
 - 固定 `vc-rs` commit，并直接复用 `vc-core` 的 ONNX protobuf/RVC 输入输出结构检查器；
 - Windows WPF 桌面工作台，连接真实硬件诊断、音频设备、模型库、旁路进程和实时指标；
 - `win-x64` 自包含发布流程，终端用户无需安装 .NET、Rust 或 Visual Studio；
+- 独立 WindowsML/DirectML 推理进程，直接复用 `vc-app` 的音频线程、重采样、固定队列、RVC worker 和遥测；
+- 桌面端可从模型库选择 Generator，并指定 ContentVec/RMVPE 后启动完整三模型 RVC 管线；
 - `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
 - Rust 开发依赖下载与 SHA-256 校验脚本；
 - 13 个原生层单元测试、格式检查和 Clippy 零警告。
@@ -36,6 +38,7 @@
 - 音频输入：HECATE G2 GAMING HEADSET 麦克风，48 kHz 单声道；
 - 默认输出：FxSound Speakers，48 kHz 双声道；
 - 2 秒旁路：0 输入过载、0 流错误；两次运行观察到 192–576 个输出采样欠载（约 4–12 ms）。
+- 正式 `vc-app` 旁路持续运行：80+ 块、0 输入过载、约 20 个启动欠载采样，双时钟缓冲稳定。
 
 ## 下一实施切片
 

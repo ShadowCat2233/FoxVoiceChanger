@@ -26,6 +26,10 @@ $developerCommand = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
     --manifest-path (Join-Path $projectRoot 'native\Cargo.toml') `
     --package foxvoice-supervisor --features wasapi --release
 if ($LASTEXITCODE -ne 0) { throw 'Native release build failed.' }
+& $cargoPath '+stable-x86_64-pc-windows-msvc' build `
+    --manifest-path (Join-Path $projectRoot 'native\Cargo.toml') `
+    --package foxvoice-engine --features windowsml --release
+if ($LASTEXITCODE -ne 0) { throw 'RVC engine release build failed.' }
 
 $outputDirectory = Join-Path $projectRoot 'artifacts\FoxVoice-win-x64'
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
@@ -37,6 +41,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Desktop release build failed.' }
 
 Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-supervisor.exe') `
     -Destination (Join-Path $outputDirectory 'foxvoice-supervisor.exe') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'native\target\release\foxvoice-engine.exe') `
+    -Destination (Join-Path $outputDirectory 'foxvoice-engine.exe') -Force
 $debugSymbols = Join-Path $outputDirectory 'FoxVoice.pdb'
 if (Test-Path -LiteralPath $debugSymbols) { Remove-Item -LiteralPath $debugSymbols -Force }
 

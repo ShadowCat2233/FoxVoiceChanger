@@ -11,6 +11,7 @@
 - 使用固定 `vc-core` commit 验证 RVC ONNX 输入输出结构；
 - 硬件后端推荐与游戏压力降级状态机；
 - WPF 桌面工作台：诊断、设备、模型库、旁路启停和实时指标；
+- 独立 `foxvoice-engine` 进程复用 `vc-app`/`vc-core` 的 RVC、SOLA、重采样和双时钟音频运行时；
 - 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
 
 ## 构建

@@ -36,13 +36,21 @@
         <TabControl Grid.Row="2" Background="{StaticResource PanelBrush}" BorderThickness="0">
             <TabItem Header="实时变声">
                 <Grid Margin="20">
-                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
                     <StackPanel Orientation="Horizontal">
                         <Button x:Name="StartButton" Content="启动安全旁路" Click="StartBypass_Click" />
+                        <Button x:Name="StartRvcButton" Content="启动 RVC" Click="StartRvc_Click" />
                         <Button x:Name="StopButton" Content="停止" Click="StopBypass_Click" Background="#394254" IsEnabled="False" />
                         <Button Content="刷新设备" Click="Refresh_Click" Background="#394254" />
                     </StackPanel>
-                    <Grid Grid.Row="1" Margin="0,18,0,0">
+                    <Grid Grid.Row="1" Margin="0,14,0,0">
+                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBox x:Name="EmbedderPath" Margin="0,4" Padding="9" Background="#0F131B" Foreground="White" BorderThickness="0" ToolTip="ContentVec ONNX 路径" />
+                        <Button Grid.Column="1" Content="选择 ContentVec" Click="BrowseEmbedder_Click" Background="#394254" />
+                        <TextBox Grid.Column="2" x:Name="F0Path" Margin="10,4,0,4" Padding="9" Background="#0F131B" Foreground="White" BorderThickness="0" ToolTip="RMVPE ONNX 路径" />
+                        <Button Grid.Column="3" Content="选择 RMVPE" Click="BrowseF0_Click" Background="#394254" />
+                    </Grid>
+                    <Grid Grid.Row="2" Margin="0,18,0,0">
                         <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
                         <StackPanel Margin="0,0,10,0">
                             <TextBlock Text="输入设备" FontWeight="SemiBold" Margin="0,0,0,8" />

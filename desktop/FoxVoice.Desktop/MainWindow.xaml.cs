@@ -10,11 +10,13 @@ public partial class MainWindow : Window
 {
     private Process? _audioProcess;
     private readonly string _supervisorPath;
+    private readonly string _enginePath;
 
     public MainWindow()
     {
         InitializeComponent();
-        _supervisorPath = FindSupervisor();
+        _supervisorPath = FindNativeExecutable("FOXVOICE_SUPERVISOR", "foxvoice-supervisor.exe");
+        _enginePath = FindNativeExecutable("FOXVOICE_ENGINE", "foxvoice-engine.exe");
         Loaded += async (_, _) => await RefreshAllAsync();
         Closing += (_, _) => StopAudioProcess();
     }
@@ -84,8 +86,44 @@ public partial class MainWindow : Window
 
     private void StartBypass_Click(object sender, RoutedEventArgs e)
     {
+        StartAudioProcess("passthrough");
+    }
+
+    private async void StartRvc_Click(object sender, RoutedEventArgs e)
+    {
+        if (ModelsGrid.SelectedItem is not ModelItem model || model.Format != "onnx")
+        {
+            FooterStatus.Text = "请先在模型库选择一个可用 ONNX RVC 模型";
+            return;
+        }
+        if (!File.Exists(EmbedderPath.Text) || !File.Exists(F0Path.Text))
+        {
+            FooterStatus.Text = "请选择 ContentVec 和 RMVPE ONNX 文件";
+            return;
+        }
+        try
+        {
+            using var resolved = JsonDocument.Parse(await RunAsync("models", "resolve", model.Id));
+            var modelPath = resolved.RootElement.GetProperty("path").GetString()
+                ?? throw new InvalidOperationException("模型路径解析失败");
+            StartAudioProcess("rvc", "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text);
+        }
+        catch (Exception error) { FooterStatus.Text = error.Message; }
+    }
+
+    private void BrowseEmbedder_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(EmbedderPath, "选择 ContentVec ONNX");
+    private void BrowseF0_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(F0Path, "选择 RMVPE ONNX");
+
+    private void BrowseOnnxInto(System.Windows.Controls.TextBox target, string title)
+    {
+        var dialog = new OpenFileDialog { Title = title, Filter = "ONNX 模型 (*.onnx)|*.onnx" };
+        if (dialog.ShowDialog(this) == true) target.Text = dialog.FileName;
+    }
+
+    private void StartAudioProcess(params string[] arguments)
+    {
         if (_audioProcess is { HasExited: false }) return;
-        var startInfo = CreateStartInfo("bypass-run");
+        var startInfo = CreateStartInfo(_enginePath, arguments);
         _audioProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         _audioProcess.OutputDataReceived += AudioOutputReceived;
         _audioProcess.ErrorDataReceived += (_, args) =>
@@ -117,6 +155,11 @@ public partial class MainWindow : Window
                 }
                 else
                 {
+                    if (root.TryGetProperty("state", out var state) && state.GetString() == "Running")
+                    {
+                        AudioStatus.Text = "正式音频引擎运行中";
+                        SampleRateText.Text = $"{root.GetProperty("outputSampleRate").GetInt32() / 1000} kHz";
+                    }
                     UnderrunText.Text = root.GetProperty("outputUnderruns").GetUInt64().ToString("N0");
                     StreamErrorText.Text = root.GetProperty("streamErrors").GetUInt64().ToString("N0");
                 }
@@ -136,6 +179,7 @@ public partial class MainWindow : Window
     private void SetAudioRunning(bool running)
     {
         StartButton.IsEnabled = !running;
+        StartRvcButton.IsEnabled = !running;
         StopButton.IsEnabled = running;
         AudioStatus.Text = running ? "正在启动…" : "已停止";
         if (!running) SampleRateText.Text = "—";
@@ -143,7 +187,7 @@ public partial class MainWindow : Window
 
     private async Task<string> RunAsync(params string[] arguments)
     {
-        using var process = new Process { StartInfo = CreateStartInfo(arguments) };
+        using var process = new Process { StartInfo = CreateStartInfo(_supervisorPath, arguments) };
         process.Start();
         var outputTask = process.StandardOutput.ReadToEndAsync();
         var errorTask = process.StandardError.ReadToEndAsync();
@@ -154,9 +198,9 @@ public partial class MainWindow : Window
         return output;
     }
 
-    private ProcessStartInfo CreateStartInfo(params string[] arguments)
+    private static ProcessStartInfo CreateStartInfo(string executable, params string[] arguments)
     {
-        var info = new ProcessStartInfo(_supervisorPath)
+        var info = new ProcessStartInfo(executable)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -167,21 +211,21 @@ public partial class MainWindow : Window
         return info;
     }
 
-    private static string FindSupervisor()
+    private static string FindNativeExecutable(string environmentName, string fileName)
     {
-        var configured = Environment.GetEnvironmentVariable("FOXVOICE_SUPERVISOR");
+        var configured = Environment.GetEnvironmentVariable(environmentName);
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured)) return configured;
-        var bundled = Path.Combine(AppContext.BaseDirectory, "foxvoice-supervisor.exe");
+        var bundled = Path.Combine(AppContext.BaseDirectory, fileName);
         if (File.Exists(bundled)) return bundled;
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
         {
             foreach (var profile in new[] { "release", "debug" })
             {
-                var candidate = Path.Combine(directory.FullName, "native", "target", profile, "foxvoice-supervisor.exe");
+                var candidate = Path.Combine(directory.FullName, "native", "target", profile, fileName);
                 if (File.Exists(candidate)) return candidate;
             }
         }
-        throw new FileNotFoundException("找不到 foxvoice-supervisor.exe，请先运行发布脚本。");
+        throw new FileNotFoundException($"找不到 {fileName}，请先运行发布脚本。");
     }
 
     private sealed record AudioDevice(string Name, string Direction, bool IsDefault)
@@ -192,11 +236,12 @@ public partial class MainWindow : Window
             value.GetProperty("isDefault").GetBoolean());
     }
 
-    private sealed record ModelItem(string DisplayName, string Format, string State, long SizeBytes, string Hash)
+    private sealed record ModelItem(string Id, string DisplayName, string Format, string State, long SizeBytes, string Hash)
     {
         public string SizeText => $"{SizeBytes / 1024d / 1024d:N1} MB";
         public string ShortHash => Hash.Length > 16 ? Hash[..16] : Hash;
         public static ModelItem FromJson(JsonElement value) => new(
+            value.GetProperty("id").GetString() ?? "",
             value.GetProperty("displayName").GetString() ?? "未命名",
             value.GetProperty("format").GetString() ?? "",
             value.GetProperty("state").GetString() ?? "",
