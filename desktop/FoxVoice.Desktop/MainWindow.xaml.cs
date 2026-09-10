@@ -58,6 +58,8 @@ public partial class MainWindow : Window
     private readonly Button _installCudaTrainingButton = new() { Content = "安装 NVIDIA CUDA 训练环境", Padding = new Thickness(14, 8, 14, 8) };
     private readonly Button _installCpuTrainingButton = new() { Content = "安装 CPU 训练环境", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
     private readonly Button _cancelTrainingButton = new() { Content = "取消安装", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
+    private readonly Button _launchTrainingButton = new() { Content = "打开训练工作台", Padding = new Thickness(14, 8, 14, 8) };
+    private readonly Button _importTrainingButton = new() { Content = "导入训练结果", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
 
     public MainWindow()
     {
@@ -406,6 +408,8 @@ public partial class MainWindow : Window
         _installCudaTrainingButton.Click += async (_, _) => await InstallTrainingAsync("cuda");
         _installCpuTrainingButton.Click += async (_, _) => await InstallTrainingAsync("cpu");
         _cancelTrainingButton.Click += (_, _) => StopTrainingProcess();
+        _launchTrainingButton.Click += async (_, _) => await LaunchTrainingWorkbenchAsync();
+        _importTrainingButton.Click += async (_, _) => await ImportTrainingOutputsAsync();
         TrainingView.Children.Clear();
         var root = new StackPanel { Margin = new Thickness(28, 26, 28, 26) };
         root.Children.Add(new TextBlock { Text = "MODEL TRAINING", Style = (Style)FindResource("Eyebrow") });
@@ -424,6 +428,10 @@ public partial class MainWindow : Window
         actions.Children.Add(_installCpuTrainingButton);
         actions.Children.Add(_cancelTrainingButton);
         content.Children.Add(actions);
+        var workbenchActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+        workbenchActions.Children.Add(_launchTrainingButton);
+        workbenchActions.Children.Add(_importTrainingButton);
+        content.Children.Add(workbenchActions);
         card.Child = content;
         root.Children.Add(card);
         root.Children.Add(new TextBlock
@@ -448,6 +456,8 @@ public partial class MainWindow : Window
             ? $"环境已就绪 · 源代码 ✓  Python ✓  PyTorch ✓  基础权重 ✓  CUDA {(cuda ? "✓" : "未启用")}"
             : $"尚未就绪 · 源代码 {(source ? "✓" : "—")}  Python {(python ? "✓" : "—")}  PyTorch {(torch ? "✓" : "—")}  基础权重 {(models ? "✓" : "—")}";
         _trainingStateText.Foreground = ready ? (Brush)FindResource("SuccessBrush") : new SolidColorBrush(Color.FromRgb(249, 200, 106));
+        _launchTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
+        _importTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
     }
 
     private async Task InstallTrainingAsync(string backend)
@@ -513,6 +523,86 @@ public partial class MainWindow : Window
         _installCudaTrainingButton.IsEnabled = !running;
         _installCpuTrainingButton.IsEnabled = !running;
         _cancelTrainingButton.IsEnabled = running;
+        _launchTrainingButton.IsEnabled = !running;
+        _importTrainingButton.IsEnabled = !running;
+    }
+
+    private async Task LaunchTrainingWorkbenchAsync()
+    {
+        if (RejectHeavyWorkDuringGame("模型训练")) return;
+        if (_trainingProcess is { HasExited: false } || _supervisorPath is null) return;
+        var process = new Process
+        {
+            StartInfo = CreateStartInfo(_supervisorPath, ["training", "workbench"], redirectInput: false),
+            EnableRaisingEvents = true
+        };
+        _trainingProcess = process;
+        SetTrainingButtons(true);
+        var lastError = "";
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (string.IsNullOrWhiteSpace(args.Data)) return;
+            lastError = args.Data;
+            Dispatcher.BeginInvoke(() => FooterStatus.Text = args.Data.StartsWith("FOXVOICE_TRAINING_STAGE=")
+                ? args.Data["FOXVOICE_TRAINING_STAGE=".Length..] : "训练工作台正在运行");
+        };
+        try
+        {
+            process.Start();
+            try { process.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            for (var attempt = 0; attempt < 60 && !process.HasExited; attempt++)
+            {
+                try
+                {
+                    using var client = new System.Net.Sockets.TcpClient();
+                    await client.ConnectAsync("127.0.0.1", 7865);
+                    Process.Start(new ProcessStartInfo("http://127.0.0.1:7865") { UseShellExecute = true });
+                    FooterStatus.Text = "RVC 训练工作台已打开；训练期间不要启动游戏";
+                    break;
+                }
+                catch (System.Net.Sockets.SocketException) { await Task.Delay(500); }
+            }
+            await process.WaitForExitAsync();
+            if (ReferenceEquals(_trainingProcess, process) && process.ExitCode != 0)
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(lastError) ? "训练工作台异常退出" : lastError);
+        }
+        catch (Exception) when (!ReferenceEquals(_trainingProcess, process))
+        {
+            FooterStatus.Text = "训练工作台已停止；已保存的检查点不会删除";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+        finally
+        {
+            if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
+            process.Dispose();
+            SetTrainingButtons(false);
+        }
+    }
+
+    private async Task ImportTrainingOutputsAsync()
+    {
+        if (RejectHeavyWorkDuringGame("训练结果导入")) return;
+        try
+        {
+            using var document = JsonDocument.Parse(await RunSupervisorAsync("training", "outputs"));
+            var paths = document.RootElement.EnumerateArray()
+                .Select(value => value.GetProperty("path").GetString()).OfType<string>().ToList();
+            if (paths.Count == 0)
+            {
+                FooterStatus.Text = "训练工作台尚未生成 .pth 或 .index 结果";
+                return;
+            }
+            var answer = MessageBox.Show(this, $"发现 {paths.Count} 个训练结果。将全部经过哈希和格式门禁后导入模型库。",
+                "导入训练结果", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+            if (answer != MessageBoxResult.OK) return;
+            foreach (var path in paths) await RunSupervisorAsync("models", "import", path);
+            await RefreshModelsAsync();
+            ModelsNav.IsChecked = true;
+            FooterStatus.Text = $"已导入 {paths.Count} 个训练结果；RVC v2 F0 检查点可点击“使用”转换为 ONNX";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
 
     private void BuildSoundboardView()

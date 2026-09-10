@@ -13,7 +13,8 @@ use foxvoice_ipc::{read_frame, write_frame};
 use foxvoice_models::ModelLibrary;
 use foxvoice_supervisor::{
     ComponentManifest, GameGuard, detect_hardware, foundation_model_status, foundation_root,
-    install_foundation_models, install_training, recommend_engine, training_root, training_status,
+    install_foundation_models, install_training, launch_training_workbench, recommend_engine,
+    training_outputs, training_root, training_status,
 };
 
 fn main() {
@@ -84,9 +85,18 @@ fn run_training_command() -> Result<()> {
                 env::args().any(|argument| argument == "--accept-licenses"),
             )?
         }
-        _ => bail!(
-            "用法: foxvoice-supervisor training status|install --backend cuda|cpu --accept-licenses"
-        ),
+        "workbench" => {
+            launch_training_workbench(&root)?;
+            return Ok(());
+        }
+        "outputs" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&training_outputs(&root)?)?
+            );
+            return Ok(());
+        }
+        _ => bail!("用法: foxvoice-supervisor training status|install|workbench|outputs"),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

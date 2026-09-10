@@ -24,6 +24,7 @@
 - RVC 进程异常退出后刷新设备并自动回退到默认设备安全旁路；
 - 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
 - 模型训练页可按需安装固定版本的官方 RVC 训练源代码、Python 3.12、FFmpeg、隔离 venv、CPU/CUDA PyTorch 和训练基础权重；安装可取消，检测到游戏时自动停止并允许稍后续装。
+- 训练环境就绪后可由 FoxVoice 启动/停止本机官方训练工作台；生成的 `.pth` 与 `.index` 可批量经过 FoxVoice 哈希、去重和格式门禁导入模型库。
 
 桌面端会把 ContentVec、RMVPE 和音频设备选择保存在
 `%LOCALAPPDATA%\FoxVoice\settings.json`。模型文件保存在相邻的 `models` 目录。

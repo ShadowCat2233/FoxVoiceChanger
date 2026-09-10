@@ -24,6 +24,14 @@ pub struct TrainingStatus {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingOutput {
+    pub path: PathBuf,
+    pub kind: String,
+    pub size_bytes: u64,
+}
+
 pub fn training_root() -> Result<PathBuf> {
     let local = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA 不可用")?;
     Ok(PathBuf::from(local).join("FoxVoice").join("training"))
@@ -239,6 +247,74 @@ pub fn install(root: &Path, backend: &str, accepted: bool) -> Result<TrainingSta
     Ok(report)
 }
 
+pub fn launch_workbench(root: &Path) -> Result<()> {
+    let report = status(root)?;
+    anyhow::ensure!(report.ready, "训练环境尚未完整安装并通过自检");
+    let source = root.join("rvc");
+    let python = root.join("venv").join("Scripts").join("python.exe");
+    eprintln!("FOXVOICE_TRAINING_STAGE=训练工作台正在启动：http://127.0.0.1:7865");
+    let status = Command::new(python)
+        .current_dir(&source)
+        .args(["webui.py", "--noautoopen"])
+        .status()
+        .context("无法启动 RVC 训练工作台")?;
+    anyhow::ensure!(
+        status.success(),
+        "RVC 训练工作台异常退出，退出码 {:?}",
+        status.code()
+    );
+    Ok(())
+}
+
+pub fn outputs(root: &Path) -> Result<Vec<TrainingOutput>> {
+    let source = root.join("rvc");
+    let mut found = Vec::new();
+    collect_outputs(
+        &source.join("assets").join("weights"),
+        "pytorchCheckpoint",
+        "pth",
+        &mut found,
+    )?;
+    collect_outputs(
+        &source.join("assets").join("indices"),
+        "faissIndex",
+        "index",
+        &mut found,
+    )?;
+    found.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(found)
+}
+
+fn collect_outputs(
+    directory: &Path,
+    kind: &str,
+    extension: &str,
+    found: &mut Vec<TrainingOutput>,
+) -> Result<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("无法读取训练产物目录: {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            found.push(TrainingOutput {
+                size_bytes: entry.metadata()?.len(),
+                path,
+                kind: kind.into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn ensure_command(command: &str, version_argument: &str, winget_id: &str) -> Result<()> {
     if Command::new(command)
         .arg(version_argument)
@@ -351,5 +427,21 @@ mod tests {
         let root = temporary.path().join("training");
         assert!(install(&root, "rocm", true).is_err());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn lists_only_supported_training_outputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let weights = temporary.path().join("rvc/assets/weights");
+        let indices = temporary.path().join("rvc/assets/indices");
+        fs::create_dir_all(&weights).unwrap();
+        fs::create_dir_all(&indices).unwrap();
+        fs::write(weights.join("voice.pth"), b"weight").unwrap();
+        fs::write(weights.join("notes.txt"), b"ignore").unwrap();
+        fs::write(indices.join("voice.index"), b"index").unwrap();
+        let found = outputs(temporary.path()).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].kind, "faissIndex");
+        assert_eq!(found[1].kind, "pytorchCheckpoint");
     }
 }

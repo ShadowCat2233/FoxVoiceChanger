@@ -12,4 +12,7 @@ pub use foundation_models::{
 pub use guard::GameGuard;
 pub use hardware::detect_hardware;
 pub use recommendation::recommend_engine;
-pub use training::{install as install_training, status as training_status, training_root};
+pub use training::{
+    install as install_training, launch_workbench as launch_training_workbench,
+    outputs as training_outputs, status as training_status, training_root,
+};
