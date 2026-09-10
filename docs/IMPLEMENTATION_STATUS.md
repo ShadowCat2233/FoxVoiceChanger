@@ -10,7 +10,7 @@
 - 安全旁路的启动、停止、采样率与欠载指标显示；
 - 独立 WindowsML/DirectML RVC 引擎进程；
 - 运行中实时调整音高、输出增益和轻量噪声门；
-- 本地 `.onnx`、`.pth`、`.index` 导入、SHA-256 去重、结构门禁和状态展示；
+- 本地 `.onnx`、`.pth`、`.index` 导入、SHA-256 去重、结构门禁、状态展示和可恢复的回收区移除；
 - Hugging Face 单文件或仓库/分支浏览、候选文件选择、Range 断点续传、代理探测与导入；
 - 启用 F0 的 RVC v2 `.pth` 可通过独立纯 Rust sidecar 转换为流式 ONNX，并重新经过结构门禁和哈希导入；
 - ContentVec、RMVPE 和 Generator 路径进入固定版本 `vc-app`/`vc-core` 推理链；

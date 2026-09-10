@@ -61,6 +61,7 @@ public partial class MainWindow : Window
         AddMonitorDevicePicker();
         AddVirtualCableInstallAction();
         AddRvcSelfTestAction();
+        AddModelRecycleAction();
         _settings = UserSettings.Load();
         BuildSoundboardView();
         EmbedderPath.Text = _settings.EmbedderPath;
@@ -688,6 +689,53 @@ public partial class MainWindow : Window
             _settings.SelectedModelId = _selectedModel?.Id ?? "";
             TrySaveSettings();
         }
+    }
+
+    private void AddModelRecycleAction()
+    {
+        var importButton = FindDescendant<Button>(ModelsView, button => Equals(button.Content, "＋ 导入本地模型"));
+        if (importButton?.Parent is not StackPanel actions) return;
+        var recycleButton = new Button { Content = "移入回收区", Margin = new Thickness(0, 0, 8, 0) };
+        recycleButton.Click += RecycleModel_Click;
+        actions.Children.Insert(Math.Max(0, actions.Children.IndexOf(importButton)), recycleButton);
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root, Func<T, bool> predicate) where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is T match && predicate(match)) return match;
+            var nested = FindDescendant(child, predicate);
+            if (nested is not null) return nested;
+        }
+        return null;
+    }
+
+    private async void RecycleModel_Click(object sender, RoutedEventArgs e)
+    {
+        if (ModelsList.SelectedItem is not ModelItem model)
+        {
+            FooterStatus.Text = "请先在模型库选择要移入回收区的模型";
+            return;
+        }
+        if (_audioProcess is { HasExited: false } && _selectedModel?.Id == model.Id)
+        {
+            FooterStatus.Text = "当前模型正在使用；请先停止实时变声再移除";
+            return;
+        }
+        var answer = MessageBox.Show(this,
+            $"将“{model.DisplayName}”移入 FoxVoice 回收区。文件不会立即永久删除。",
+            "移除模型", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.OK) return;
+        try
+        {
+            await RunSupervisorAsync("models", "recycle", model.Id);
+            if (_selectedModel?.Id == model.Id) SelectModel(null, persist: true);
+            await RefreshModelsAsync();
+            FooterStatus.Text = "模型已安全移入回收区";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
 
     private async void ImportModel_Click(object sender, RoutedEventArgs e)
