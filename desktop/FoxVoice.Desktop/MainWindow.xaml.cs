@@ -697,7 +697,11 @@ public partial class MainWindow : Window
         if (importButton?.Parent is not StackPanel actions) return;
         var recycleButton = new Button { Content = "移入回收区", Margin = new Thickness(0, 0, 8, 0) };
         recycleButton.Click += RecycleModel_Click;
-        actions.Children.Insert(Math.Max(0, actions.Children.IndexOf(importButton)), recycleButton);
+        var offlineButton = new Button { Content = "转换 WAV", Margin = new Thickness(0, 0, 8, 0) };
+        offlineButton.Click += ConvertWav_Click;
+        var insertAt = Math.Max(0, actions.Children.IndexOf(importButton));
+        actions.Children.Insert(insertAt, offlineButton);
+        actions.Children.Insert(insertAt + 1, recycleButton);
     }
 
     private static T? FindDescendant<T>(DependencyObject root, Func<T, bool> predicate) where T : DependencyObject
@@ -736,6 +740,44 @@ public partial class MainWindow : Window
             FooterStatus.Text = "模型已安全移入回收区";
         }
         catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+    }
+
+    private async void ConvertWav_Click(object sender, RoutedEventArgs e)
+    {
+        if (RejectHeavyWorkDuringGame("离线音频转换")) return;
+        if (_audioProcess is { HasExited: false })
+        {
+            FooterStatus.Text = "请先停止实时变声，避免离线转换与游戏语音争用 GPU";
+            return;
+        }
+        if (_selectedModel is null || !File.Exists(EmbedderPath.Text) || !File.Exists(F0Path.Text))
+        {
+            FooterStatus.Text = "离线转换需要先选择可用 Generator，并安装 ContentVec 与 RMVPE";
+            return;
+        }
+        var inputDialog = new OpenFileDialog { Title = "选择待转换 WAV", Filter = "WAV 音频 (*.wav)|*.wav" };
+        if (inputDialog.ShowDialog(this) != true) return;
+        var outputDialog = new SaveFileDialog
+        {
+            Title = "保存变声 WAV", Filter = "WAV 音频 (*.wav)|*.wav", AddExtension = true,
+            FileName = Path.GetFileNameWithoutExtension(inputDialog.FileName) + "-foxvoice.wav"
+        };
+        if (outputDialog.ShowDialog(this) != true) return;
+        try
+        {
+            FooterStatus.Text = "正在离线转换 WAV；实时语音保持停用…";
+            using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
+            var modelPath = resolved.RootElement.GetProperty("path").GetString()
+                ?? throw new InvalidOperationException("模型路径解析失败");
+            using var result = JsonDocument.Parse(await RunEngineCommandAsync(
+                "convert-wav", "--input", inputDialog.FileName, "--output", outputDialog.FileName,
+                "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text,
+                "--pitch", PitchSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            var elapsed = result.RootElement.GetProperty("elapsedMs").GetDouble();
+            FooterStatus.Text = $"离线转换完成：{Path.GetFileName(outputDialog.FileName)}（{elapsed / 1000:N1} 秒）";
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{outputDialog.FileName}\"") { UseShellExecute = true });
+        }
+        catch (Exception error) { FooterStatus.Text = $"离线转换失败：{FriendlyError(error)}"; }
     }
 
     private async void ImportModel_Click(object sender, RoutedEventArgs e)

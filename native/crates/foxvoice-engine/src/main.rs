@@ -37,9 +37,143 @@ fn run() -> Result<()> {
         "passthrough" => run_engine(true),
         "rvc" => run_engine(false),
         "validate-rvc" => validate_rvc(),
+        "convert-wav" => convert_wav(),
         "play-wav" => play_wav(),
-        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc, play-wav"),
+        _ => bail!("可用命令: devices, passthrough, rvc, validate-rvc, convert-wav, play-wav"),
     }
+}
+
+fn convert_wav() -> Result<()> {
+    let arguments: Vec<String> = env::args().collect();
+    let input = required_path(&arguments, "--input")?;
+    let output =
+        PathBuf::from(option_value(&arguments, "--output").context("缺少参数 --output <path>")?);
+    anyhow::ensure!(input != output, "输出文件不能覆盖输入文件");
+    anyhow::ensure!(
+        output
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("wav")),
+        "离线转换输出必须是 .wav 文件"
+    );
+    if let Some(parent) = output.parent() {
+        anyhow::ensure!(parent.is_dir(), "输出目录不存在: {}", parent.display());
+    }
+    let model = required_path(&arguments, "--model")?;
+    let embedder = required_path(&arguments, "--embedder")?;
+    let f0_model = required_path(&arguments, "--f0")?;
+    let pitch_shift = option_value(&arguments, "--pitch")
+        .map(str::parse)
+        .transpose()
+        .context("--pitch 必须是数字")?
+        .unwrap_or(0.0_f32);
+    anyhow::ensure!(
+        (-24.0..=24.0).contains(&pitch_shift),
+        "--pitch 必须在 -24 到 +24 半音之间"
+    );
+    let (source, source_rate) = read_wav_mono(&input)?;
+    anyhow::ensure!(!source.is_empty(), "输入 WAV 没有音频采样");
+    let worker = thread::Builder::new()
+        .name("foxvoice-offline-convert".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            convert_wav_inner(
+                source,
+                source_rate,
+                model,
+                embedder,
+                f0_model,
+                output,
+                pitch_shift,
+            )
+        })
+        .context("无法启动离线转换线程")?;
+    let report = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("离线转换线程异常终止"))??;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn convert_wav_inner(
+    source: Vec<f32>,
+    source_rate: u32,
+    model: PathBuf,
+    embedder: PathBuf,
+    f0_model: PathBuf,
+    output: PathBuf,
+    pitch_shift: f32,
+) -> Result<serde_json::Value> {
+    let sample_rate = 48_000;
+    let timing = RvcChunkTiming::from_ms(160, sample_rate)?;
+    let input = resample_linear(&source, source_rate, sample_rate);
+    let started = Instant::now();
+    let mut pipeline = RvcPipeline::load(RvcPipelineConfig {
+        model: &model,
+        embedder: &embedder,
+        embedder_output: None,
+        f0_model: &f0_model,
+        provider: windows_provider()?,
+        gpu_priority: vc_core::model_rvc::GpuPriority::Normal,
+        gpu_device_id: 0,
+        sample_rate,
+        chunk_samples: timing.input_chunk_samples,
+        speaker_id: 0,
+        pitch_shift,
+        f0: F0Config::default(),
+        input_gain: 1.0,
+        noise_gate_enabled: false,
+        noise_gate_threshold: 0.01,
+        noise_gate_shaping: NoiseGateShaping::default(),
+        output_extra_ms: 60,
+        volume_excluded_ms: 40,
+        extra_convert_ms: 80,
+        output_gain: 1.0,
+        output_dynamics: OutputDynamicsConfig::default(),
+        progress: None,
+    })?;
+    let mut converted = Vec::new();
+    let mut chunk_audio = Vec::new();
+    let mut pitch = Vec::new();
+    let mut output_rate = sample_rate;
+    for (index, chunk) in input.chunks(timing.input_chunk_samples).enumerate() {
+        let mut padded = vec![0.0_f32; timing.input_chunk_samples];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        let result = pipeline.process(&padded, sample_rate, &mut chunk_audio, &mut pitch)?;
+        output_rate = result.sample_rate;
+        let keep = if chunk.len() == timing.input_chunk_samples {
+            chunk_audio.len()
+        } else {
+            chunk_audio.len().saturating_mul(chunk.len()) / timing.input_chunk_samples
+        };
+        converted.extend_from_slice(&chunk_audio[..keep]);
+        if index % 10 == 0 {
+            eprintln!(
+                "FOXVOICE_PROGRESS={}",
+                json!({"chunks": index + 1, "totalChunks": input.len().div_ceil(timing.input_chunk_samples)})
+            );
+        }
+    }
+    let temporary = output.with_extension("wav.partial");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: output_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&temporary, spec).context("无法创建离线输出 WAV")?;
+    for sample in &converted {
+        writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+    }
+    writer.finalize()?;
+    if output.exists() {
+        std::fs::remove_file(&output).context("无法替换现有输出文件")?;
+    }
+    std::fs::rename(&temporary, &output).context("无法提交离线输出文件")?;
+    Ok(json!({
+        "ok": true, "output": output, "sampleRate": output_rate,
+        "samples": converted.len(), "elapsedMs": started.elapsed().as_secs_f64() * 1000.0
+    }))
 }
 
 fn play_wav() -> Result<()> {
