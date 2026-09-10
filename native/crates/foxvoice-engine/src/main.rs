@@ -39,11 +39,29 @@ fn run() -> Result<()> {
         "validate-rvc" => validate_rvc(),
         "provider-status" => provider_status(),
         "convert-wav" => convert_wav(),
-        "play-wav" => play_wav(),
+        "play-audio" | "play-wav" => play_audio(),
+        "inspect-audio" => inspect_audio(),
         _ => bail!(
-            "可用命令: devices, passthrough, rvc, validate-rvc, provider-status, convert-wav, play-wav"
+            "可用命令: devices, passthrough, rvc, validate-rvc, provider-status, convert-wav, play-audio, inspect-audio"
         ),
     }
+}
+
+fn inspect_audio() -> Result<()> {
+    let arguments: Vec<String> = env::args().collect();
+    let path = required_path(&arguments, "--file")?;
+    let (samples, sample_rate) = read_audio_mono(&path)?;
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "file": path,
+            "sampleRate": sample_rate,
+            "samples": samples.len(),
+            "durationMs": samples.len() as f64 * 1000.0 / sample_rate as f64
+        })
+    );
+    Ok(())
 }
 
 fn convert_wav() -> Result<()> {
@@ -181,7 +199,7 @@ fn convert_wav_inner(
     }))
 }
 
-fn play_wav() -> Result<()> {
+fn play_audio() -> Result<()> {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -198,7 +216,7 @@ fn play_wav() -> Result<()> {
         (-36.0..=12.0).contains(&gain_db),
         "--gain-db 必须在 -36 到 +12 dB 之间"
     );
-    let (source, source_rate) = read_wav_mono(&path)?;
+    let (source, source_rate) = read_audio_mono(&path)?;
     let host = cpal::default_host();
     let requested = option_value(&arguments, "--output");
     let device = if let Some(name) = requested {
@@ -220,12 +238,9 @@ fn play_wav() -> Result<()> {
     let sample_rate = supported.sample_rate();
     let channels = usize::from(supported.channels());
     let gain = db_to_gain(gain_db);
-    let samples = Arc::new(
-        resample_linear(&source, source_rate, sample_rate)
-            .into_iter()
-            .map(|sample| (sample * gain).clamp(-1.0, 1.0))
-            .collect::<Vec<_>>(),
-    );
+    let mut prepared = resample_linear(&source, source_rate, sample_rate);
+    apply_soundboard_dsp(&mut prepared, gain, sample_rate);
+    let samples = Arc::new(prepared);
     let position = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicBool::new(false));
     let config: StreamConfig = supported.into();
@@ -269,6 +284,114 @@ fn play_wav() -> Result<()> {
         json!({"ok": true, "file": path, "sampleRate": sample_rate, "samples": samples.len()})
     );
     Ok(())
+}
+
+fn read_audio_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    anyhow::ensure!(
+        path.metadata().context("无法读取音效文件信息")?.len() <= 512 * 1024 * 1024,
+        "音效文件超过 512 MiB 上限"
+    );
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("wav"))
+    {
+        return read_wav_mono(path);
+    }
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
+        formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
+    };
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    anyhow::ensure!(
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "flac" | "mp3" | "ogg"
+        ),
+        "音效板仅支持 WAV、FLAC、MP3 和 OGG"
+    );
+    let file = std::fs::File::open(path).context("无法打开音效文件")?;
+    let mut hint = Hint::new();
+    hint.with_extension(extension);
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            MediaSourceStream::new(Box::new(file), Default::default()),
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("无法识别音效格式")?;
+    let mut format = probed.format;
+    let track = format.default_track().context("音效文件没有默认音轨")?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("无法创建音效解码器")?;
+    let mut mono = Vec::new();
+    let mut sample_rate = 0;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => return Err(error).context("读取音效数据失败"),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(error) => return Err(error).context("解码音效失败"),
+        };
+        let spec = *decoded.spec();
+        sample_rate = spec.rate;
+        let channels = spec.channels.count();
+        anyhow::ensure!(channels > 0 && sample_rate > 0, "音效音频格式无效");
+        let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buffer.copy_interleaved_ref(decoded);
+        mono.extend(
+            buffer
+                .samples()
+                .chunks(channels)
+                .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32),
+        );
+        anyhow::ensure!(
+            mono.len() <= sample_rate as usize * 60 * 30,
+            "音效时长超过 30 分钟上限"
+        );
+    }
+    anyhow::ensure!(
+        !mono.is_empty() && sample_rate > 0,
+        "音效文件没有可解码采样"
+    );
+    Ok((mono, sample_rate))
+}
+
+fn apply_soundboard_dsp(samples: &mut [f32], gain: f32, sample_rate: u32) {
+    let fade_samples = ((sample_rate as usize * 5) / 1000).min(samples.len() / 2);
+    let length = samples.len();
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let fade_in = if fade_samples == 0 {
+            1.0
+        } else {
+            (index + 1).min(fade_samples) as f32 / fade_samples as f32
+        };
+        let remaining = length - index;
+        let fade_out = if fade_samples == 0 {
+            1.0
+        } else {
+            remaining.min(fade_samples) as f32 / fade_samples as f32
+        };
+        *sample = (*sample * gain * fade_in.min(fade_out)).clamp(-1.0, 1.0);
+    }
 }
 
 fn build_sound_stream<T: cpal::SizedSample + Send + 'static>(
@@ -711,5 +834,15 @@ mod tests {
         assert_eq!(mono.len(), 2);
         assert!(mono[0].abs() < 0.0001);
         assert!((mono[1] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn soundboard_dsp_fades_edges_and_limits_peak() {
+        let mut samples = vec![2.0; 1_000];
+        apply_soundboard_dsp(&mut samples, 2.0, 48_000);
+        assert!(samples[0] > 0.0 && samples[0] < 0.02);
+        assert_eq!(samples[500], 1.0);
+        assert!(samples[999] > 0.0 && samples[999] < 0.02);
+        assert!(samples.iter().all(|sample| (-1.0..=1.0).contains(sample)));
     }
 }

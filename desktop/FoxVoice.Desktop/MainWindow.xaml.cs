@@ -794,7 +794,7 @@ public partial class MainWindow : Window
         var title = new StackPanel();
         title.Children.Add(new TextBlock { Text = "SOUNDBOARD", Style = (Style)FindResource("Eyebrow") });
         title.Children.Add(new TextBlock { Text = "音效板", Style = (Style)FindResource("SectionTitle") });
-        var add = new Button { Content = "＋ 添加 WAV", Style = (Style)FindResource("PrimaryButton"), HorizontalAlignment = HorizontalAlignment.Right };
+        var add = new Button { Content = "＋ 添加音效", Style = (Style)FindResource("PrimaryButton"), HorizontalAlignment = HorizontalAlignment.Right };
         add.Click += AddSound_Click;
         var header = new Grid();
         header.Children.Add(title);
@@ -827,7 +827,7 @@ public partial class MainWindow : Window
 
     private void AddSound_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new OpenFileDialog { Title = "添加音效", Filter = "WAV 音频 (*.wav)|*.wav", Multiselect = true };
+        var dialog = new OpenFileDialog { Title = "添加音效", Filter = "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg|所有文件 (*.*)|*.*", Multiselect = true };
         if (dialog.ShowDialog(this) != true) return;
         foreach (var path in dialog.FileNames)
         {
@@ -861,7 +861,7 @@ public partial class MainWindow : Window
             _soundboardPanel.Children.Add(card);
         }
         if (_soundboardPanel.Children.Count == 0)
-            _soundboardPanel.Children.Add(new TextBlock { Text = "还没有音效。添加 PCM/Float WAV 后，可发送到当前主输出。", Foreground = (Brush)FindResource("TextSecondary"), Margin = new Thickness(8, 28, 0, 0) });
+            _soundboardPanel.Children.Add(new TextBlock { Text = "还没有音效。添加 WAV、FLAC、MP3 或 OGG 后，可发送到当前主输出。", Foreground = (Brush)FindResource("TextSecondary"), Margin = new Thickness(8, 28, 0, 0) });
         RegisterSoundboardHotkeys();
     }
 
@@ -881,7 +881,7 @@ public partial class MainWindow : Window
     private void PlaySound(string path)
     {
         if (_enginePath is null || !File.Exists(path)) return;
-        var arguments = new List<string> { "play-wav", "--file", path, "--gain-db", _soundboardGain.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) };
+        var arguments = new List<string> { "play-audio", "--file", path, "--gain-db", _soundboardGain.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) };
         if (OutputDeviceCombo.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
         var process = new Process { StartInfo = CreateStartInfo(_enginePath, arguments, redirectInput: false), EnableRaisingEvents = true };
         process.OutputDataReceived += (_, _) => { };
