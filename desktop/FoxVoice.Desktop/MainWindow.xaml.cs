@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private Process? _audioProcess;
     private Process? _monitorProcess;
     private Process? _trainingProcess;
+    private Process? _modelTransferProcess;
     private readonly HashSet<Process> _soundProcesses = [];
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
@@ -54,6 +55,7 @@ public partial class MainWindow : Window
     private readonly Button _rvcSelfTestButton = new() { Content = "运行 RVC 三模型自检", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 10, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
     private readonly TextBlock _tensorRtStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
     private readonly Button _installTensorRtButton = new() { Content = "安装并自检", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
+    private readonly Button _cancelModelTransferButton = new() { Content = "取消下载", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
     private readonly WrapPanel _soundboardPanel = new();
     private readonly Slider _soundboardGain = new() { Minimum = -36, Maximum = 12, Width = 180, TickFrequency = 3, IsSnapToTickEnabled = false };
     private readonly TextBlock _trainingStateText = new() { Text = "检测中", TextWrapping = TextWrapping.Wrap };
@@ -72,6 +74,7 @@ public partial class MainWindow : Window
         AddVirtualCableInstallAction();
         AddRvcSelfTestAction();
         AddModelRecycleAction();
+        AddModelTransferCancelAction();
         _settings = UserSettings.Load();
         BuildSoundboardView();
         BuildTrainingView();
@@ -98,6 +101,7 @@ public partial class MainWindow : Window
             StopMonitorProcess();
             StopSoundboardProcesses();
             StopTrainingProcess();
+            StopModelTransfer();
             ReleaseSoundboardHotkeys();
         };
     }
@@ -130,6 +134,11 @@ public partial class MainWindow : Window
                 {
                     StopTrainingProcess();
                     FooterStatus.Text = $"检测到 {candidate}，训练组件安装已暂停；退出游戏后可继续，已下载内容会复用";
+                }
+                if (_modelTransferProcess is { HasExited: false })
+                {
+                    StopModelTransfer();
+                    FooterStatus.Text = $"检测到 {candidate}，模型下载已暂停；退出游戏后重试将从断点继续";
                 }
             }
             return;
@@ -991,6 +1000,17 @@ public partial class MainWindow : Window
         actions.Children.Insert(insertAt + 1, recycleButton);
     }
 
+    private void AddModelTransferCancelAction()
+    {
+        _cancelModelTransferButton.Click += (_, _) => StopModelTransfer();
+        var download = FindDescendant<Button>(ModelsView, button => Equals(button.Content, "下载并导入"));
+        if (download?.Parent is not Grid row) return;
+        var column = new ColumnDefinition { Width = GridLength.Auto };
+        row.ColumnDefinitions.Add(column);
+        Grid.SetColumn(_cancelModelTransferButton, row.ColumnDefinitions.Count - 1);
+        row.Children.Add(_cancelModelTransferButton);
+    }
+
     private static T? FindDescendant<T>(DependencyObject root, Func<T, bool> predicate) where T : DependencyObject
     {
         for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
@@ -1106,7 +1126,7 @@ public partial class MainWindow : Window
                 if (answer != MessageBoxResult.OK) return;
             }
             catch (Exception error) { FooterStatus.Text = FriendlyError(error); return; }
-            await ImportModelAsync(["models", "huggingface", url], "正在从 Hugging Face 下载并校验…");
+            await ImportHuggingFaceModelAsync(url, "正在从 Hugging Face 下载并校验…");
             return;
         }
         try
@@ -1129,7 +1149,7 @@ public partial class MainWindow : Window
             var selected = ChooseHuggingFaceFile(files, repositoryInfo);
             if (selected is null) { FooterStatus.Text = "已取消仓库导入"; return; }
             HuggingFaceUrl.Text = selected.DownloadUrl;
-            await ImportModelAsync(["models", "huggingface", selected.DownloadUrl], $"正在下载 {selected.Path} 并校验…");
+            await ImportHuggingFaceModelAsync(selected.DownloadUrl, $"正在下载 {selected.Path} 并校验…");
         }
         catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
@@ -1179,6 +1199,22 @@ public partial class MainWindow : Window
             await RunSupervisorAsync(arguments);
             await RefreshModelsAsync();
             FooterStatus.Text = "模型导入完成";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+    }
+
+    private async Task ImportHuggingFaceModelAsync(string url, string progress)
+    {
+        try
+        {
+            FooterStatus.Text = progress + "（可取消并续传）";
+            await RunCancelableModelTransferAsync("models", "huggingface", url);
+            await RefreshModelsAsync();
+            FooterStatus.Text = "Hugging Face 模型下载、校验和导入完成";
+        }
+        catch (OperationCanceledException)
+        {
+            FooterStatus.Text = "模型下载已暂停；再次下载同一地址会从已保存断点继续";
         }
         catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
@@ -1736,6 +1772,45 @@ public partial class MainWindow : Window
         var error = await errorTask;
         if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "控制服务执行失败" : error.Trim());
         return output;
+    }
+
+    private async Task<string> RunCancelableModelTransferAsync(params string[] arguments)
+    {
+        if (_supervisorPath is null) throw new InvalidOperationException("原生控制服务尚未连接");
+        if (_modelTransferProcess is { HasExited: false }) throw new InvalidOperationException("已有模型下载正在运行");
+        var process = new Process { StartInfo = CreateStartInfo(_supervisorPath, arguments, redirectInput: false) };
+        _modelTransferProcess = process;
+        _cancelModelTransferButton.IsEnabled = true;
+        try
+        {
+            process.Start();
+            try { process.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            if (!ReferenceEquals(_modelTransferProcess, process)) throw new OperationCanceledException();
+            var output = await outputTask;
+            var error = await errorTask;
+            if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "模型下载失败" : error.Trim());
+            return output;
+        }
+        finally
+        {
+            if (ReferenceEquals(_modelTransferProcess, process)) _modelTransferProcess = null;
+            _cancelModelTransferButton.IsEnabled = false;
+            process.Dispose();
+        }
+    }
+
+    private void StopModelTransfer()
+    {
+        var process = _modelTransferProcess;
+        _modelTransferProcess = null;
+        if (process is { HasExited: false })
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+        }
+        _cancelModelTransferButton.IsEnabled = false;
     }
 
     private async Task<string> RunEngineCommandAsync(params string[] arguments)
