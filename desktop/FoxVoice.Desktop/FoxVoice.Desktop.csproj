@@ -8,4 +8,12 @@
     <AssemblyName>FoxVoice</AssemblyName>
     <RootNamespace>FoxVoice.Desktop</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\native\target\release\foxvoice-supervisor.exe"
+                      LogicalName="FoxVoice.Native.foxvoice-supervisor.exe"
+                      Condition="Exists('..\..\native\target\release\foxvoice-supervisor.exe')" />
+    <EmbeddedResource Include="..\..\native\target\release\foxvoice-engine.exe"
+                      LogicalName="FoxVoice.Native.foxvoice-engine.exe"
+                      Condition="Exists('..\..\native\target\release\foxvoice-engine.exe')" />
+  </ItemGroup>
 </Project>

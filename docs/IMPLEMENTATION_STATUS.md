@@ -1,60 +1,42 @@
 # FoxVoice 实施状态
 
 更新时间：2026-09-10
+状态口径：只记录已经接入真实实现并完成相应验证的能力。完整差异见 `IMPLEMENTATION_AUDIT.md`。
 
-## 已完成
+## 当前可用
 
-- 可操作的产品工作台原型；
-- 修正版产品与技术架构；
-- Rust workspace 与跨进程协议基础类型；
-- Windows 图形适配器与驱动版本探测；
-- WindowsML、TensorRT、CUDA、CPU 后端推荐规则；
-- 推理组件分目录和冲突组校验；
-- 游戏模式六级降级状态机；
-- 1 MiB 上限、长度前缀 JSON IPC 帧与控制命令契约；
-- 固定容量无锁 SPSC 音频环形缓冲，欠载补静音、过载丢弃并计数；
-- WASAPI 设备枚举与无模型安全旁路实现（可选 `wasapi` 特性）；
-- 自动安装并验证微软签名的 Visual Studio Build Tools、Windows SDK 与 MSVC Rust 工具链；
-- 本机 WASAPI 设备枚举和 2 秒真实音频流旁路自检；
-- 本地 RVC 模型库：`.onnx`、`.pth`、`.index` 分类导入、SHA-256 去重、原子提交、清单列表和可恢复删除；
-- 固定 `vc-rs` commit，并直接复用 `vc-core` 的 ONNX protobuf/RVC 输入输出结构检查器；
-- Windows WPF 桌面工作台，连接真实硬件诊断、音频设备、模型库、旁路进程和实时指标；
-- `win-x64` 自包含发布流程，终端用户无需安装 .NET、Rust 或 Visual Studio；
-- 独立 WindowsML/DirectML 推理进程，直接复用 `vc-app` 的音频线程、重采样、固定队列、RVC worker 和遥测；
-- 桌面端可从模型库选择 Generator，并指定 ContentVec/RMVPE 后启动完整三模型 RVC 管线；
-- Hugging Face 官方域名 `resolve` URL 导入，包含 HTTPS、文件类型、4 GiB 上限、临时文件清理和模型门禁；
-- 桌面设置持久化，所选输入/输出设备会传递给独立引擎；
-- 推理进程异常退出时，桌面控制层刷新设备并自动启动默认设备安全旁路；
-- `doctor`、`recommend`、`validate-components`、`guard-demo`、`ipc-demo` 和 `audio-buffer-demo` 命令；
-- Rust 开发依赖下载与 SHA-256 校验脚本；
-- 13 个原生层单元测试、格式检查和 Clippy 零警告。
+- 与交互原型一致的 Windows 五模块工作台布局；
+- 真实 WASAPI 麦克风/输出设备枚举、选择和持久化；
+- 安全旁路的启动、停止、采样率与欠载指标显示；
+- 独立 WindowsML/DirectML RVC 引擎进程；
+- 运行中实时调整音高、输出增益和轻量噪声门；
+- 本地 `.onnx`、`.pth`、`.index` 导入、SHA-256 去重、结构门禁和状态展示；
+- Hugging Face 单个 `resolve` 文件地址下载与导入；
+- ContentVec、RMVPE 和 Generator 路径进入固定版本 `vc-app`/`vc-core` 推理链；
+- 硬件诊断、后端推荐与虚拟音频设备检测；
+- 引擎异常后的安全旁路恢复；
+- 单文件自包含启动、原生组件按哈希提取和崩溃日志；
+- 分阶段发布、SHA-256 清单、便携 ZIP 和自动冒烟测试。
 
-## 本机自检结果
+## 本机验证结果
 
-- 操作系统：Windows x64；
-- 显卡：NVIDIA GeForce RTX 4060 Ti；
-- 其他适配器：GameViewer Virtual Display Adapter；
-- 当前推荐：WindowsML；
-- 原因：TensorRT 组件尚未安装和通过自检；
-- `.index`：游戏实时模式默认不参与推理；
-- 组件清单：4 个组件，schema v1 校验通过。
-- 音频输入：HECATE G2 GAMING HEADSET 麦克风，48 kHz 单声道；
-- 默认输出：FxSound Speakers，48 kHz 双声道；
-- 2 秒旁路：0 输入过载、0 流错误；两次运行观察到 192–576 个输出采样欠载（约 4–12 ms）。
-- 正式 `vc-app` 旁路持续运行：80+ 块、0 输入过载、约 20 个启动欠载采样，双时钟缓冲稳定。
+- Windows x64，NVIDIA GeForce RTX 4060 Ti；
+- 5 个 WASAPI 输入/输出端点可枚举；
+- DirectML 为当前推荐后端；
+- 安全旁路达到 `Running`，48 kHz，实时参数命令发送后进程继续运行；
+- Windows UI Automation 已点击验证五个导航、设备弹窗、无模型启动引导、旁路启停和音高调整；
+- 发布目录与纯单文件隔离启动都保持响应，内嵌的两个原生组件能够自动提取；
+- Rust 工作区 20 个测试通过，Clippy 使用 `-D warnings` 通过；
+- 当前本机模型库为 0 个模型，未进行特定声音的 RVC 听感验收。
 
-## MVP 后续增强
+## 未交付
 
-1. 下载进度、取消与断点续传；
-2. `.pth` 隔离转换进程；
-3. 音效板与全局热键；
-4. TensorRT 独立组件和压力测试；
-5. 本地训练与离线编辑器。
+- 音效板和全局热键；
+- 模型训练；
+- TensorRT/CUDA 可选组件安装；
+- VB-CABLE 安装与双输出路由；
+- Hugging Face 仓库级浏览和断点续传；
+- `.pth` 转 ONNX；
+- 设备热插拔、完整游戏自动降级和长时间压力测试。
 
-此阶段不会加入训练、FAISS 检索或自研虚拟驱动，先保证音频闭环和故障恢复稳定。
-
-## 当前验证边界
-
-本机已使用 MSVC 编译完整 `wasapi`/`windowsml` 特性，20 个测试、格式检查和 Clippy 均通过，并完成真实
-设备枚举与短时旁路。当前仍是共享模式原型：尚未实现设备热插拔恢复、跨进程共享内存、时钟
-漂移补偿和 RVC 推理，因此不能视为游戏场景的最终低延迟验收。
+这些入口在 UI 中会明确显示当前状态，不再伪装成已可用功能。

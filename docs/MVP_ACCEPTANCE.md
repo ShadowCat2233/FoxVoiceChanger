@@ -1,35 +1,34 @@
-# FoxVoice 本地 MVP 验收
+# FoxVoice 本地构建验收记录
 
 验收日期：2026-09-10  
 平台：Windows 11 x64，NVIDIA GeForce RTX 4060 Ti
 
-| 范围 | 实现证据 | 验证结果 |
-| --- | --- | --- |
-| 桌面程序 | `desktop/FoxVoice.Desktop` | Release 构建 0 警告、0 错误；自包含程序启动后持续运行 |
-| 音频路由 | `foxvoice-engine passthrough` | HECATE G2 输入到 FxSound 输出，48 kHz，80+ 块，0 输入过载 |
-| 模型管理 | `foxvoice-models` | 本地/Hugging Face 导入、SHA-256 去重、原子提交、列表、解析、回收区 |
-| RVC 接入 | `foxvoice-engine rvc` | 固定 `vc-app`/`vc-core` commit，WindowsML 构建通过，三模型参数进入 `RealtimeConfig` |
-| 自动依赖 | `scripts/bootstrap-native.ps1` | 自动安装并验证 Rust、MSVC Build Tools 与 Windows SDK；完整脚本实机通过 |
-| 发布构建 | `scripts/build-release.ps1` | 自包含目录、便携 ZIP、文件清单与 ZIP SHA-256 均实测通过 |
-| 安全与恢复 | 模型门禁、下载限制、独立进程、旁路恢复 | 单元测试、Clippy 和运行时旁路验证通过 |
+本文件只证明当前构建和已接入路径，不再把未提供权重、驱动或压力环境的项目写成产品完成。
 
-## 自动验证命令
+| 范围 | 验证结果 |
+| --- | --- |
+| 桌面界面 | Release 构建 0 警告、0 错误；布局与交互原型一致；五个导航均完成真实点击测试 |
+| 启动恢复 | 发布目录与仅含 `FoxVoice.exe` 的隔离目录均能启动并保持响应；原生组件可自动提取 |
+| 音频路由 | 本机枚举 5 个 WASAPI 端点；安全旁路达到 48 kHz `Running` 并可正常停止 |
+| 实时控制 | 运行中发送音高、输出增益和噪声门参数后，引擎继续报告 `Running` |
+| 模型管理 | 本地/Hugging Face 单文件导入、SHA-256 去重、结构门禁、列表、解析和回收由测试覆盖 |
+| RVC 代码路径 | 固定版本 `vc-app`/`vc-core`、WindowsML 构建和三模型启动参数已接入 |
+| 原生质量门 | MSVC 工作区 20 个测试通过；Clippy `-D warnings` 通过 |
+| 发布 | 临时目录构建、原子替换、文件哈希、便携 ZIP 和自动冒烟测试通过 |
+
+## 尚不能验收的项目
+
+- 当前本机模型库为空，没有合法的 Generator、ContentVec 和 RMVPE 权重，因此没有完成实际变声音质验收；
+- 未检测到 VB-CABLE，尚未验证将变声结果作为虚拟麦克风送入游戏；
+- 未执行 4 小时连续运行、GPU 95% 游戏压力、P95/P99 延迟和设备热插拔测试；
+- 音效板、训练、TensorRT/CUDA 组件安装、双输出监听和 `.pth` 转换尚未实现。
+
+## 可重复验证命令
 
 ```powershell
 .\scripts\bootstrap-native.ps1
-dotnet build .\desktop\FoxVoice.Desktop\FoxVoice.Desktop.csproj -c Release
 .\scripts\build-release.ps1
+.\scripts\smoke-release.ps1
 ```
 
-Rust 工作区在 `wasapi,windowsml` 特性组合下共有 20 个测试通过，Clippy 使用 `-D warnings`
-通过。发布清单中的 `FoxVoice.exe`、`foxvoice-supervisor.exe`、`foxvoice-engine.exe` 哈希均已
-重新计算验证；便携 ZIP 的外部 `.sha256` 同样验证通过。
-
-## MVP 边界
-
-RVC 声音效果依赖用户提供合法的 Generator、ContentVec 和 RMVPE 权重，因此仓库不能凭空完成
-某一声音的音质验收。本 MVP 已验证模型结构门禁、WindowsML 编译、正式引擎设备链路和三模型
-加载入口；具体模型仍需在目标机器上执行听感、P95/P99 延迟及长时间游戏压力测试。
-
-`.pth` 转 ONNX、训练、音效板、FAISS 实时检索、自研虚拟驱动和 TensorRT 是后续扩展，不属于
-本地 MVP 完成条件。
+只有补齐所需合法权重和虚拟音频设备后，才能继续执行 RVC 听感及游戏链路验收。
