@@ -51,6 +51,7 @@ fn list_devices() -> Result<()> {
 
 fn run_engine(passthrough: bool) -> Result<()> {
     let arguments: Vec<String> = env::args().collect();
+    let monitoring = passthrough && arguments.iter().any(|argument| argument == "--monitor");
     let output_gain_db = option_value(&arguments, "--output-gain-db")
         .map(str::parse)
         .transpose()
@@ -79,10 +80,10 @@ fn run_engine(passthrough: bool) -> Result<()> {
     let mut config = RealtimeConfig {
         passthrough,
         provider: windows_provider()?,
-        chunk_ms: 160,
-        crossfade_ms: 40,
-        sola_search_ms: 12,
-        extra_convert_ms: 80,
+        chunk_ms: if monitoring { 60 } else { 160 },
+        crossfade_ms: if monitoring { 10 } else { 40 },
+        sola_search_ms: if monitoring { 5 } else { 12 },
+        extra_convert_ms: if monitoring { 0 } else { 80 },
         // Keep the lightweight gate stage available so the UI can toggle it
         // through live parameters without rebuilding the model pipeline.
         denoiser_mode: DenoiserMode::NoiseGate,

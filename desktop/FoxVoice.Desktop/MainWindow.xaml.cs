@@ -16,6 +16,7 @@ public partial class MainWindow : Window
     private readonly UserSettings _settings;
     private readonly SemaphoreSlim _engineInputLock = new(1, 1);
     private Process? _audioProcess;
+    private Process? _monitorProcess;
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
     private string? _enginePath;
@@ -25,6 +26,8 @@ public partial class MainWindow : Window
     private bool _recovering;
     private bool _ready;
     private bool _suppressDeviceSelection;
+    private AudioDevice? _virtualCableInput;
+    private readonly ComboBox _monitorDeviceCombo = new() { DisplayMemberPath = "Name", Margin = new Thickness(0, 6, 0, 12) };
     private readonly TextBlock _foundationStateText = new() { Text = "检测中", HorizontalAlignment = HorizontalAlignment.Right };
     private readonly Button _installFoundationButton = new() { Content = "安装基础模型", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
 
@@ -32,6 +35,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         AddFoundationModelsCard();
+        AddMonitorDevicePicker();
+        AddVirtualCableInstallAction();
         _settings = UserSettings.Load();
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
@@ -40,7 +45,7 @@ public partial class MainWindow : Window
         NoiseGateToggle.IsChecked = _settings.NoiseGateEnabled;
         GameGuardToggle.IsChecked = _settings.GameGuardEnabled;
         MonitorToggle.IsEnabled = false;
-        MonitorToggle.ToolTip = "当前引擎尚未接入虚拟麦克风与本地监听双输出";
+        MonitorToggle.ToolTip = "选择虚拟声卡为主输出后，可独立监听到物理耳机";
         UpdateLiveControlLabels();
 
         Loaded += MainWindow_Loaded;
@@ -48,6 +53,7 @@ public partial class MainWindow : Window
         {
             TrySaveSettings();
             StopAudioProcess();
+            StopMonitorProcess();
         };
     }
 
@@ -103,6 +109,7 @@ public partial class MainWindow : Window
         var devices = document.RootElement.EnumerateArray().Select(AudioDevice.FromJson).ToList();
         var inputs = devices.Where(device => device.Direction == "input").ToList();
         var outputs = devices.Where(device => device.Direction == "output").ToList();
+        _virtualCableInput = inputs.FirstOrDefault(IsVirtualCableInput);
 
         _suppressDeviceSelection = true;
         InputDeviceCombo.ItemsSource = inputs;
@@ -113,6 +120,11 @@ public partial class MainWindow : Window
         OutputDeviceCombo.SelectedItem = outputs.FirstOrDefault(device => device.Name == _settings.OutputDevice)
             ?? outputs.FirstOrDefault(device => device.IsDefault)
             ?? outputs.FirstOrDefault();
+        var physicalOutputs = outputs.Where(device => !IsVirtualDevice(device)).ToList();
+        _monitorDeviceCombo.ItemsSource = physicalOutputs;
+        _monitorDeviceCombo.SelectedItem = physicalOutputs.FirstOrDefault(device => device.Name == _settings.MonitorOutputDevice)
+            ?? physicalOutputs.FirstOrDefault(device => device.IsDefault)
+            ?? physicalOutputs.FirstOrDefault();
         _suppressDeviceSelection = false;
         UpdateDeviceRouteText();
 
@@ -123,6 +135,7 @@ public partial class MainWindow : Window
         VirtualCableStateText.Foreground = virtualCable is null
             ? new SolidColorBrush(Color.FromRgb(249, 200, 106))
             : (Brush)FindResource("SuccessBrush");
+        UpdateMonitorAvailability();
     }
 
     private async Task RefreshModelsAsync()
@@ -241,6 +254,26 @@ public partial class MainWindow : Window
         };
         if (ComponentsView.Content is StackPanel root && root.Children.OfType<StackPanel>().LastOrDefault() is StackPanel list)
             list.Children.Insert(1, card);
+    }
+
+    private void AddMonitorDevicePicker()
+    {
+        _monitorDeviceCombo.SelectionChanged += (_, _) =>
+        {
+            if (!_ready) return;
+            UpdateMonitorAvailability();
+            TrySaveSettings();
+        };
+        if (DeviceOverlay.Children.OfType<Border>().FirstOrDefault()?.Child is not Grid card) return;
+        var routePanel = card.Children.OfType<StackPanel>().FirstOrDefault(child => Grid.GetRow(child) == 1);
+        if (routePanel is null) return;
+        routePanel.Children.Add(new TextBlock
+        {
+            Text = "本地监听设备（可选）",
+            Foreground = (Brush)FindResource("TextSecondary"),
+            Margin = new Thickness(0, 14, 0, 0)
+        });
+        routePanel.Children.Add(_monitorDeviceCombo);
     }
 
     private void Navigation_Checked(object sender, RoutedEventArgs e)
@@ -487,6 +520,8 @@ public partial class MainWindow : Window
             FooterStateText.Text = snapshot.Passthrough ? "安全旁路运行中" : "实时引擎运行中";
             FooterDot.Fill = (Brush)FindResource("SuccessBrush");
             FooterStatus.Text = snapshot.Message ?? "音频链路正常";
+            if (MonitorToggle.IsChecked == true && _monitorProcess is not { HasExited: false })
+                StartMonitorProcess();
         }
         if (snapshot.OutputSampleRate > 0) SampleRateText.Text = $"{snapshot.OutputSampleRate / 1000.0:0.#} kHz";
         UnderrunText.Text = snapshot.OutputUnderruns.ToString("N0");
@@ -511,6 +546,7 @@ public partial class MainWindow : Window
         }
         _audioProcess?.Dispose();
         _audioProcess = null;
+        StopMonitorProcess();
         SetAudioRunning(false);
     }
 
@@ -602,9 +638,99 @@ public partial class MainWindow : Window
 
     private void Monitor_Changed(object sender, RoutedEventArgs e)
     {
-        if (!_ready || MonitorToggle.IsChecked != true) return;
-        MonitorToggle.IsChecked = false;
-        FooterStatus.Text = "当前引擎只有一个输出总线；双输出监听会在音频路由阶段实现";
+        if (!_ready) return;
+        if (MonitorToggle.IsChecked == true) StartMonitorProcess();
+        else StopMonitorProcess();
+    }
+
+    private void StartMonitorProcess()
+    {
+        if (_monitorProcess is { HasExited: false }) return;
+        if (_audioProcess is not { HasExited: false })
+        {
+            FooterStatus.Text = "先启动实时变声，再开启本地监听";
+            return;
+        }
+        if (_enginePath is null || _virtualCableInput is null || _monitorDeviceCombo.SelectedItem is not AudioDevice output)
+        {
+            MonitorToggle.IsChecked = false;
+            FooterStatus.Text = "双输出需要虚拟声卡输入端和一个物理监听设备";
+            return;
+        }
+        var info = CreateStartInfo(_enginePath,
+            ["passthrough", "--monitor", "--input", _virtualCableInput.Name, "--output", output.Name], redirectInput: false);
+        var process = new Process { StartInfo = info, EnableRaisingEvents = true };
+        process.Exited += (_, _) => Dispatcher.BeginInvoke(() =>
+        {
+            if (!ReferenceEquals(_monitorProcess, process)) return;
+            _monitorProcess = null;
+            process.Dispose();
+            if (MonitorToggle.IsChecked == true)
+            {
+                MonitorToggle.IsChecked = false;
+                FooterStatus.Text = "本地监听已退出；送往游戏的主变声链路不受影响";
+            }
+        });
+        try
+        {
+            process.Start();
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+            _monitorProcess = process;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            FooterStatus.Text = $"双输出已启用：游戏走虚拟声卡，监听走 {output.Name}";
+        }
+        catch (Exception error)
+        {
+            process.Dispose();
+            MonitorToggle.IsChecked = false;
+            FooterStatus.Text = $"无法启动本地监听：{FriendlyError(error)}";
+        }
+    }
+
+    private void StopMonitorProcess()
+    {
+        var process = _monitorProcess;
+        _monitorProcess = null;
+        if (process is { HasExited: false })
+        {
+            try { process.Kill(entireProcessTree: true); }
+            catch { }
+        }
+        process?.Dispose();
+    }
+
+    private void UpdateMonitorAvailability()
+    {
+        var primaryOutput = OutputDeviceCombo.SelectedItem as AudioDevice;
+        var ready = _virtualCableInput is not null
+            && primaryOutput is not null && IsVirtualDevice(primaryOutput)
+            && _monitorDeviceCombo.SelectedItem is AudioDevice;
+        MonitorToggle.IsEnabled = ready;
+        MonitorToggle.ToolTip = ready
+            ? "使用独立低优先级监听进程，不阻塞送往游戏的主链路"
+            : "请把主输出选择为 VB-CABLE，并选择一个物理监听设备";
+        if (!ready && MonitorToggle.IsChecked == true) MonitorToggle.IsChecked = false;
+    }
+
+    private static bool IsVirtualDevice(AudioDevice device) =>
+        device.Name.Contains("CABLE", StringComparison.OrdinalIgnoreCase)
+        || device.Name.Contains("Virtual", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsVirtualCableInput(AudioDevice device) =>
+        device.Direction == "input" && IsVirtualDevice(device);
+
+    private void AddVirtualCableInstallAction()
+    {
+        if (VirtualCableStateText.Parent is not Grid grid) return;
+        grid.Children.Remove(VirtualCableStateText);
+        var button = new Button { Content = "官方安装说明", Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 8, 0, 0) };
+        button.Click += (_, _) => Process.Start(new ProcessStartInfo("https://vb-audio.com/Cable/") { UseShellExecute = true });
+        var action = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
+        action.Children.Add(VirtualCableStateText);
+        action.Children.Add(button);
+        Grid.SetColumn(action, 2);
+        grid.Children.Add(action);
     }
 
     private void OpenDevices_Click(object sender, RoutedEventArgs e) => DeviceOverlay.Visibility = Visibility.Visible;
@@ -626,6 +752,7 @@ public partial class MainWindow : Window
     {
         if (!_ready || _suppressDeviceSelection) return;
         UpdateDeviceRouteText();
+        UpdateMonitorAvailability();
     }
 
     private void UpdateDeviceRouteText()
@@ -653,6 +780,7 @@ public partial class MainWindow : Window
             _settings.F0Path = F0Path.Text;
             _settings.InputDevice = (InputDeviceCombo.SelectedItem as AudioDevice)?.Name ?? "";
             _settings.OutputDevice = (OutputDeviceCombo.SelectedItem as AudioDevice)?.Name ?? "";
+            _settings.MonitorOutputDevice = (_monitorDeviceCombo.SelectedItem as AudioDevice)?.Name ?? "";
             _settings.SelectedModelId = _selectedModel?.Id ?? _settings.SelectedModelId;
             _settings.Pitch = PitchSlider.Value;
             _settings.OutputGainDb = OutputGainSlider.Value;

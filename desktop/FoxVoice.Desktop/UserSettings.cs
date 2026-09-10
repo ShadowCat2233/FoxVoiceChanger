@@ -9,6 +9,7 @@ internal sealed class UserSettings
     public string F0Path { get; set; } = "";
     public string InputDevice { get; set; } = "";
     public string OutputDevice { get; set; } = "";
+    public string MonitorOutputDevice { get; set; } = "";
     public string SelectedModelId { get; set; } = "";
     public double Pitch { get; set; }
     public double OutputGainDb { get; set; }
