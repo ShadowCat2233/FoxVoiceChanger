@@ -1,5 +1,15 @@
 # Third-party notices
 
+## RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+
+FoxVoice can optionally download a pinned upstream checkout for local model training. The training
+source is not included in the FoxVoice archive and is licensed separately under the MIT License.
+PyTorch, pretrained weights, FFmpeg and Python packages installed by that workflow retain their own
+licenses. Users must review and accept those terms before installation.
+
+Source: https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+Pinned revision: `81eed5e8f68b6bed1789f682fe78cdd324495afc`
+
 ## vc-rs / vc-convert
 
 FoxVoice uses code from `shirohata/vc-rs` at commit

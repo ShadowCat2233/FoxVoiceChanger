@@ -3,6 +3,7 @@ pub mod foundation_models;
 pub mod guard;
 pub mod hardware;
 pub mod recommendation;
+pub mod training;
 
 pub use components::{ComponentManifest, ManifestError};
 pub use foundation_models::{
@@ -11,3 +12,4 @@ pub use foundation_models::{
 pub use guard::GameGuard;
 pub use hardware::detect_hardware;
 pub use recommendation::recommend_engine;
+pub use training::{install as install_training, status as training_status, training_root};

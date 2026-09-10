@@ -13,7 +13,7 @@ use foxvoice_ipc::{read_frame, write_frame};
 use foxvoice_models::ModelLibrary;
 use foxvoice_supervisor::{
     ComponentManifest, GameGuard, detect_hardware, foundation_model_status, foundation_root,
-    install_foundation_models, recommend_engine,
+    install_foundation_models, install_training, recommend_engine, training_root, training_status,
 };
 
 fn main() {
@@ -50,6 +50,7 @@ fn run() -> Result<()> {
         "audio-buffer-demo" => print_audio_buffer_demo(),
         "models" => run_models_command(),
         "foundation-models" => run_foundation_models_command(),
+        "training" => run_training_command(),
         #[cfg(feature = "wasapi")]
         "audio-devices" => print_audio_devices(),
         #[cfg(feature = "wasapi")]
@@ -65,6 +66,30 @@ fn run() -> Result<()> {
             }
         ),
     }
+}
+
+fn run_training_command() -> Result<()> {
+    let action = env::args().nth(2).unwrap_or_else(|| "status".into());
+    let root = training_root()?;
+    let report = match action.as_str() {
+        "status" => training_status(&root)?,
+        "install" => {
+            let backend = env::args()
+                .skip_while(|argument| argument != "--backend")
+                .nth(1)
+                .unwrap_or_else(|| "cuda".into());
+            install_training(
+                &root,
+                &backend,
+                env::args().any(|argument| argument == "--accept-licenses"),
+            )?
+        }
+        _ => bail!(
+            "用法: foxvoice-supervisor training status|install --backend cuda|cpu --accept-licenses"
+        ),
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn run_foundation_models_command() -> Result<()> {

@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _gameDetectionTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private Process? _audioProcess;
     private Process? _monitorProcess;
+    private Process? _trainingProcess;
     private readonly HashSet<Process> _soundProcesses = [];
     private StreamWriter? _engineInput;
     private string? _supervisorPath;
@@ -53,6 +54,10 @@ public partial class MainWindow : Window
     private readonly Button _rvcSelfTestButton = new() { Content = "运行 RVC 三模型自检", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 10, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
     private readonly WrapPanel _soundboardPanel = new();
     private readonly Slider _soundboardGain = new() { Minimum = -36, Maximum = 12, Width = 180, TickFrequency = 3, IsSnapToTickEnabled = false };
+    private readonly TextBlock _trainingStateText = new() { Text = "检测中", TextWrapping = TextWrapping.Wrap };
+    private readonly Button _installCudaTrainingButton = new() { Content = "安装 NVIDIA CUDA 训练环境", Padding = new Thickness(14, 8, 14, 8) };
+    private readonly Button _installCpuTrainingButton = new() { Content = "安装 CPU 训练环境", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button _cancelTrainingButton = new() { Content = "取消安装", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
 
     public MainWindow()
     {
@@ -64,6 +69,7 @@ public partial class MainWindow : Window
         AddModelRecycleAction();
         _settings = UserSettings.Load();
         BuildSoundboardView();
+        BuildTrainingView();
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
         PitchSlider.Value = _settings.Pitch;
@@ -86,6 +92,7 @@ public partial class MainWindow : Window
             StopAudioProcess();
             StopMonitorProcess();
             StopSoundboardProcesses();
+            StopTrainingProcess();
             ReleaseSoundboardHotkeys();
         };
     }
@@ -114,6 +121,11 @@ public partial class MainWindow : Window
                 GuardStateText.Text = $"游戏保护：已检测到 {candidate}";
                 if (_audioProcess is { HasExited: false } && _guardProfile == "normal")
                     _ = SendGuardProfileAsync("stable");
+                if (_trainingProcess is { HasExited: false })
+                {
+                    StopTrainingProcess();
+                    FooterStatus.Text = $"检测到 {candidate}，训练组件安装已暂停；退出游戏后可继续，已下载内容会复用";
+                }
             }
             return;
         }
@@ -202,6 +214,8 @@ public partial class MainWindow : Window
         catch (Exception error) { failures.Add($"硬件诊断：{FriendlyError(error)}"); }
         try { await RefreshFoundationModelsAsync(applyPaths: true); }
         catch (Exception error) { failures.Add($"基础模型：{FriendlyError(error)}"); }
+        try { await RefreshTrainingStatusAsync(); }
+        catch (Exception error) { failures.Add($"训练组件：{FriendlyError(error)}"); }
 
         if (failures.Count == 0)
         {
@@ -385,6 +399,120 @@ public partial class MainWindow : Window
             Margin = new Thickness(0, 14, 0, 0)
         });
         routePanel.Children.Add(_monitorDeviceCombo);
+    }
+
+    private void BuildTrainingView()
+    {
+        _installCudaTrainingButton.Click += async (_, _) => await InstallTrainingAsync("cuda");
+        _installCpuTrainingButton.Click += async (_, _) => await InstallTrainingAsync("cpu");
+        _cancelTrainingButton.Click += (_, _) => StopTrainingProcess();
+        TrainingView.Children.Clear();
+        var root = new StackPanel { Margin = new Thickness(28, 26, 28, 26) };
+        root.Children.Add(new TextBlock { Text = "MODEL TRAINING", Style = (Style)FindResource("Eyebrow") });
+        root.Children.Add(new TextBlock { Text = "模型训练", Style = (Style)FindResource("SectionTitle") });
+        var card = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 18, 0, 14), Padding = new Thickness(20) };
+        var content = new StackPanel();
+        content.Children.Add(new TextBlock { Text = "隔离训练组件", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        content.Children.Add(new TextBlock
+        {
+            Text = "固定官方 RVC 源代码版本；Python 3.12、FFmpeg、PyTorch 和训练权重按需安装到 LocalAppData，不进入实时引擎。",
+            Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 7, 0, 14)
+        });
+        content.Children.Add(_trainingStateText);
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 16, 0, 0) };
+        actions.Children.Add(_installCudaTrainingButton);
+        actions.Children.Add(_installCpuTrainingButton);
+        actions.Children.Add(_cancelTrainingButton);
+        content.Children.Add(actions);
+        card.Child = content;
+        root.Children.Add(card);
+        root.Children.Add(new TextBlock
+        {
+            Text = "安装可能下载数 GB 数据。检测到全屏/无边框游戏时会停止安装进程；Git、pip 与 Hugging Face 缓存允许稍后继续。训练任务向导将在环境完整自检通过后启用。",
+            Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap
+        });
+        TrainingView.Children.Add(root);
+    }
+
+    private async Task RefreshTrainingStatusAsync()
+    {
+        using var document = JsonDocument.Parse(await RunSupervisorAsync("training", "status"));
+        var root = document.RootElement;
+        var ready = root.GetProperty("ready").GetBoolean();
+        var source = root.GetProperty("sourceReady").GetBoolean();
+        var python = root.GetProperty("pythonReady").GetBoolean();
+        var torch = root.GetProperty("torchReady").GetBoolean();
+        var cuda = root.GetProperty("cudaReady").GetBoolean();
+        var models = root.GetProperty("modelsReady").GetBoolean();
+        _trainingStateText.Text = ready
+            ? $"环境已就绪 · 源代码 ✓  Python ✓  PyTorch ✓  基础权重 ✓  CUDA {(cuda ? "✓" : "未启用")}"
+            : $"尚未就绪 · 源代码 {(source ? "✓" : "—")}  Python {(python ? "✓" : "—")}  PyTorch {(torch ? "✓" : "—")}  基础权重 {(models ? "✓" : "—")}";
+        _trainingStateText.Foreground = ready ? (Brush)FindResource("SuccessBrush") : new SolidColorBrush(Color.FromRgb(249, 200, 106));
+    }
+
+    private async Task InstallTrainingAsync(string backend)
+    {
+        if (RejectHeavyWorkDuringGame("训练组件安装")) return;
+        if (_trainingProcess is { HasExited: false }) return;
+        var label = backend == "cuda" ? "NVIDIA CUDA 12.8" : "CPU";
+        var answer = MessageBox.Show(this,
+            $"将安装官方 RVC 固定版本及 {label} 训练环境，可能下载数 GB。\n\nRVC 代码采用 MIT；PyTorch、预训练权重和其他依赖遵循各自许可证。继续表示你接受并确认有权训练所用声音素材。",
+            "安装训练组件", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+        if (answer != MessageBoxResult.OK) return;
+        if (_supervisorPath is null) return;
+        var process = new Process
+        {
+            StartInfo = CreateStartInfo(_supervisorPath, ["training", "install", "--backend", backend, "--accept-licenses"], redirectInput: false),
+            EnableRaisingEvents = true
+        };
+        _trainingProcess = process;
+        SetTrainingButtons(true);
+        try
+        {
+            process.Start();
+            try { process.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            while (await process.StandardError.ReadLineAsync() is { } line)
+            {
+                if (line.StartsWith("FOXVOICE_TRAINING_STAGE="))
+                    FooterStatus.Text = line["FOXVOICE_TRAINING_STAGE=".Length..];
+            }
+            await process.WaitForExitAsync();
+            var output = await outputTask;
+            if (process.ExitCode != 0) throw new InvalidOperationException("训练组件安装未完成，请查看上方最后阶段后重试");
+            using var _ = JsonDocument.Parse(output);
+            await RefreshTrainingStatusAsync();
+            FooterStatus.Text = $"{label} 训练组件安装并自检通过";
+        }
+        catch (Exception) when (!ReferenceEquals(_trainingProcess, process))
+        {
+            FooterStatus.Text = "训练组件安装已取消；下次安装会复用已下载内容";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+        finally
+        {
+            if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
+            process.Dispose();
+            SetTrainingButtons(false);
+        }
+    }
+
+    private void StopTrainingProcess()
+    {
+        var process = _trainingProcess;
+        _trainingProcess = null;
+        if (process is { HasExited: false })
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+        }
+        SetTrainingButtons(false);
+    }
+
+    private void SetTrainingButtons(bool running)
+    {
+        _installCudaTrainingButton.IsEnabled = !running;
+        _installCpuTrainingButton.IsEnabled = !running;
+        _cancelTrainingButton.IsEnabled = running;
     }
 
     private void BuildSoundboardView()
