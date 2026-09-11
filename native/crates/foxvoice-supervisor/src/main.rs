@@ -320,6 +320,15 @@ fn run_models_command() -> Result<()> {
                 serde_json::to_string_pretty(&library.mark_used(&id)?)?
             );
         }
+        "rescan" => {
+            let id = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models rescan <model-id>")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.rescan_profile(&id)?)?
+            );
+        }
         "tested" => {
             let id = env::args().nth(3).context(
                 "用法: foxvoice-supervisor models tested <model-id> <passed|failed> <provider>",
@@ -375,7 +384,7 @@ fn run_models_command() -> Result<()> {
             println!("FOXVOICE_RESULT_JSON={}", serde_json::to_string(&result?)?);
         }
         _ => bail!(
-            "未知模型命令。可用命令: models list, models import, models huggingface, models huggingface-files, models huggingface-info, models metadata, models used, models tested, models recycle, models resolve, models convert"
+            "未知模型命令。可用命令: models list, models import, models huggingface, models huggingface-files, models huggingface-info, models metadata, models used, models rescan, models tested, models recycle, models resolve, models convert"
         ),
     }
     Ok(())

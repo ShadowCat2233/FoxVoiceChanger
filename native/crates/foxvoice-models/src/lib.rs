@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+mod onnx_profile;
+
 const MANIFEST_FILE: &str = "model.json";
 const RECYCLE_DIRECTORY: &str = ".recycle";
 const MAX_MODEL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -124,10 +126,13 @@ impl ModelLibrary {
             .context("模型文件名不是有效 UTF-8")?
             .to_owned();
         let (format, state) = classify(source_path)?;
-        if format == ModelFormat::Onnx {
+        let onnx_profile = if format == ModelFormat::Onnx {
             vc_core::model_rvc::inspect_model(source_path)
                 .context("ONNX 文件不是受支持的 RVC 模型")?;
-        }
+            onnx_profile::inspect(source_path).ok()
+        } else {
+            None
+        };
         let sha256 = sha256_file(source_path)?;
         let id = format!("model-{}", &sha256[..16]);
         let destination_directory = self.root.join(&id);
@@ -159,10 +164,22 @@ impl ModelLibrary {
             source,
             author: None,
             license: None,
-            tags: default_tags(format),
-            rvc_version: None,
-            sample_rate: None,
-            uses_f0: None,
+            tags: default_tags(format)
+                .into_iter()
+                .chain(
+                    onnx_profile
+                        .as_ref()
+                        .filter(|profile| profile.streaming)
+                        .map(|_| "streaming".into()),
+                )
+                .collect(),
+            rvc_version: onnx_profile
+                .as_ref()
+                .and_then(|profile| profile.rvc_version.clone()),
+            sample_rate: onnx_profile
+                .as_ref()
+                .and_then(|profile| profile.sample_rate),
+            uses_f0: onnx_profile.as_ref().and_then(|profile| profile.uses_f0),
             speaker_count: None,
             recommended_provider: None,
             test_status: None,
@@ -386,6 +403,36 @@ impl ModelLibrary {
         Ok(path)
     }
 
+    pub fn rescan_profile(&self, id: &str) -> Result<ModelRecord> {
+        let mut record = self.read_record(id)?;
+        anyhow::ensure!(
+            record.format == ModelFormat::Onnx,
+            "只有 ONNX Generator 可扫描结构资料"
+        );
+        let path = self.root.join(id).join(&record.file_name);
+        anyhow::ensure!(
+            sha256_file(&path)? == record.sha256,
+            "模型文件已变化；拒绝更新结构资料，请重新导入"
+        );
+        let profile = onnx_profile::inspect(&path)?;
+        record.rvc_version = profile.rvc_version;
+        record.sample_rate = profile.sample_rate;
+        record.uses_f0 = profile.uses_f0;
+        for tag in default_tags(ModelFormat::Onnx) {
+            if !record.tags.contains(&tag) {
+                record.tags.push(tag);
+            }
+        }
+        if profile.streaming && !record.tags.iter().any(|tag| tag == "streaming") {
+            record.tags.push("streaming".into());
+        }
+        if let Some(decoded) = percent_decode_utf8(&record.display_name) {
+            record.display_name = decoded;
+        }
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
     pub fn update_metadata(&self, id: &str, update: ModelMetadataUpdate) -> Result<ModelRecord> {
         let mut record = self.read_record(id)?;
         let display_name = update.display_name.trim();
@@ -475,6 +522,27 @@ fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>> {
         normalized.push(tag);
     }
     Ok(normalized)
+}
+
+fn percent_decode_utf8(value: &str) -> Option<String> {
+    if !value.as_bytes().contains(&b'%') {
+        return None;
+    }
+    let input = value.as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' && index + 2 < input.len() {
+            let high = (input[index + 1] as char).to_digit(16)? as u8;
+            let low = (input[index + 2] as char).to_digit(16)? as u8;
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -752,6 +820,16 @@ mod tests {
                 .is_err()
         );
         assert!(library.record_test(&model.id, true, "mystery").is_err());
+    }
+
+    #[test]
+    fn decodes_utf8_huggingface_display_names_without_loss() {
+        assert_eq!(
+            percent_decode_utf8("%E5%A5%B3%E5%A3%B0-%E9%9B%85%E7%90%B3"),
+            Some("女声-雅琳".into())
+        );
+        assert_eq!(percent_decode_utf8("plain-name"), None);
+        assert_eq!(percent_decode_utf8("broken-%ZZ"), None);
     }
 
     #[test]

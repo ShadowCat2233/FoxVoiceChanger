@@ -292,6 +292,17 @@ public partial class MainWindow : Window
     {
         using var document = JsonDocument.Parse(await RunSupervisorAsync("models", "list"));
         _models = document.RootElement.EnumerateArray().Select(ModelItem.FromJson).ToList();
+        var missingProfiles = _models.Where(model => model.IsUsable && model.RvcVersion is null).ToList();
+        if (missingProfiles.Count > 0)
+        {
+            foreach (var model in missingProfiles)
+            {
+                try { await RunSupervisorAsync("models", "rescan", model.Id); }
+                catch { /* 旧模型的可选资料扫描失败不应阻止模型库打开。 */ }
+            }
+            using var rescanned = JsonDocument.Parse(await RunSupervisorAsync("models", "list"));
+            _models = rescanned.RootElement.EnumerateArray().Select(ModelItem.FromJson).ToList();
+        }
         ModelsList.ItemsSource = _models;
         var usable = _models.Where(model => model.IsUsable).ToList();
         PresetItems.ItemsSource = usable.Take(4).ToList();
