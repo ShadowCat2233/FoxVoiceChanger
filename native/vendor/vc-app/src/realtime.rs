@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
@@ -26,6 +26,9 @@ use crate::audio::{self, AudioStream, RealtimeAudio};
 const INPUT_QUEUE_CHUNKS: usize = 4;
 const OUTPUT_QUEUE_CHUNKS: usize = 4;
 const COMMAND_CAPACITY: usize = 8;
+const OUTPUT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_AUTOMATIC_RESTARTS: u32 = 3;
+const OUTPUT_STALL_ERROR: &str = "output render callback stalled";
 
 /// OS audio host / API. Modelled on cpal's `HostId` (the canonical serialized
 /// tokens match: `wasapi`/`asio`/`coreaudio`/`alsa`/`jack`), so the same enum
@@ -530,10 +533,14 @@ fn control_loop(
     passthrough: Arc<AtomicBool>,
 ) {
     let mut session: Option<RealtimeSession> = None;
+    let mut active_config: Option<RealtimeConfig> = None;
+    let mut automatic_restarts = 0_u32;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Command::Apply(config)) => {
                 passthrough.store(config.passthrough, Ordering::Relaxed);
+                active_config = Some(config.clone());
+                automatic_restarts = 0;
                 set_status(&status, EngineState::Stopping, "Stopping previous session");
                 drop(session.take());
                 set_status(&status, EngineState::Starting, "Validating configuration");
@@ -555,6 +562,8 @@ fn control_loop(
                 }
             }
             Ok(Command::Stop) => {
+                active_config = None;
+                automatic_restarts = 0;
                 set_status(&status, EngineState::Stopping, "Stopping");
                 drop(session.take());
                 set_status(&status, EngineState::Stopped, "Stopped");
@@ -584,7 +593,46 @@ fn control_loop(
             // model) into the status detail, not just the generic message.
             let detail = session.as_ref().and_then(|s| s.last_error());
             drop(session.take());
-            set_error_message(&status, "Realtime worker stopped", detail);
+            let can_restart = detail
+                .as_deref()
+                .is_some_and(|message| message.starts_with(OUTPUT_STALL_ERROR))
+                && automatic_restarts < MAX_AUTOMATIC_RESTARTS;
+            if can_restart {
+                automatic_restarts += 1;
+                set_status(
+                    &status,
+                    EngineState::Starting,
+                    format!(
+                        "Output endpoint stalled; rebuilding audio session ({automatic_restarts}/{MAX_AUTOMATIC_RESTARTS})"
+                    ),
+                );
+                let restart = active_config
+                    .clone()
+                    .context("automatic restart lost the active configuration")
+                    .and_then(|config| {
+                        RealtimeSession::start(
+                            config,
+                            Arc::clone(&telemetry),
+                            Arc::clone(&live),
+                            Arc::clone(&passthrough),
+                            &status,
+                        )
+                    });
+                match restart {
+                    Ok(new_session) => {
+                        if let Ok(mut current) = status.lock() {
+                            *current = new_session.status();
+                        }
+                        session = Some(new_session);
+                    }
+                    Err(error) => set_error(
+                        &status,
+                        &error.context("Failed to rebuild stalled output endpoint"),
+                    ),
+                }
+            } else {
+                set_error_message(&status, "Realtime worker stopped", detail);
+            }
         }
     }
     drop(session);
@@ -1092,6 +1140,7 @@ impl RealtimeSession {
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
         let running = Arc::new(AtomicBool::new(true));
         let wake = Arc::new(WorkerWake::default());
+        let output_callbacks = Arc::new(AtomicU64::new(0));
         // Build the device streams before spawning the inference worker: a
         // stream failure then returns without ever starting (and stopping) the
         // worker and its model/CUDA context. The streams stay paused until
@@ -1103,6 +1152,7 @@ impl RealtimeSession {
             &running,
             &wake,
             &telemetry,
+            &output_callbacks,
         )?;
         let last_error = Arc::new(Mutex::new(None));
         let worker_last_error = Arc::clone(&last_error);
@@ -1113,6 +1163,7 @@ impl RealtimeSession {
         let worker_debug_output = Arc::clone(&debug_output);
         let capture_input = config.debug_input_wav.is_some();
         let capture_output = config.debug_output_wav.is_some();
+        let worker_output_callbacks = Arc::clone(&output_callbacks);
         let mut worker = Some(
             thread::Builder::new()
                 .name("vc-app-inference".to_string())
@@ -1129,6 +1180,8 @@ impl RealtimeSession {
                     let mut model = model;
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
+                    let mut last_output_callbacks = worker_output_callbacks.load(Ordering::Relaxed);
+                    let mut last_output_progress = Instant::now();
                     while worker_running.load(Ordering::SeqCst) {
                         if !accumulate_input_chunk(&mut input_consumer, &mut input_acc, input_chunk)
                         {
@@ -1143,6 +1196,35 @@ impl RealtimeSession {
                             // fixed 2 ms poll: no wasted tail latency when input
                             // arrives, no idle spin when the input stream stops.
                             thread::park_timeout(Duration::from_millis(100));
+                            continue;
+                        }
+                        let callback_count = worker_output_callbacks.load(Ordering::Relaxed);
+                        if callback_count != last_output_callbacks {
+                            last_output_callbacks = callback_count;
+                            last_output_progress = Instant::now();
+                        }
+                        let buffered = output_capacity - output_producer.slots();
+                        if buffered >= output_capacity.saturating_sub(output_chunk) {
+                            if output_callback_stalled(
+                                buffered,
+                                output_capacity.saturating_sub(output_chunk),
+                                last_output_progress.elapsed(),
+                            ) {
+                                let message = format!(
+                                    "{OUTPUT_STALL_ERROR}: no callback progress for at least {} ms",
+                                    OUTPUT_STALL_TIMEOUT.as_millis()
+                                );
+                                tracing::error!("{message}");
+                                if let Ok(mut slot) = worker_last_error.lock() {
+                                    *slot = Some(message);
+                                }
+                                worker_running.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            // Do not generate another chunk into a full ring. The
+                            // accumulated input remains intact until render resumes,
+                            // preventing output drops during a short endpoint pause.
+                            thread::park_timeout(Duration::from_millis(5));
                             continue;
                         }
                         #[allow(clippy::collapsible_if)]
@@ -1303,6 +1385,10 @@ fn should_queue_silent_output(buffered: usize, output_chunk: usize) -> bool {
     buffered <= output_chunk
 }
 
+fn output_callback_stalled(buffered: usize, high_water: usize, without_progress: Duration) -> bool {
+    buffered >= high_water && without_progress >= OUTPUT_STALL_TIMEOUT
+}
+
 /// Choose how many queued samples an output callback should consume.
 ///
 /// Independent capture and render devices have independent hardware clocks. A
@@ -1368,6 +1454,7 @@ fn build_streams(
     running: &Arc<AtomicBool>,
     wake: &Arc<WorkerWake>,
     telemetry: &Arc<Telemetry>,
+    output_callbacks: &Arc<AtomicU64>,
 ) -> Result<StreamEndpoints> {
     let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(input_capacity);
     let (output_producer, mut output_consumer) = RingBuffer::<f32>::new(output_capacity);
@@ -1394,9 +1481,11 @@ fn build_streams(
     })?;
     let output_running = Arc::clone(running);
     let output_telemetry = Arc::clone(telemetry);
+    let output_callback_counter = Arc::clone(output_callbacks);
     let low_water = output_capacity / OUTPUT_QUEUE_CHUNKS;
     let mut last_output_sample = 0.0_f32;
     let output_stream = audio.build_output_stream(move |out| {
+        output_callback_counter.fetch_add(1, Ordering::Relaxed);
         if !output_running.load(Ordering::Relaxed) {
             out.fill(0.0);
             return;
@@ -1718,6 +1807,21 @@ mod tests {
         assert_eq!(samples.first().copied(), Some(0.0));
         assert_eq!(samples.last().copied(), Some(2.0));
         assert_eq!(samples, vec![0.0, 0.5, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn output_stall_requires_both_high_water_and_timeout() {
+        assert!(!output_callback_stalled(
+            2_879,
+            2_880,
+            OUTPUT_STALL_TIMEOUT * 2
+        ));
+        assert!(!output_callback_stalled(
+            2_880,
+            2_880,
+            OUTPUT_STALL_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(output_callback_stalled(2_880, 2_880, OUTPUT_STALL_TIMEOUT));
     }
 
     #[test]
