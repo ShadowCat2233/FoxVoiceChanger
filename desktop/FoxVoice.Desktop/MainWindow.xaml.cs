@@ -1579,7 +1579,7 @@ public partial class MainWindow : Window
         }
         if (snapshot.OutputSampleRate > 0) SampleRateText.Text = $"{snapshot.OutputSampleRate / 1000.0:0.#} kHz";
         UnderrunText.Text = snapshot.OutputUnderruns.ToString("N0");
-        StreamErrorText.Text = snapshot.StreamErrors.ToString("N0");
+        StreamErrorText.Text = (snapshot.InputOverruns + snapshot.OutputDroppedSamples).ToString("N0");
         UpdateGameGuard(snapshot);
         if (snapshot.ProcessingUs > 0)
         {
@@ -1711,9 +1711,10 @@ public partial class MainWindow : Window
     private void UpdateGameGuard(EngineSnapshot snapshot)
     {
         if (GameGuardToggle.IsChecked != true || snapshot.State != "Running" || _guardCommandPending) return;
-        var newFault = snapshot.OutputUnderruns > _guardLastUnderruns || snapshot.StreamErrors > _guardLastStreamErrors;
+        var dataFlowErrors = snapshot.InputOverruns + snapshot.OutputDroppedSamples;
+        var newFault = snapshot.OutputUnderruns > _guardLastUnderruns || dataFlowErrors > _guardLastStreamErrors;
         _guardLastUnderruns = snapshot.OutputUnderruns;
-        _guardLastStreamErrors = snapshot.StreamErrors;
+        _guardLastStreamErrors = dataFlowErrors;
         var budgetUs = (ulong)Math.Max(snapshot.ChunkMs, 1) * 1000;
         var overloaded = !snapshot.Passthrough && (snapshot.ProcessingUs >= budgetUs * 85 / 100 || newFault);
         var recovered = snapshot.Passthrough ? !newFault : snapshot.ProcessingUs > 0 && snapshot.ProcessingUs <= budgetUs / 2 && !newFault;
@@ -2225,7 +2226,8 @@ public partial class MainWindow : Window
         ulong ProcessingUs,
         int ChunkMs,
         ulong OutputUnderruns,
-        ulong StreamErrors)
+        ulong InputOverruns,
+        ulong OutputDroppedSamples)
     {
         public static EngineSnapshot FromJson(JsonElement root)
         {
@@ -2237,11 +2239,12 @@ public partial class MainWindow : Window
             var processing = root.TryGetProperty("processingUs", out var processingValue) ? processingValue.GetUInt64() : 0;
             var chunkMs = root.TryGetProperty("chunkMs", out var chunkValue) ? chunkValue.GetInt32() : (int)DefaultProcessingBudgetMs;
             var underruns = root.TryGetProperty("outputUnderruns", out var underrunValue) ? underrunValue.GetUInt64() : 0;
-            var streamErrors = root.TryGetProperty("streamErrors", out var errorValue) ? errorValue.GetUInt64() : 0;
+            var overruns = root.TryGetProperty("inputOverruns", out var overrunValue) ? overrunValue.GetUInt64() : 0;
+            var dropped = root.TryGetProperty("outputDroppedSamples", out var droppedValue) ? droppedValue.GetUInt64() : 0;
             var passthrough = eventName == "audioStarted"
                 || (root.TryGetProperty("passthrough", out var passthroughValue) && passthroughValue.GetBoolean())
                 || (root.TryGetProperty("mode", out var modeValue) && modeValue.GetString() == "safeBypass");
-            return new(state, message, passthrough, sampleRate, processing, chunkMs, underruns, streamErrors);
+            return new(state, message, passthrough, sampleRate, processing, chunkMs, underruns, overruns, dropped);
         }
     }
 }
