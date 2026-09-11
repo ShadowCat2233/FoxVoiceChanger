@@ -25,6 +25,7 @@
 - Windows ML bootstrapper 与再分发许可证经过固定 NuGet SHA-256 后进入发布包和单文件内嵌运行时；NVIDIA RTX 30 系及以上可通过系统 EP 目录按需安装 TensorRT RTX，并以当前三模型真实推理通过后启用；
 - RVC 进程异常退出后刷新设备并自动回退到默认设备安全旁路；
 - 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
+- 生成无需管理员权限的单文件 `FoxVoiceSetup.exe`：内嵌并逐文件校验发布负载，支持当前用户安装、修复、升级、上一版回滚和保留用户模型的卸载；
 - 模型训练页可按需安装固定版本的官方 RVC 训练源代码、Python 3.12、FFmpeg、隔离 venv、CPU/CUDA PyTorch 和训练基础权重；安装可取消，检测到游戏时自动停止并允许稍后续装。
 - 训练环境就绪后可由 FoxVoice 启动/停止本机官方训练工作台；生成的 `.pth` 与 `.index` 可批量经过 FoxVoice 哈希、去重和格式门禁导入模型库。
 
@@ -47,7 +48,7 @@
 ```
 
 成品位于 `artifacts\FoxVoice-win-x64`，运行 `FoxVoice.exe`。发布脚本同时生成可直接分享的
-`FoxVoice-win-x64.zip` 和对应 `.sha256` 文件。
+`FoxVoice-win-x64.zip`、当前用户安装器 `FoxVoiceSetup.exe` 和各自的 `.sha256` 文件。
 
 ## 目录
 
@@ -56,6 +57,7 @@
 - `app/`：交互式产品工作台原型；
 - `docs/`：架构、实施状态和上游集成边界；
 - `scripts/`：依赖引导与发布构建。
+- `setup/`：当前用户安装、修复、升级、回滚和卸载工具；
 
 实时推理需要用户合法取得的 RVC Generator、ContentVec 和 RMVPE 模型。外部权重不随 MIT
 源码自动授权，模型来源、许可证与哈希必须分别记录。

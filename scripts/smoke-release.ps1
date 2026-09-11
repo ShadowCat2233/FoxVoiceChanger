@@ -9,9 +9,42 @@ $supervisor = Join-Path $releaseDirectory 'foxvoice-supervisor.exe'
 $engine = Join-Path $releaseDirectory 'foxvoice-engine.exe'
 $converter = Join-Path $releaseDirectory 'foxvoice-converter.exe'
 $bootstrap = Join-Path $releaseDirectory 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
+$setup = Join-Path $projectRoot 'artifacts\FoxVoiceSetup.exe'
 
-foreach ($path in @($desktop, $supervisor, $engine, $converter, $bootstrap)) {
+foreach ($path in @($desktop, $supervisor, $engine, $converter, $bootstrap, $setup)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing release file: $path" }
+}
+
+& $setup verify --yes
+if ($LASTEXITCODE -ne 0) { throw 'Installer embedded payload verification failed.' }
+
+$tempRootForSetup = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$installerTestRoot = Join-Path $tempRootForSetup "FoxVoiceSetupSmoke-$([guid]::NewGuid().ToString('N'))"
+$installerTestFullPath = [IO.Path]::GetFullPath($installerTestRoot)
+if (-not $installerTestFullPath.StartsWith($tempRootForSetup, [StringComparison]::OrdinalIgnoreCase) -or
+    -not ([IO.Path]::GetFileName($installerTestFullPath)).StartsWith('FoxVoiceSetupSmoke-', [StringComparison]::Ordinal)) {
+    throw "Unsafe installer smoke directory: $installerTestFullPath"
+}
+try {
+    $env:FOXVOICE_SETUP_TEST_ROOT = $installerTestFullPath
+    & $setup install --yes
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $installerTestFullPath 'Programs\FoxVoice\current\FoxVoice.exe'))) {
+        throw 'Isolated installer did not install FoxVoice.'
+    }
+    & $setup repair --yes
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $installerTestFullPath 'Programs\FoxVoice\rollback\FoxVoice.exe'))) {
+        throw 'Isolated installer did not preserve a rollback version during repair.'
+    }
+    & $setup rollback --yes
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated installer rollback failed.' }
+    & $setup uninstall --yes
+    if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath (Join-Path $installerTestFullPath 'Programs\FoxVoice\current'))) {
+        throw 'Isolated installer uninstall failed.'
+    }
+}
+finally {
+    Remove-Item Env:FOXVOICE_SETUP_TEST_ROOT -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $installerTestFullPath) { Remove-Item -LiteralPath $installerTestFullPath -Recurse -Force }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $releaseDirectory 'THIRD_PARTY_NOTICES.md'))) {
     throw 'Missing third-party notices.'

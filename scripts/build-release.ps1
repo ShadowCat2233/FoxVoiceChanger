@@ -69,6 +69,8 @@ $outputDirectory = Join-Path $artifactsDirectory 'FoxVoice-win-x64'
 $stagingDirectory = Join-Path $artifactsDirectory ".FoxVoice-win-x64-staging-$PID"
 $archivePath = Join-Path $artifactsDirectory 'FoxVoice-win-x64.zip'
 $archiveStagingPath = Join-Path $artifactsDirectory ".FoxVoice-win-x64-$PID.zip"
+$setupPath = Join-Path $artifactsDirectory 'FoxVoiceSetup.exe'
+$setupStagingDirectory = Join-Path $artifactsDirectory ".FoxVoice-setup-staging-$PID"
 $artifactsRoot = [IO.Path]::GetFullPath($artifactsDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 
 function Assert-ArtifactChild([string]$Path) {
@@ -82,6 +84,8 @@ Assert-ArtifactChild $outputDirectory
 Assert-ArtifactChild $stagingDirectory
 Assert-ArtifactChild $archivePath
 Assert-ArtifactChild $archiveStagingPath
+Assert-ArtifactChild $setupPath
+Assert-ArtifactChild $setupStagingDirectory
 New-Item -ItemType Directory -Path $stagingDirectory | Out-Null
 & dotnet publish (Join-Path $projectRoot 'desktop\FoxVoice.Desktop\FoxVoice.Desktop.csproj') `
     --configuration $Configuration --runtime win-x64 --self-contained true `
@@ -152,5 +156,34 @@ if ($archiveBackupPath -and (Test-Path -LiteralPath $archiveBackupPath)) {
 
 $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash
 Set-Content -Encoding ascii -LiteralPath "$archivePath.sha256" -Value "$archiveHash  FoxVoice-win-x64.zip"
+
+New-Item -ItemType Directory -Path $setupStagingDirectory | Out-Null
+& dotnet publish (Join-Path $projectRoot 'setup\FoxVoice.Setup\FoxVoice.Setup.csproj') `
+    --configuration $Configuration --runtime win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+    -p:PayloadPath="$archivePath" --output $setupStagingDirectory
+if ($LASTEXITCODE -ne 0) { throw 'FoxVoice installer build failed.' }
+$builtSetup = Join-Path $setupStagingDirectory 'FoxVoiceSetup.exe'
+if (-not (Test-Path -LiteralPath $builtSetup)) { throw 'FoxVoice installer output is missing.' }
+$setupBackupPath = $null
+try {
+    if (Test-Path -LiteralPath $setupPath) {
+        $setupBackupPath = Join-Path $artifactsDirectory ".FoxVoiceSetup-backup-$PID.exe"
+        Assert-ArtifactChild $setupBackupPath
+        Move-Item -LiteralPath $setupPath -Destination $setupBackupPath
+    }
+    Move-Item -LiteralPath $builtSetup -Destination $setupPath
+}
+catch {
+    if ($setupBackupPath -and (Test-Path -LiteralPath $setupBackupPath) -and -not (Test-Path -LiteralPath $setupPath)) {
+        Move-Item -LiteralPath $setupBackupPath -Destination $setupPath
+    }
+    throw
+}
+if ($setupBackupPath -and (Test-Path -LiteralPath $setupBackupPath)) { Remove-Item -LiteralPath $setupBackupPath -Force }
+Remove-Item -LiteralPath $setupStagingDirectory -Recurse -Force
+$setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setupPath).Hash
+Set-Content -Encoding ascii -LiteralPath "$setupPath.sha256" -Value "$setupHash  FoxVoiceSetup.exe"
 Write-Host "FoxVoice release is ready: $outputDirectory"
 Write-Host "Portable archive: $archivePath"
+Write-Host "Per-user installer: $setupPath"

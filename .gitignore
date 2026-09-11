@@ -47,4 +47,6 @@ next-env.d.ts
 /build/convert-test-*/
 desktop/**/bin/
 desktop/**/obj/
+setup/**/bin/
+setup/**/obj/
 artifacts/
