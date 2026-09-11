@@ -11,7 +11,9 @@ windowsml = ["vc-app/windowsml", "vc-core/windowsml"]
 
 [dependencies]
 anyhow.workspace = true
+claxon = "0.4.3"
 cpal.workspace = true
+flacenc = { version = "0.5.1", default-features = false }
 hound = "3.5.1"
 serde.workspace = true
 serde_json.workspace = true

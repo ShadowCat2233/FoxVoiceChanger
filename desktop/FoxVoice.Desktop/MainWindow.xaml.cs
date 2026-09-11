@@ -911,10 +911,10 @@ public partial class MainWindow : Window
         if (sender is Button { Tag: string path }) PlaySound(path);
     }
 
-    private void PlaySound(string path)
+    private void PlaySound(string path, long? startMs = null, long? endMs = null, bool allowLoop = true)
     {
         if (_enginePath is null || !File.Exists(path)) return;
-        var looping = _settings.SoundboardLoopFiles.Contains(path, StringComparer.OrdinalIgnoreCase);
+        var looping = allowLoop && _settings.SoundboardLoopFiles.Contains(path, StringComparer.OrdinalIgnoreCase);
         if (looping && _loopingSoundProcesses.ContainsKey(path))
         {
             StopLoopingSound(path);
@@ -923,6 +923,7 @@ public partial class MainWindow : Window
         }
         var arguments = new List<string> { "play-audio", "--file", path, "--gain-db", _soundboardGain.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) };
         if (looping) arguments.Add("--loop");
+        if (startMs.HasValue && endMs.HasValue) arguments.AddRange(["--start-ms", startMs.Value.ToString(), "--end-ms", endMs.Value.ToString()]);
         if (OutputDeviceCombo.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
         var process = new Process { StartInfo = CreateStartInfo(_enginePath, arguments, redirectInput: false), EnableRaisingEvents = true };
         process.OutputDataReceived += (_, _) => { };
@@ -1160,7 +1161,7 @@ public partial class MainWindow : Window
         if (importButton?.Parent is not StackPanel actions) return;
         var recycleButton = new Button { Content = "移入回收区", Margin = new Thickness(0, 0, 8, 0) };
         recycleButton.Click += RecycleModel_Click;
-        var offlineButton = new Button { Content = "转换 WAV", Margin = new Thickness(0, 0, 8, 0) };
+        var offlineButton = new Button { Content = "离线编辑", Margin = new Thickness(0, 0, 8, 0) };
         offlineButton.Click += ConvertWav_Click;
         var insertAt = Math.Max(0, actions.Children.IndexOf(importButton));
         actions.Children.Insert(insertAt, offlineButton);
@@ -1229,26 +1230,35 @@ public partial class MainWindow : Window
             FooterStatus.Text = "离线转换需要先选择可用 Generator，并安装 ContentVec 与 RMVPE";
             return;
         }
-        var inputDialog = new OpenFileDialog { Title = "选择待转换 WAV", Filter = "WAV 音频 (*.wav)|*.wav" };
-        if (inputDialog.ShowDialog(this) != true) return;
-        var outputDialog = new SaveFileDialog
-        {
-            Title = "保存变声 WAV", Filter = "WAV 音频 (*.wav)|*.wav", AddExtension = true,
-            FileName = Path.GetFileNameWithoutExtension(inputDialog.FileName) + "-foxvoice.wav"
-        };
-        if (outputDialog.ShowDialog(this) != true) return;
         try
         {
-            FooterStatus.Text = "正在离线转换 WAV；实时语音保持停用…";
+            var inputDialog = new OpenFileDialog { Title = "选择待转换音频", Filter = "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg" };
+            if (inputDialog.ShowDialog(this) != true) return;
+            using var waveform = JsonDocument.Parse(await RunEngineCommandAsync("waveform", "--file", inputDialog.FileName, "--points", "180"));
+            var durationMs = waveform.RootElement.GetProperty("durationMs").GetDouble();
+            var peaks = waveform.RootElement.GetProperty("peaks").EnumerateArray().Select(value => value.GetDouble()).ToList();
+            var trim = new OfflineTrimDialog(this, inputDialog.FileName, durationMs, peaks,
+                (start, end) => PlaySound(inputDialog.FileName, start, end, allowLoop: false));
+            if (trim.ShowDialog() != true) return;
+            var outputDialog = new SaveFileDialog
+            {
+                Title = "保存变声音频", Filter = "WAV 音频 (*.wav)|*.wav|FLAC 无损音频 (*.flac)|*.flac", AddExtension = true,
+                DefaultExt = ".wav", FileName = Path.GetFileNameWithoutExtension(inputDialog.FileName) + "-foxvoice"
+            };
+            if (outputDialog.ShowDialog(this) != true) return;
+            FooterStatus.Text = "正在离线转换所选音频区间；实时语音保持停用…";
             using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
             var modelPath = resolved.RootElement.GetProperty("path").GetString()
                 ?? throw new InvalidOperationException("模型路径解析失败");
             using var result = JsonDocument.Parse(await RunEngineCommandAsync(
-                "convert-wav", "--input", inputDialog.FileName, "--output", outputDialog.FileName,
+                "convert-audio", "--input", inputDialog.FileName, "--output", outputDialog.FileName,
                 "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text,
-                "--pitch", PitchSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                "--pitch", PitchSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "--start-ms", trim.StartMs.ToString(), "--end-ms", trim.EndMs.ToString()));
             var elapsed = result.RootElement.GetProperty("elapsedMs").GetDouble();
             FooterStatus.Text = $"离线转换完成：{Path.GetFileName(outputDialog.FileName)}（{elapsed / 1000:N1} 秒）";
+            if (MessageBox.Show(this, "转换完成。是否立即试听结果？", "离线转换", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
+                PlaySound(outputDialog.FileName, allowLoop: false);
             Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{outputDialog.FileName}\"") { UseShellExecute = true });
         }
         catch (Exception error) { FooterStatus.Text = $"离线转换失败：{FriendlyError(error)}"; }

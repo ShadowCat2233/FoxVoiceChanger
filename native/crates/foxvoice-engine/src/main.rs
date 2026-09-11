@@ -38,11 +38,12 @@ fn run() -> Result<()> {
         "rvc" => run_engine(false),
         "validate-rvc" => validate_rvc(),
         "provider-status" => provider_status(),
-        "convert-wav" => convert_wav(),
+        "convert-audio" | "convert-wav" => convert_audio(),
         "play-audio" | "play-wav" => play_audio(),
         "inspect-audio" => inspect_audio(),
+        "waveform" => waveform(),
         _ => bail!(
-            "可用命令: devices, passthrough, rvc, validate-rvc, provider-status, convert-wav, play-audio, inspect-audio"
+            "可用命令: devices, passthrough, rvc, validate-rvc, provider-status, convert-audio, play-audio, inspect-audio, waveform"
         ),
     }
 }
@@ -64,18 +65,43 @@ fn inspect_audio() -> Result<()> {
     Ok(())
 }
 
-fn convert_wav() -> Result<()> {
+fn waveform() -> Result<()> {
+    let arguments: Vec<String> = env::args().collect();
+    let path = required_path(&arguments, "--file")?;
+    let points = option_value(&arguments, "--points")
+        .map(str::parse)
+        .transpose()
+        .context("--points 必须是整数")?
+        .unwrap_or(160_usize);
+    anyhow::ensure!((32..=1024).contains(&points), "--points 必须为 32-1024");
+    let (samples, sample_rate) = read_audio_mono(&path)?;
+    let peaks = waveform_peaks(&samples, points);
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "sampleRate": sample_rate,
+            "samples": samples.len(),
+            "durationMs": samples.len() as f64 * 1000.0 / sample_rate as f64,
+            "peaks": peaks
+        })
+    );
+    Ok(())
+}
+
+fn convert_audio() -> Result<()> {
     let arguments: Vec<String> = env::args().collect();
     let input = required_path(&arguments, "--input")?;
     let output =
         PathBuf::from(option_value(&arguments, "--output").context("缺少参数 --output <path>")?);
     anyhow::ensure!(input != output, "输出文件不能覆盖输入文件");
+    let output_extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
     anyhow::ensure!(
-        output
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("wav")),
-        "离线转换输出必须是 .wav 文件"
+        matches!(output_extension.as_deref(), Some("wav" | "flac")),
+        "离线转换输出必须是 .wav 或 .flac 文件"
     );
     if let Some(parent) = output.parent() {
         anyhow::ensure!(parent.is_dir(), "输出目录不存在: {}", parent.display());
@@ -93,8 +119,9 @@ fn convert_wav() -> Result<()> {
         (-24.0..=24.0).contains(&pitch_shift),
         "--pitch 必须在 -24 到 +24 半音之间"
     );
-    let (source, source_rate) = read_wav_mono(&input)?;
-    anyhow::ensure!(!source.is_empty(), "输入 WAV 没有音频采样");
+    let (source, source_rate) = read_audio_mono(&input)?;
+    let source = trim_audio(&source, source_rate, trim_range(&arguments)?)?;
+    anyhow::ensure!(!source.is_empty(), "裁剪区间没有音频采样");
     let worker = thread::Builder::new()
         .name("foxvoice-offline-convert".into())
         .stack_size(64 * 1024 * 1024)
@@ -177,26 +204,60 @@ fn convert_wav_inner(
             );
         }
     }
-    let temporary = output.with_extension("wav.partial");
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: output_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(&temporary, spec).context("无法创建离线输出 WAV")?;
-    for sample in &converted {
-        writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
-    }
-    writer.finalize()?;
-    if output.exists() {
-        std::fs::remove_file(&output).context("无法替换现有输出文件")?;
-    }
-    std::fs::rename(&temporary, &output).context("无法提交离线输出文件")?;
+    write_offline_audio(&output, output_rate, &converted)?;
     Ok(json!({
         "ok": true, "output": output, "sampleRate": output_rate,
         "samples": converted.len(), "elapsedMs": started.elapsed().as_secs_f64() * 1000.0
     }))
+}
+
+fn write_offline_audio(output: &std::path::Path, sample_rate: u32, samples: &[f32]) -> Result<()> {
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let temporary = output.with_file_name(format!(
+        "{}.partial",
+        output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("输出文件名无效")?
+    ));
+    if extension == "flac" {
+        use flacenc::{component::BitRepr, error::Verify};
+        let pcm: Vec<i32> = samples
+            .iter()
+            .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i32)
+            .collect();
+        let config = flacenc::config::Encoder::default()
+            .into_verified()
+            .map_err(|(_, error)| anyhow::anyhow!("FLAC 编码配置无效: {error:?}"))?;
+        let source = flacenc::source::MemSource::from_samples(&pcm, 1, 16, sample_rate as usize);
+        let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+            .map_err(|error| anyhow::anyhow!("FLAC 编码失败: {error:?}"))?;
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        stream.write(&mut sink).context("FLAC 序列化失败")?;
+        std::fs::write(&temporary, sink.as_slice()).context("无法写入临时 FLAC")?;
+    } else {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer =
+            hound::WavWriter::create(&temporary, spec).context("无法创建离线输出 WAV")?;
+        for sample in samples {
+            writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        }
+        writer.finalize()?;
+    }
+    if output.exists() {
+        std::fs::remove_file(output).context("无法替换现有输出文件")?;
+    }
+    std::fs::rename(&temporary, output).context("无法提交离线输出文件")?;
+    Ok(())
 }
 
 fn play_audio() -> Result<()> {
@@ -213,11 +274,13 @@ fn play_audio() -> Result<()> {
         .context("--gain-db 必须是数字")?
         .unwrap_or(0.0_f32);
     let looping = arguments.iter().any(|argument| argument == "--loop");
+    let range = trim_range(&arguments)?;
     anyhow::ensure!(
         (-36.0..=12.0).contains(&gain_db),
         "--gain-db 必须在 -36 到 +12 dB 之间"
     );
     let (source, source_rate) = read_audio_mono(&path)?;
+    let source = trim_audio(&source, source_rate, range)?;
     anyhow::ensure!(!source.is_empty(), "音效文件没有音频采样");
     let host = cpal::default_host();
     let requested = option_value(&arguments, "--output");
@@ -293,6 +356,13 @@ fn read_audio_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
         .is_some_and(|value| value.eq_ignore_ascii_case("wav"))
     {
         return read_wav_mono(path);
+    }
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("flac"))
+    {
+        return read_flac_mono(path);
     }
     use symphonia::core::{
         audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
@@ -371,6 +441,27 @@ fn read_audio_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, sample_rate))
 }
 
+fn read_flac_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    let mut reader = claxon::FlacReader::open(path).context("无法读取 FLAC 文件")?;
+    let info = reader.streaminfo();
+    let channels = info.channels as usize;
+    anyhow::ensure!(channels > 0 && info.sample_rate > 0, "FLAC 音频格式无效");
+    anyhow::ensure!((1..=32).contains(&info.bits_per_sample), "FLAC 位深无效");
+    let scale = ((1_i64 << (info.bits_per_sample - 1)) - 1) as f32;
+    let interleaved: Vec<i32> = reader.samples().collect::<Result<_, _>>()?;
+    let mono = interleaved
+        .chunks(channels)
+        .map(|frame| {
+            frame
+                .iter()
+                .map(|sample| *sample as f32 / scale)
+                .sum::<f32>()
+                / frame.len() as f32
+        })
+        .collect();
+    Ok((mono, info.sample_rate))
+}
+
 fn apply_soundboard_dsp(samples: &mut [f32], gain: f32, sample_rate: u32) {
     let fade_samples = ((sample_rate as usize * 5) / 1000).min(samples.len() / 2);
     let length = samples.len();
@@ -431,6 +522,50 @@ fn sound_sample(samples: &[f32], index: usize, looping: bool) -> f32 {
     } else {
         samples.get(index).copied().unwrap_or(0.0)
     }
+}
+
+fn trim_range(arguments: &[String]) -> Result<Option<(u64, u64)>> {
+    let start = option_value(arguments, "--start-ms")
+        .map(str::parse)
+        .transpose()
+        .context("--start-ms 必须是非负整数")?;
+    let end = option_value(arguments, "--end-ms")
+        .map(str::parse)
+        .transpose()
+        .context("--end-ms 必须是非负整数")?;
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start < end => Ok(Some((start, end))),
+        _ => bail!("裁剪必须同时提供 --start-ms/--end-ms，且开始时间小于结束时间"),
+    }
+}
+
+fn trim_audio(samples: &[f32], sample_rate: u32, range: Option<(u64, u64)>) -> Result<Vec<f32>> {
+    let Some((start_ms, end_ms)) = range else {
+        return Ok(samples.to_vec());
+    };
+    let start = (start_ms.saturating_mul(sample_rate as u64) / 1000) as usize;
+    let end = (end_ms.saturating_mul(sample_rate as u64) / 1000) as usize;
+    anyhow::ensure!(start < samples.len(), "裁剪开始时间超出音频长度");
+    anyhow::ensure!(end <= samples.len(), "裁剪结束时间超出音频长度");
+    Ok(samples[start..end].to_vec())
+}
+
+fn waveform_peaks(samples: &[f32], points: usize) -> Vec<f32> {
+    if samples.is_empty() || points == 0 {
+        return vec![];
+    }
+    (0..points)
+        .map(|point| {
+            let start = point * samples.len() / points;
+            let end = ((point + 1) * samples.len() / points)
+                .max(start + 1)
+                .min(samples.len());
+            samples[start..end]
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+        })
+        .collect()
 }
 
 fn read_wav_mono(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
@@ -863,5 +998,38 @@ mod tests {
         assert_eq!(sound_sample(&samples, 3, true), 0.5);
         assert_eq!(sound_sample(&samples, 2, false), 0.0);
         assert_eq!(sound_sample(&[], 10, true), 0.0);
+    }
+
+    #[test]
+    fn trim_and_waveform_preserve_requested_interval() {
+        let samples: Vec<f32> = (0..1_000).map(|value| value as f32 / 1_000.0).collect();
+        let trimmed = trim_audio(&samples, 1_000, Some((100, 400))).unwrap();
+        assert_eq!(trimmed.len(), 300);
+        assert_eq!(trimmed[0], 0.1);
+        assert!(trim_audio(&samples, 1_000, Some((900, 1_100))).is_err());
+        let peaks = waveform_peaks(&[0.1, -0.8, 0.2, -0.4], 2);
+        assert_eq!(peaks, vec![0.8, 0.4]);
+    }
+
+    #[test]
+    fn flac_output_round_trips_through_supported_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("result.flac");
+        let samples: Vec<f32> = (0..48_000)
+            .map(|index| ((index as f32 / 48_000.0) * std::f32::consts::TAU * 440.0).sin() * 0.5)
+            .collect();
+        write_offline_audio(&output, 48_000, &samples).unwrap();
+        let encoded = std::fs::read(&output).unwrap();
+        assert!(
+            encoded.len() > 100,
+            "encoded FLAC was only {} bytes",
+            encoded.len()
+        );
+        assert_eq!(&encoded[..4], b"fLaC");
+        let (decoded, sample_rate) = read_audio_mono(&output).unwrap();
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(decoded.len(), samples.len());
+        assert!(decoded.iter().any(|sample| sample.abs() > 0.4));
+        assert!(!output.with_file_name("result.flac.partial").exists());
     }
 }
