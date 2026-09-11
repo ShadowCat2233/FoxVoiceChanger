@@ -129,6 +129,7 @@ public partial class MainWindow : Window
 
     private void GameDetectionTimer_Tick(object? sender, EventArgs e)
     {
+        if (UiText.IsEnglish(_settings.Language)) ApplyLocalization();
         var candidate = GameGuardToggle.IsChecked == true ? DetectForegroundGame() : null;
         if (candidate is not null)
         {

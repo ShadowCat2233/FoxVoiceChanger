@@ -80,6 +80,35 @@ internal static class UiText
         ["引擎连接失败"] = "Engine connection failed", ["资源保护已启用，等待游戏或实时引擎"] = "Resource protection enabled; waiting for a game or the real-time engine",
         ["稳定档 · 保持当前链路"] = "Stable · current pipeline retained", ["保生存档 · 无缝原声旁路"] = "Survival · seamless original-voice bypass",
         ["保护旁路 · 等待恢复"] = "Protective bypass · waiting to recover", ["本机组件、设备与模型库已就绪"] = "Local components, devices, and model library are ready",
+        ["不可用"] = "Unavailable", ["不受支持"] = "Unsupported", ["仅保存"] = "Stored only", ["可使用"] = "Ready",
+        ["需要转换"] = "Conversion required", ["需要准备"] = "Setup required", ["需要处理"] = "Action required",
+        ["未检测到"] = "Not detected", ["已检测到"] = "Detected", ["已安装"] = "Installed", ["未启用"] = "Disabled",
+        ["未知"] = "Unknown", ["未知仓库"] = "Unknown repository", ["未命名"] = "Unnamed", ["CPU 安全模式"] = "CPU safe mode",
+        ["模型库已刷新"] = "Model library refreshed", ["模型导入完成"] = "Model import completed", ["模型资料已保存"] = "Model metadata saved",
+        ["模型已安全移入回收区"] = "Model moved safely to the recycle area", ["设备选择已保存"] = "Device selection saved",
+        ["设备选择已保存，将在下次启动引擎时生效"] = "Device selection saved; it will apply the next time the engine starts",
+        ["实时引擎已停止"] = "Real-time engine stopped", ["转换完成，流式 ONNX 模型已通过结构校验并选中"] = "Conversion completed; the streaming ONNX model passed structural validation and is selected",
+        ["正在读取 Hugging Face 仓库文件…"] = "Reading Hugging Face repository files…", ["正在从 Hugging Face 下载并校验…"] = "Downloading and verifying from Hugging Face…",
+        ["正在校验并导入本地模型…"] = "Verifying and importing the local model…", ["正在加载 RVC 模型…"] = "Loading RVC model…",
+        ["正在启动安全旁路…"] = "Starting safe bypass…", ["正在检测本机组件、音频设备与模型库…"] = "Checking local components, audio devices, and model library…",
+        ["正在隔离转换 RVC v2 F0 检查点，请稍候…"] = "Converting the RVC v2 F0 checkpoint in isolation…",
+        ["Hugging Face 模型下载、校验和导入完成"] = "Hugging Face model download, verification, and import completed",
+        ["ContentVec 与 RMVPE 文件和 SHA-256 均已校验"] = "ContentVec and RMVPE files and SHA-256 hashes are verified",
+        ["RVC 基础模型安装完成，来源、大小与 SHA-256 已校验"] = "RVC foundation models installed with source, size, and SHA-256 verified",
+        ["先启动实时变声，再开启本地监听"] = "Start live voice conversion before enabling local monitoring",
+        ["双输出需要虚拟声卡输入端和一个物理监听设备"] = "Dual output requires a virtual cable endpoint and one physical monitor device",
+        ["本地监听已退出；送往游戏的主变声链路不受影响"] = "Local monitoring exited; the main converted-voice path to the game is unaffected",
+        ["请把主输出选择为 VB-CABLE，并选择一个物理监听设备"] = "Select VB-CABLE as the main output and choose a physical monitor device",
+        ["推理引擎已退出，正在切换安全旁路…"] = "The inference engine exited; switching to safe bypass…",
+        ["已切换到安全旁路；请在诊断页查看原始错误"] = "Switched to safe bypass; see Diagnostics for the original error",
+        ["该 Hugging Face 仓库是私有或受限仓库；FoxVoice 当前不接收访问令牌"] = "This Hugging Face repository is private or gated; FoxVoice does not accept access tokens",
+        ["此仓库没有 .onnx、.pth 或 .index 文件"] = "This repository contains no .onnx, .pth, or .index files",
+        ["已取消仓库导入"] = "Repository import cancelled", ["模型下载已暂停；再次下载同一地址会从已保存断点继续"] = "Model download paused; retrying the same address resumes from the saved checkpoint",
+        ["请选择有效的训练数据集目录"] = "Choose a valid training dataset folder", ["实验名称只能包含英文、数字、下划线或连字符"] = "Experiment name may contain only letters, digits, underscores, or hyphens",
+        ["训练轮数必须为 1-1200"] = "Epochs must be between 1 and 1200", ["批大小必须为 1-64"] = "Batch size must be between 1 and 64",
+        ["训练完成；正在导入输出模型"] = "Training completed; importing output models", ["训练已停止；已有检查点未删除"] = "Training stopped; existing checkpoints were preserved",
+        ["训练组件安装已取消；下次安装会复用已下载内容"] = "Training component installation cancelled; downloaded files will be reused next time",
+        ["训练工作台尚未生成 .pth 或 .index 结果"] = "The training workbench has not produced .pth or .index results yet",
         ["FOXVOICE / 实时变声"] = "FOXVOICE / LIVE VOICE", ["FOXVOICE / 模型库"] = "FOXVOICE / MODEL LIBRARY",
         ["FOXVOICE / 音效板"] = "FOXVOICE / SOUNDBOARD", ["FOXVOICE / 模型训练"] = "FOXVOICE / MODEL TRAINING",
         ["FOXVOICE / 组件中心"] = "FOXVOICE / COMPONENT CENTER", ["FOXVOICE / 设置"] = "FOXVOICE / SETTINGS"
@@ -100,6 +129,19 @@ internal static class UiText
         if (EnglishText.TryGetValue(value, out var exact)) return exact;
 
         return value
+            .Replace("安全旁路恢复失败：", "Safe bypass recovery failed: ", StringComparison.Ordinal)
+            .Replace("设备热插拔检测失败：", "Device hot-plug detection failed: ", StringComparison.Ordinal)
+            .Replace("设置保存失败：", "Failed to save settings: ", StringComparison.Ordinal)
+            .Replace("离线转换失败：", "Offline conversion failed: ", StringComparison.Ordinal)
+            .Replace("音效播放失败：", "Sound playback failed: ", StringComparison.Ordinal)
+            .Replace("无法启动本地监听：", "Could not start local monitoring: ", StringComparison.Ordinal)
+            .Replace("RVC 自检失败：", "RVC self-test failed: ", StringComparison.Ordinal)
+            .Replace("TensorRT RTX 未启用：", "TensorRT RTX was not enabled: ", StringComparison.Ordinal)
+            .Replace("已选择模型：", "Selected model: ", StringComparison.Ordinal)
+            .Replace("正在播放音效：", "Playing sound: ", StringComparison.Ordinal)
+            .Replace("已停止循环：", "Stopped loop: ", StringComparison.Ordinal)
+            .Replace("游戏保护：已检测到 ", "Game Guard: detected ", StringComparison.Ordinal)
+            .Replace("双输出已启用：游戏走虚拟声卡，监听走 ", "Dual output enabled: game uses virtual cable; monitoring uses ", StringComparison.Ordinal)
             .Replace("正在检测", "Detecting", StringComparison.Ordinal)
             .Replace("未检测到", "Not detected", StringComparison.Ordinal)
             .Replace("已检测到", "Detected", StringComparison.Ordinal)
