@@ -58,6 +58,28 @@ internal static class UiText
         ["还没有音效。添加 WAV、FLAC、MP3 或 OGG 后，可发送到当前主输出。"] = "No sounds yet. Add WAV, FLAC, MP3, or OGG files to play them through the main output.",
         ["固定官方 RVC 源代码版本；Python 3.12、FFmpeg、PyTorch 和训练权重按需安装到 LocalAppData，不进入实时引擎。"] = "A pinned official RVC source version; Python 3.12, FFmpeg, PyTorch, and training weights install on demand outside the real-time engine.",
         ["数据集目录（本人授权的干净人声 WAV/FLAC）"] = "Dataset folder (authorized clean voice WAV/FLAC)",
+        ["编辑模型资料"] = "Edit Model Metadata", ["模型资料"] = "Model Metadata", ["保存"] = "Save",
+        ["作者（可选）"] = "Author (optional)", ["许可证（可选）"] = "License (optional)",
+        ["标签（英文逗号分隔，最多 20 个）"] = "Tags (comma-separated, up to 20)",
+        ["资料只保存在本机 model.json；许可证应以模型发布者声明为准。"] = "Metadata is stored only in local model.json; the publisher's license declaration remains authoritative.",
+        ["模型名称不能为空。"] = "Model name cannot be empty.", ["离线音频裁剪"] = "Offline Audio Trim",
+        ["选择需要变声的单轨区间"] = "Select the portion of this track to convert", ["开始位置"] = "Start Position",
+        ["结束位置"] = "End Position", ["试听所选原声"] = "Preview Original Selection", ["转换所选区间"] = "Convert Selection",
+        ["安装 RVC 基础模型"] = "Install RVC Foundation Models", ["安装 TensorRT RTX"] = "Install TensorRT RTX",
+        ["安装训练组件"] = "Install Training Components", ["开始一键训练"] = "Start One-click Training",
+        ["移除模型"] = "Remove Model", ["确认模型来源"] = "Confirm Model Source", ["离线转换"] = "Offline Conversion",
+        ["选择待转换音频"] = "Choose Audio to Convert", ["保存变声音频"] = "Save Converted Audio",
+        ["添加音效"] = "Add Sound", ["选择 ContentVec ONNX"] = "Choose ContentVec ONNX", ["选择 RMVPE ONNX"] = "Choose RMVPE ONNX",
+        ["导入 RVC 模型或索引"] = "Import RVC Model or Index", ["选择 Hugging Face 模型文件"] = "Choose Hugging Face Model File",
+        ["选择已获授权的训练音频目录"] = "Choose an Authorized Training Audio Folder",
+        ["训练会长时间占用 CPU/GPU。请确认数据集中的声音均已获得授权，训练期间不要启动游戏。"] = "Training uses CPU/GPU for a long time. Confirm every voice in the dataset is authorized and do not start a game during training.",
+        ["转换完成。是否立即试听结果？"] = "Conversion completed. Preview the result now?",
+        ["安全旁路运行中"] = "Safe bypass running", ["实时变声运行中"] = "Live voice running",
+        ["实时引擎运行中"] = "Real-time engine running", ["音频链路正常"] = "Audio path healthy",
+        ["引擎启动中"] = "Engine starting", ["正在启动…"] = "Starting…", ["DirectML 已就绪"] = "DirectML ready",
+        ["引擎连接失败"] = "Engine connection failed", ["资源保护已启用，等待游戏或实时引擎"] = "Resource protection enabled; waiting for a game or the real-time engine",
+        ["稳定档 · 保持当前链路"] = "Stable · current pipeline retained", ["保生存档 · 无缝原声旁路"] = "Survival · seamless original-voice bypass",
+        ["保护旁路 · 等待恢复"] = "Protective bypass · waiting to recover", ["本机组件、设备与模型库已就绪"] = "Local components, devices, and model library are ready",
         ["FOXVOICE / 实时变声"] = "FOXVOICE / LIVE VOICE", ["FOXVOICE / 模型库"] = "FOXVOICE / MODEL LIBRARY",
         ["FOXVOICE / 音效板"] = "FOXVOICE / SOUNDBOARD", ["FOXVOICE / 模型训练"] = "FOXVOICE / MODEL TRAINING",
         ["FOXVOICE / 组件中心"] = "FOXVOICE / COMPONENT CENTER", ["FOXVOICE / 设置"] = "FOXVOICE / SETTINGS"
@@ -89,6 +111,8 @@ internal static class UiText
             .Replace("没有输入设备", "No input device", StringComparison.Ordinal)
             .Replace("没有输出设备", "No output device", StringComparison.Ordinal);
     }
+
+    public static string Translate(string value) => Translate(value, CurrentLanguage);
 
     public static void Apply(DependencyObject root, string? language)
     {

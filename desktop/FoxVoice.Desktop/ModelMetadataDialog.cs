@@ -13,12 +13,12 @@ internal sealed class ModelMetadataDialog : Window
     public ModelMetadataDialog(Window owner, string name, string? author, string? license, IReadOnlyList<string> tags)
     {
         Owner = owner;
-        Title = "编辑模型资料";
+        Title = UiText.Translate("编辑模型资料");
         Width = 460;
         SizeToContent = SizeToContent.Height;
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        Background = owner.FindResource("WindowBackground") as System.Windows.Media.Brush;
+        Background = owner.FindResource("AppBackground") as System.Windows.Media.Brush;
         Foreground = owner.FindResource("TextPrimary") as System.Windows.Media.Brush;
         _name = new TextBox { Text = name };
         _author = new TextBox { Text = author ?? "" };
@@ -39,7 +39,7 @@ internal sealed class ModelMetadataDialog : Window
         {
             if (string.IsNullOrWhiteSpace(_name.Text))
             {
-                MessageBox.Show(this, "模型名称不能为空。", "模型资料", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(this, UiText.Translate("模型名称不能为空。"), UiText.Translate("模型资料"), MessageBoxButton.OK, MessageBoxImage.Warning);
                 _name.Focus();
                 return;
             }
@@ -48,6 +48,7 @@ internal sealed class ModelMetadataDialog : Window
         actions.Children.Add(save);
         root.Children.Add(actions);
         Content = root;
+        UiText.Apply(root, UiText.CurrentLanguage);
     }
 
     public string ModelName => _name.Text;

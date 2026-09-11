@@ -372,9 +372,10 @@ public partial class MainWindow : Window
                 return;
             }
             var answer = MessageBox.Show(this,
-                "将从 Hugging Face 的 wok000/weights_gpl 仓库下载 ContentVec 与 RMVPE，共约 741 MB。\n\n" +
-                "这些权重采用 GPL-3.0，不属于 FoxVoice 的 MIT 代码，也不会打包进 FoxVoice。继续表示你接受上游许可。",
-                "安装 RVC 基础模型", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+                UiText.IsEnglish(UiText.CurrentLanguage)
+                    ? "Download ContentVec and RMVPE (about 741 MB) from the wok000/weights_gpl repository on Hugging Face.\n\nThese weights use GPL-3.0, are not part of FoxVoice's MIT code, and are not bundled. Continuing means you accept the upstream license."
+                    : "将从 Hugging Face 的 wok000/weights_gpl 仓库下载 ContentVec 与 RMVPE，共约 741 MB。\n\n这些权重采用 GPL-3.0，不属于 FoxVoice 的 MIT 代码，也不会打包进 FoxVoice。继续表示你接受上游许可。",
+                T("安装 RVC 基础模型"), MessageBoxButton.OKCancel, MessageBoxImage.Information);
             if (answer != MessageBoxResult.OK) return;
             _installFoundationButton.IsEnabled = false;
             FooterStatus.Text = "正在下载并校验基础模型（约 741 MB），请勿关闭程序…";
@@ -459,8 +460,10 @@ public partial class MainWindow : Window
             return;
         }
         var answer = MessageBox.Show(this,
-            "Windows ML 将按需获取 NVIDIA TensorRT RTX 执行提供程序。该组件遵循 NVIDIA 软件许可，不随 FoxVoice 打包。\n\n继续后会用当前三模型执行一帧真实推理；只有成功才会设为首选后端。",
-            "安装 TensorRT RTX", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+            UiText.IsEnglish(UiText.CurrentLanguage)
+                ? "Windows ML will acquire the NVIDIA TensorRT RTX execution provider on demand. It follows NVIDIA's license and is not bundled with FoxVoice.\n\nFoxVoice will run real inference with the current three models and select it only after a successful test."
+                : "Windows ML 将按需获取 NVIDIA TensorRT RTX 执行提供程序。该组件遵循 NVIDIA 软件许可，不随 FoxVoice 打包。\n\n继续后会用当前三模型执行一帧真实推理；只有成功才会设为首选后端。",
+            T("安装 TensorRT RTX"), MessageBoxButton.OKCancel, MessageBoxImage.Information);
         if (answer != MessageBoxResult.OK) return;
         try
         {
@@ -596,8 +599,10 @@ public partial class MainWindow : Window
         if (_trainingProcess is { HasExited: false }) return;
         var label = backend == "cuda" ? "NVIDIA CUDA 12.8" : "CPU";
         var answer = MessageBox.Show(this,
-            $"将安装官方 RVC 固定版本及 {label} 训练环境，可能下载数 GB。\n\nRVC 代码采用 MIT；PyTorch、预训练权重和其他依赖遵循各自许可证。继续表示你接受并确认有权训练所用声音素材。",
-            "安装训练组件", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+            UiText.IsEnglish(UiText.CurrentLanguage)
+                ? $"Install a pinned official RVC version and the {label} training environment. This may download several GB.\n\nRVC code is MIT; PyTorch, pretrained weights, and dependencies retain their own licenses. Continuing confirms acceptance and authorization for the training voices."
+                : $"将安装官方 RVC 固定版本及 {label} 训练环境，可能下载数 GB。\n\nRVC 代码采用 MIT；PyTorch、预训练权重和其他依赖遵循各自许可证。继续表示你接受并确认有权训练所用声音素材。",
+            T("安装训练组件"), MessageBoxButton.OKCancel, MessageBoxImage.Information);
         if (answer != MessageBoxResult.OK) return;
         if (_supervisorPath is null) return;
         var process = new Process
@@ -661,7 +666,7 @@ public partial class MainWindow : Window
 
     private void BrowseTrainingDataset()
     {
-        var dialog = new OpenFolderDialog { Title = "选择已获授权的训练音频目录", Multiselect = false };
+        var dialog = new OpenFolderDialog { Title = T("选择已获授权的训练音频目录"), Multiselect = false };
         if (dialog.ShowDialog(this) == true) _trainingDatasetText.Text = dialog.FolderName;
     }
 
@@ -675,7 +680,7 @@ public partial class MainWindow : Window
         if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[A-Za-z0-9_-]{1,64}$")) { FooterStatus.Text = "实验名称只能包含英文、数字、下划线或连字符"; return; }
         if (!ushort.TryParse(_trainingEpochsText.Text, out var epochs) || epochs is < 1 or > 1200) { FooterStatus.Text = "训练轮数必须为 1-1200"; return; }
         if (!byte.TryParse(_trainingBatchText.Text, out var batch) || batch is < 1 or > 64) { FooterStatus.Text = "批大小必须为 1-64"; return; }
-        var answer = MessageBox.Show(this, "训练会长时间占用 CPU/GPU。请确认数据集中的声音均已获得授权，训练期间不要启动游戏。", "开始一键训练", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        var answer = MessageBox.Show(this, T("训练会长时间占用 CPU/GPU。请确认数据集中的声音均已获得授权，训练期间不要启动游戏。"), T("开始一键训练"), MessageBoxButton.OKCancel, MessageBoxImage.Warning);
         if (answer != MessageBoxResult.OK) return;
         var workers = Math.Clamp(Environment.ProcessorCount / 2, 1, 16);
         var process = new Process
@@ -858,7 +863,14 @@ public partial class MainWindow : Window
 
     private void AddSound_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new OpenFileDialog { Title = "添加音效", Filter = "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg|所有文件 (*.*)|*.*", Multiselect = true };
+        var dialog = new OpenFileDialog
+        {
+            Title = T("添加音效"),
+            Filter = UiText.IsEnglish(UiText.CurrentLanguage)
+                ? "Supported audio (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg|All files (*.*)|*.*"
+                : "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg|所有文件 (*.*)|*.*",
+            Multiselect = true
+        };
         if (dialog.ShowDialog(this) != true) return;
         foreach (var path in dialog.FileNames)
         {
@@ -1115,6 +1127,8 @@ public partial class MainWindow : Window
 
     private void ApplyLocalization() => UiText.Apply(this, _settings.Language);
 
+    private static string T(string value) => UiText.Translate(value);
+
     private async void Refresh_Click(object sender, RoutedEventArgs e)
     {
         await RefreshAllAsync();
@@ -1280,8 +1294,10 @@ public partial class MainWindow : Window
             return;
         }
         var answer = MessageBox.Show(this,
-            $"将“{model.DisplayName}”移入 FoxVoice 回收区。文件不会立即永久删除。",
-            "移除模型", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            UiText.IsEnglish(UiText.CurrentLanguage)
+                ? $"Move “{model.DisplayName}” to the FoxVoice recycle area. Files are not permanently deleted immediately."
+                : $"将“{model.DisplayName}”移入 FoxVoice 回收区。文件不会立即永久删除。",
+            T("移除模型"), MessageBoxButton.OKCancel, MessageBoxImage.Warning);
         if (answer != MessageBoxResult.OK) return;
         try
         {
@@ -1308,7 +1324,7 @@ public partial class MainWindow : Window
         }
         try
         {
-            var inputDialog = new OpenFileDialog { Title = "选择待转换音频", Filter = "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg" };
+            var inputDialog = new OpenFileDialog { Title = T("选择待转换音频"), Filter = UiText.IsEnglish(UiText.CurrentLanguage) ? "Supported audio (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg" : "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg" };
             if (inputDialog.ShowDialog(this) != true) return;
             using var waveform = JsonDocument.Parse(await RunEngineCommandAsync("waveform", "--file", inputDialog.FileName, "--points", "180"));
             var durationMs = waveform.RootElement.GetProperty("durationMs").GetDouble();
@@ -1318,7 +1334,7 @@ public partial class MainWindow : Window
             if (trim.ShowDialog() != true) return;
             var outputDialog = new SaveFileDialog
             {
-                Title = "保存变声音频", Filter = "WAV 音频 (*.wav)|*.wav|FLAC 无损音频 (*.flac)|*.flac", AddExtension = true,
+                Title = T("保存变声音频"), Filter = UiText.IsEnglish(UiText.CurrentLanguage) ? "WAV audio (*.wav)|*.wav|FLAC lossless audio (*.flac)|*.flac" : "WAV 音频 (*.wav)|*.wav|FLAC 无损音频 (*.flac)|*.flac", AddExtension = true,
                 DefaultExt = ".wav", FileName = Path.GetFileNameWithoutExtension(inputDialog.FileName) + "-foxvoice"
             };
             if (outputDialog.ShowDialog(this) != true) return;
@@ -1333,7 +1349,7 @@ public partial class MainWindow : Window
                 "--start-ms", trim.StartMs.ToString(), "--end-ms", trim.EndMs.ToString()));
             var elapsed = result.RootElement.GetProperty("elapsedMs").GetDouble();
             FooterStatus.Text = $"离线转换完成：{Path.GetFileName(outputDialog.FileName)}（{elapsed / 1000:N1} 秒）";
-            if (MessageBox.Show(this, "转换完成。是否立即试听结果？", "离线转换", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
+            if (MessageBox.Show(this, T("转换完成。是否立即试听结果？"), T("离线转换"), MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
                 PlaySound(outputDialog.FileName, allowLoop: false);
             Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{outputDialog.FileName}\"") { UseShellExecute = true });
         }
@@ -1345,7 +1361,7 @@ public partial class MainWindow : Window
         if (RejectHeavyWorkDuringGame("模型导入与转换")) return;
         var dialog = new OpenFileDialog
         {
-            Title = "导入 RVC 模型或索引",
+            Title = T("导入 RVC 模型或索引"),
             Filter = "RVC 文件 (*.onnx;*.pth;*.index)|*.onnx;*.pth;*.index",
             Multiselect = false
         };
@@ -1375,7 +1391,7 @@ public partial class MainWindow : Window
                 }
                 var answer = MessageBox.Show(this,
                     $"来源：{info.Repository}\n分支：{info.Revision}\n许可证：{info.License ?? "未声明"}\n\n请确认你有权下载和使用此模型。",
-                    "确认模型来源", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+                    T("确认模型来源"), MessageBoxButton.OKCancel, MessageBoxImage.Information);
                 if (answer != MessageBoxResult.OK) return;
             }
             catch (Exception error) { FooterStatus.Text = FriendlyError(error); return; }
@@ -1414,7 +1430,7 @@ public partial class MainWindow : Window
         list.SelectedIndex = 0;
         var dialog = new Window
         {
-            Owner = this, Title = "选择 Hugging Face 模型文件", Width = 680, Height = 460,
+            Owner = this, Title = T("选择 Hugging Face 模型文件"), Width = 680, Height = 460,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = (Brush)FindResource("AppBackground"),
             Foreground = (Brush)FindResource("TextPrimary"), ResizeMode = ResizeMode.CanResizeWithGrip
         };
@@ -1673,6 +1689,7 @@ public partial class MainWindow : Window
             BudgetText.Text = $"-- / {DefaultProcessingBudgetMs:0} ms";
             BudgetProgress.Value = 0;
         }
+        ApplyLocalization();
     }
 
     private async void LiveControl_Changed(object sender, RoutedEventArgs e)
@@ -1729,6 +1746,7 @@ public partial class MainWindow : Window
             _ = SendGuardProfileAsync("normal");
         }
         TrySaveSettings();
+        ApplyLocalization();
     }
 
     private void ResetGameGuardState()
@@ -1997,12 +2015,12 @@ public partial class MainWindow : Window
         OutputRouteText.Text = (OutputDeviceCombo.SelectedItem as AudioDevice)?.Name ?? "没有输出设备";
     }
 
-    private void BrowseEmbedder_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(EmbedderPath, "选择 ContentVec ONNX");
-    private void BrowseF0_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(F0Path, "选择 RMVPE ONNX");
+    private void BrowseEmbedder_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(EmbedderPath, T("选择 ContentVec ONNX"));
+    private void BrowseF0_Click(object sender, RoutedEventArgs e) => BrowseOnnxInto(F0Path, T("选择 RMVPE ONNX"));
 
     private void BrowseOnnxInto(TextBox target, string title)
     {
-        var dialog = new OpenFileDialog { Title = title, Filter = "ONNX 模型 (*.onnx)|*.onnx" };
+        var dialog = new OpenFileDialog { Title = title, Filter = UiText.IsEnglish(UiText.CurrentLanguage) ? "ONNX model (*.onnx)|*.onnx" : "ONNX 模型 (*.onnx)|*.onnx" };
         if (dialog.ShowDialog(this) != true) return;
         target.Text = dialog.FileName;
         TrySaveSettings();

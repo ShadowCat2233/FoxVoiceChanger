@@ -21,7 +21,7 @@ internal sealed class OfflineTrimDialog : Window
     public OfflineTrimDialog(Window owner, string path, double durationMs, IReadOnlyList<double> peaks, Action<long, long> preview)
     {
         Owner = owner;
-        Title = "离线音频裁剪";
+        Title = UiText.Translate("离线音频裁剪");
         Width = 680;
         Height = 430;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -54,6 +54,7 @@ internal sealed class OfflineTrimDialog : Window
         buttons.Children.Add(confirm);
         root.Children.Add(buttons);
         Content = root;
+        UiText.Apply(root, UiText.CurrentLanguage);
 
         _start.ValueChanged += (_, _) => { if (_start.Value >= _end.Value) _start.Value = Math.Max(0, _end.Value - 1); UpdateSelection(); };
         _end.ValueChanged += (_, _) => { if (_end.Value <= _start.Value) _end.Value = Math.Min(_end.Maximum, _start.Value + 1); UpdateSelection(); };
@@ -68,7 +69,8 @@ internal sealed class OfflineTrimDialog : Window
 
     private void UpdateSelection()
     {
-        _selection.Text = $"{StartMs / 1000.0:N2} 秒 — {EndMs / 1000.0:N2} 秒  ·  {(EndMs - StartMs) / 1000.0:N2} 秒";
+        var unit = UiText.IsEnglish(UiText.CurrentLanguage) ? "s" : "秒";
+        _selection.Text = $"{StartMs / 1000.0:N2} {unit} — {EndMs / 1000.0:N2} {unit}  ·  {(EndMs - StartMs) / 1000.0:N2} {unit}";
         _selection.Foreground = Brushes.LightGray;
         _selection.Margin = new Thickness(0, 8, 0, 0);
     }
