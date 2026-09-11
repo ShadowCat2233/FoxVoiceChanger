@@ -1757,15 +1757,15 @@ public partial class MainWindow : Window
             _guardProfile = level;
             GuardStateText.Text = level switch
             {
-                "stable" => "稳定档 · 240 ms",
-                "survival" => "保生存档 · 320 ms",
+                "stable" => "稳定档 · 保持当前链路",
+                "survival" => "保生存档 · 无缝原声旁路",
                 "bypass" => "保护旁路 · 等待恢复",
                 _ => "资源保护已启用"
             };
             FooterStatus.Text = level switch
             {
-                "stable" => "检测到连续超载：已切换稳定档，主链路重新装载中",
-                "survival" => "负载仍高：已扩大实时缓冲并减少上下文",
+                "stable" => "检测到连续超载：保持已加载链路并观察恢复，不重载模型",
+                "survival" => "负载仍高：已无缝切到原声旁路，避免游戏语音中断",
                 "bypass" => "持续无法满足预算：已进入保护旁路，避免游戏语音中断",
                 _ => "负载持续稳定：已恢复标准实时配置"
             };

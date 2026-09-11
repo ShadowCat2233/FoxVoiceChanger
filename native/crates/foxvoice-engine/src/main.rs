@@ -774,7 +774,7 @@ fn run_engine(passthrough: bool) -> Result<()> {
     }
     config.input_device = option_value(&arguments, "--input").map(ToOwned::to_owned);
     config.output_device = option_value(&arguments, "--output").map(ToOwned::to_owned);
-    let mut active_config = config.clone();
+    let active_config = config.clone();
     controller.apply_config(config)?;
     let mut guard_profile = "normal";
 
@@ -807,32 +807,30 @@ fn run_engine(passthrough: bool) -> Result<()> {
                     }
                 }
                 Ok(EngineCommand::Guard { level }) => {
-                    let (chunk_ms, crossfade_ms, sola_search_ms, extra_convert_ms) =
-                        match level.as_str() {
-                            "normal" => (160, 40, 12, 80),
-                            "stable" => (240, 50, 10, 60),
-                            "survival" => (320, 60, 8, 40),
-                            "bypass" => {
-                                controller.set_passthrough(true);
-                                guard_profile = "bypass";
-                                continue;
-                            }
-                            _ => {
-                                eprintln!("忽略未知游戏保护级别: {level}");
-                                continue;
-                            }
-                        };
-                    controller.set_passthrough(passthrough);
-                    active_config.chunk_ms = if monitoring { 60 } else { chunk_ms };
-                    active_config.crossfade_ms = if monitoring { 10 } else { crossfade_ms };
-                    active_config.sola_search_ms = if monitoring { 5 } else { sola_search_ms };
-                    active_config.extra_convert_ms = if monitoring { 20 } else { extra_convert_ms };
-                    controller.apply_config(active_config.clone())?;
-                    guard_profile = match level.as_str() {
-                        "stable" => "stable",
-                        "survival" => "survival",
-                        _ => "normal",
-                    };
+                    // Re-applying timing config tears down the active audio session and reloads
+                    // all three models. Under game load that caused a measured 600+ ms stall and
+                    // hundreds of underruns. Guard transitions must therefore remain lock-free:
+                    // stable keeps the already-loaded RVC route, while survival/bypass atomically
+                    // switch to intelligible dry voice until the UI's recovery hysteresis clears.
+                    match level.as_str() {
+                        "normal" => {
+                            controller.set_passthrough(passthrough);
+                            guard_profile = "normal";
+                        }
+                        "stable" => {
+                            controller.set_passthrough(passthrough);
+                            guard_profile = "stable";
+                        }
+                        "survival" => {
+                            controller.set_passthrough(true);
+                            guard_profile = "survival";
+                        }
+                        "bypass" => {
+                            controller.set_passthrough(true);
+                            guard_profile = "bypass";
+                        }
+                        _ => eprintln!("忽略未知游戏保护级别: {level}"),
+                    }
                 }
                 Err(error) => eprintln!("忽略无效实时参数: {error}"),
             }
@@ -847,7 +845,7 @@ fn run_engine(passthrough: bool) -> Result<()> {
             "{}",
             json!({
                 "event": "engineStatus", "state": format!("{:?}", status.state),
-                "passthrough": passthrough || guard_profile == "bypass",
+                "passthrough": passthrough || matches!(guard_profile, "survival" | "bypass"),
                 "guardProfile": guard_profile, "chunkMs": active_config.chunk_ms,
                 "message": status.message, "detail": status.detail,
                 "inputDevice": status.input_device, "outputDevice": status.output_device,
