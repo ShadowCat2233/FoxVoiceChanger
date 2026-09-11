@@ -10,7 +10,7 @@ use foxvoice_contracts::{
     IPC_PROTOCOL_VERSION, PerformanceSample,
 };
 use foxvoice_ipc::{read_frame, write_frame};
-use foxvoice_models::ModelLibrary;
+use foxvoice_models::{ModelLibrary, ModelMetadataUpdate};
 use foxvoice_supervisor::{
     ComponentManifest, GameGuard, TrainingRequest, detect_hardware, foundation_model_status,
     foundation_root, install_foundation_models, install_training, launch_training_workbench,
@@ -284,6 +284,61 @@ fn run_models_command() -> Result<()> {
                 .context("用法: foxvoice-supervisor models resolve <model-id>")?;
             println!("{}", serde_json::json!({"path": library.model_file(&id)?}));
         }
+        "metadata" => {
+            let mut arguments = env::args().skip(3);
+            let id = arguments.next().context(
+                "用法: foxvoice-supervisor models metadata <model-id> <name> <author> <license> <comma-tags>",
+            )?;
+            let display_name = arguments.next().context("缺少模型名称")?;
+            let author = arguments.next().filter(|value| !value.trim().is_empty());
+            let license = arguments.next().filter(|value| !value.trim().is_empty());
+            let tags = arguments
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .map(ToOwned::to_owned)
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.update_metadata(
+                    &id,
+                    ModelMetadataUpdate {
+                        display_name,
+                        author,
+                        license,
+                        tags
+                    },
+                )?)?
+            );
+        }
+        "used" => {
+            let id = env::args()
+                .nth(3)
+                .context("用法: foxvoice-supervisor models used <model-id>")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.mark_used(&id)?)?
+            );
+        }
+        "tested" => {
+            let id = env::args().nth(3).context(
+                "用法: foxvoice-supervisor models tested <model-id> <passed|failed> <provider>",
+            )?;
+            let status = env::args().nth(4).context("缺少测试状态")?;
+            anyhow::ensure!(
+                matches!(status.as_str(), "passed" | "failed"),
+                "测试状态只能是 passed 或 failed"
+            );
+            let provider = env::args().nth(5).context("缺少推理后端")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&library.record_test(
+                    &id,
+                    status == "passed",
+                    &provider
+                )?)?
+            );
+        }
         "convert" => {
             let id = env::args()
                 .nth(3)
@@ -320,7 +375,7 @@ fn run_models_command() -> Result<()> {
             println!("FOXVOICE_RESULT_JSON={}", serde_json::to_string(&result?)?);
         }
         _ => bail!(
-            "未知模型命令。可用命令: models list, models import, models huggingface, models huggingface-files, models recycle, models resolve, models convert"
+            "未知模型命令。可用命令: models list, models import, models huggingface, models huggingface-files, models huggingface-info, models metadata, models used, models tested, models recycle, models resolve, models convert"
         ),
     }
     Ok(())

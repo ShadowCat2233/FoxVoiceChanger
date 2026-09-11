@@ -18,6 +18,7 @@ public partial class MainWindow : Window
     private const double DefaultProcessingBudgetMs = 160.0;
     private readonly UserSettings _settings;
     private readonly SemaphoreSlim _engineInputLock = new(1, 1);
+    private readonly SemaphoreSlim _modelActivityLock = new(1, 1);
     private readonly DispatcherTimer _deviceRefreshTimer = new() { Interval = TimeSpan.FromSeconds(10) };
     private readonly DispatcherTimer _gameDetectionTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private Process? _audioProcess;
@@ -457,6 +458,7 @@ public partial class MainWindow : Window
             using var report = JsonDocument.Parse(await RunEngineCommandAsync(
                 "validate-rvc", "--provider", "nvtrtx", "--frames", "20", "--model", modelPath,
                 "--embedder", EmbedderPath.Text, "--f0", F0Path.Text));
+            await RecordModelTestAsync(_selectedModel.Id, true, "nvtrtx");
             _settings.PreferredProvider = "nvtrtx";
             TrySaveSettings();
             await RefreshTensorRtStatusAsync();
@@ -464,6 +466,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
+            if (_selectedModel is not null) await RecordModelTestAsync(_selectedModel.Id, false, "nvtrtx");
             _settings.PreferredProvider = "directml";
             FooterStatus.Text = $"TensorRT RTX 未启用：{FriendlyError(error)}";
         }
@@ -1152,7 +1155,19 @@ public partial class MainWindow : Window
         {
             _settings.SelectedModelId = _selectedModel?.Id ?? "";
             TrySaveSettings();
+            if (_selectedModel is not null) _ = MarkModelUsedAsync(_selectedModel.Id);
         }
+    }
+
+    private async Task MarkModelUsedAsync(string id)
+    {
+        try
+        {
+            await _modelActivityLock.WaitAsync();
+            await RunSupervisorAsync("models", "used", id);
+        }
+        catch { /* 最近使用时间不应阻断音频主流程。 */ }
+        finally { _modelActivityLock.Release(); }
     }
 
     private void AddModelRecycleAction()
@@ -1161,11 +1176,39 @@ public partial class MainWindow : Window
         if (importButton?.Parent is not StackPanel actions) return;
         var recycleButton = new Button { Content = "移入回收区", Margin = new Thickness(0, 0, 8, 0) };
         recycleButton.Click += RecycleModel_Click;
+        var metadataButton = new Button { Content = "编辑资料", Margin = new Thickness(0, 0, 8, 0) };
+        metadataButton.Click += EditModelMetadata_Click;
         var offlineButton = new Button { Content = "离线编辑", Margin = new Thickness(0, 0, 8, 0) };
         offlineButton.Click += ConvertWav_Click;
         var insertAt = Math.Max(0, actions.Children.IndexOf(importButton));
         actions.Children.Insert(insertAt, offlineButton);
-        actions.Children.Insert(insertAt + 1, recycleButton);
+        actions.Children.Insert(insertAt + 1, metadataButton);
+        actions.Children.Insert(insertAt + 2, recycleButton);
+    }
+
+    private async void EditModelMetadata_Click(object sender, RoutedEventArgs e)
+    {
+        if (ModelsList.SelectedItem is not ModelItem model)
+        {
+            FooterStatus.Text = "请先选择要编辑资料的模型";
+            return;
+        }
+        var dialog = new ModelMetadataDialog(this, model.DisplayName, model.Author, model.License, model.Tags);
+        if (dialog.ShowDialog() != true) return;
+        try
+        {
+            await _modelActivityLock.WaitAsync();
+            try
+            {
+                await RunSupervisorAsync("models", "metadata", model.Id, dialog.ModelName,
+                    dialog.Author, dialog.License, dialog.Tags);
+                await RefreshModelsAsync();
+            }
+            finally { _modelActivityLock.Release(); }
+            ModelsList.SelectedItem = _models.FirstOrDefault(item => item.Id == model.Id);
+            FooterStatus.Text = "模型资料已保存";
+        }
+        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
     }
 
     private void AddModelTransferCancelAction()
@@ -1868,14 +1911,27 @@ public partial class MainWindow : Window
             var p95Ms = root.GetProperty("p95Ms").GetDouble();
             var p99Ms = root.GetProperty("p99Ms").GetDouble();
             var outputSamples = root.GetProperty("outputSamples").GetInt32();
+            await RecordModelTestAsync(_selectedModel.Id, true, "directml");
             DoctorText.Text = $"RVC 三模型自检通过\n\n后端：WindowsML / DirectML\n模型加载：{loadMs:N0} ms\n20 帧平均：{inferenceMs:N1} ms\nP95 / P99：{p95Ms:N1} / {p99Ms:N1} ms\n输出采样：{outputSamples:N0}\n\n" + DoctorText.Text;
             FooterStatus.Text = $"RVC 自检通过：平均 {inferenceMs:N1} ms，P95 {p95Ms:N1} ms，P99 {p99Ms:N1} ms";
         }
         catch (Exception error)
         {
+            if (_selectedModel is not null) await RecordModelTestAsync(_selectedModel.Id, false, "directml");
             FooterStatus.Text = $"RVC 自检失败：{FriendlyError(error)}";
         }
         finally { _rvcSelfTestButton.IsEnabled = true; }
+    }
+
+    private async Task RecordModelTestAsync(string id, bool passed, string provider)
+    {
+        try
+        {
+            await _modelActivityLock.WaitAsync();
+            await RunSupervisorAsync("models", "tested", id, passed ? "passed" : "failed", provider);
+        }
+        catch { /* 诊断记录失败不能覆盖真实自检结果。 */ }
+        finally { _modelActivityLock.Release(); }
     }
 
     private void OpenDevices_Click(object sender, RoutedEventArgs e) => DeviceOverlay.Visibility = Visibility.Visible;
@@ -2075,20 +2131,69 @@ public partial class MainWindow : Window
             value.GetProperty("isDefault").GetBoolean());
     }
 
-    private sealed record ModelItem(string Id, string DisplayName, string Format, string State, long SizeBytes, string Hash)
+    private sealed record ModelItem(
+        string Id, string DisplayName, string Format, string State, long SizeBytes, string Hash,
+        string? Author, string? License, IReadOnlyList<string> Tags, string? RvcVersion,
+        int? SampleRate, bool? UsesF0, int? SpeakerCount, string? RecommendedProvider,
+        string? TestStatus, long? LastTestedAtUnixMs, long? LastUsedAtUnixMs)
     {
         public bool IsUsable => Format == "onnx" && State == "ready";
         public string SizeText => $"{SizeBytes / 1024d / 1024d:N1} MB";
-        public string ShortHash => Hash.Length > 16 ? Hash[..16] : Hash;
+        private string HashPrefix => Hash.Length > 16 ? Hash[..16] : Hash;
+        public string ShortHash
+        {
+            get
+            {
+                var details = DetailLine;
+                var activity = ActivityLine;
+                return string.Join(" · ", new[] { details, activity }.Where(value => !string.IsNullOrWhiteSpace(value)));
+            }
+        }
         public string FormatLabel => Format switch { "onnx" => "ONNX", "pytorchCheckpoint" => "PyTorch", "faissIndex" => "FAISS index", _ => Format };
         public string StateLabel => State switch { "ready" => "可使用", "conversionRequired" => "需要转换", "storedOnly" => "仅保存", _ => State };
+        public string DetailLine => string.Join(" · ", new[]
+        {
+            string.IsNullOrWhiteSpace(Author) ? null : Author,
+            string.IsNullOrWhiteSpace(License) ? null : License,
+            Tags.Count == 0 ? null : string.Join(" / ", Tags),
+            HashPrefix
+        }.Where(value => value is not null));
+        public string ActivityLine
+        {
+            get
+            {
+                var profile = RvcVersion is null ? null : $"RVC {RvcVersion}";
+                var rate = SampleRate is null ? null : $"{SampleRate / 1000d:0.#} kHz";
+                var test = TestStatus switch { "passed" => $"{ProviderLabel(RecommendedProvider)}自检通过", "failed" => "最近自检失败", _ => null };
+                var used = LastUsedAtUnixMs is null ? null : $"使用于 {FormatTimestamp(LastUsedAtUnixMs.Value)}";
+                var parts = new[] { profile, rate, UsesF0 is null ? null : UsesF0.Value ? "F0" : "非 F0", SpeakerCount is null ? null : $"{SpeakerCount} speakers", test, used }
+                    .Where(value => value is not null);
+                return string.Join(" · ", parts);
+            }
+        }
         public static ModelItem FromJson(JsonElement value) => new(
             value.GetProperty("id").GetString() ?? "",
             value.GetProperty("displayName").GetString() ?? "未命名",
             value.GetProperty("format").GetString() ?? "",
             value.GetProperty("state").GetString() ?? "",
             value.GetProperty("sizeBytes").GetInt64(),
-            value.GetProperty("sha256").GetString() ?? "");
+            value.GetProperty("sha256").GetString() ?? "",
+            OptionalString(value, "author"), OptionalString(value, "license"),
+            value.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array
+                ? tags.EnumerateArray().Select(tag => tag.GetString() ?? "").Where(tag => tag.Length > 0).ToArray() : [],
+            OptionalString(value, "rvcVersion"), OptionalInt(value, "sampleRate"), OptionalBool(value, "usesF0"),
+            OptionalInt(value, "speakerCount"), OptionalString(value, "recommendedProvider"),
+            OptionalString(value, "testStatus"), OptionalLong(value, "lastTestedAtUnixMs"), OptionalLong(value, "lastUsedAtUnixMs"));
+        private static string? OptionalString(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.String ? item.GetString() : null;
+        private static int? OptionalInt(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.Number ? item.GetInt32() : null;
+        private static long? OptionalLong(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.Number ? item.GetInt64() : null;
+        private static bool? OptionalBool(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind is JsonValueKind.True or JsonValueKind.False ? item.GetBoolean() : null;
+        private static string ProviderLabel(string? provider) => provider switch { "nvtrtx" => "TensorRT RTX ", "directml" => "DirectML ", "cpu" => "CPU ", _ => "" };
+        private static string FormatTimestamp(long milliseconds) => DateTimeOffset.FromUnixTimeMilliseconds(milliseconds).LocalDateTime.ToString("MM-dd HH:mm");
     }
 
     private sealed record HuggingFaceFileItem(string Path, long SizeBytes, string DownloadUrl)

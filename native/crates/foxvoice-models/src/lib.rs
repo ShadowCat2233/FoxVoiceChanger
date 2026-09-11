@@ -45,6 +45,36 @@ pub struct ModelRecord {
     pub sha256: String,
     pub imported_at_unix_ms: u64,
     pub source: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub rvc_version: Option<String>,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub uses_f0: Option<bool>,
+    #[serde(default)]
+    pub speaker_count: Option<u32>,
+    #[serde(default)]
+    pub recommended_provider: Option<String>,
+    #[serde(default)]
+    pub test_status: Option<String>,
+    #[serde(default)]
+    pub last_tested_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_used_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelMetadataUpdate {
+    pub display_name: String,
+    pub author: Option<String>,
+    pub license: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +157,17 @@ impl ModelLibrary {
             sha256,
             imported_at_unix_ms: unix_ms()?,
             source,
+            author: None,
+            license: None,
+            tags: default_tags(format),
+            rvc_version: None,
+            sample_rate: None,
+            uses_f0: None,
+            speaker_count: None,
+            recommended_provider: None,
+            test_status: None,
+            last_tested_at_unix_ms: None,
+            last_used_at_unix_ms: None,
         };
         write_manifest(&temporary_directory.join(MANIFEST_FILE), &record)?;
         fs::rename(&temporary_directory, &destination_directory).context("无法原子提交模型导入")?;
@@ -156,6 +197,10 @@ impl ModelLibrary {
         let url_hash = format!("{:x}", Sha256::digest(url.as_str().as_bytes()));
         let temporary_path = download_root.join(format!(".part-{}-{file_name}", &url_hash[..16]));
         let mut completed_download = false;
+        let repository_info = self.huggingface_repository_info(source_url).ok();
+        let repository = parse_huggingface_repository(source_url)
+            .ok()
+            .map(|value| value.0);
         let result = (|| -> Result<ModelRecord> {
             let existing = temporary_path
                 .metadata()
@@ -199,7 +244,23 @@ impl ModelLibrary {
             );
             output.sync_all()?;
             completed_download = true;
-            self.import_file(&temporary_path, Some(url.to_string()))
+            let mut record = self.import_file(&temporary_path, Some(url.to_string()))?;
+            if record.author.is_none() {
+                record.author = repository
+                    .as_deref()
+                    .and_then(|value| value.split_once('/'))
+                    .map(|value| value.0.to_owned());
+            }
+            if record.license.is_none() {
+                record.license = repository_info
+                    .as_ref()
+                    .and_then(|value| value.license.clone());
+            }
+            if !record.tags.iter().any(|value| value == "hugging-face") {
+                record.tags.push("hugging-face".into());
+            }
+            self.save_record(&record)?;
+            Ok(record)
         })();
         if (result.is_ok() || completed_download) && temporary_path.exists() {
             fs::remove_file(&temporary_path).context("无法清理下载临时文件")?;
@@ -324,6 +385,96 @@ impl ModelLibrary {
         anyhow::ensure!(path.is_file(), "模型数据文件缺失: {id}");
         Ok(path)
     }
+
+    pub fn update_metadata(&self, id: &str, update: ModelMetadataUpdate) -> Result<ModelRecord> {
+        let mut record = self.read_record(id)?;
+        let display_name = update.display_name.trim();
+        anyhow::ensure!(!display_name.is_empty(), "模型名称不能为空");
+        anyhow::ensure!(
+            display_name.chars().count() <= 120,
+            "模型名称不能超过 120 个字符"
+        );
+        record.display_name = display_name.to_owned();
+        record.author = normalize_optional(update.author, 120, "作者")?;
+        record.license = normalize_optional(update.license, 80, "许可证")?;
+        record.tags = normalize_tags(update.tags)?;
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn mark_used(&self, id: &str) -> Result<ModelRecord> {
+        let mut record = self.read_record(id)?;
+        record.last_used_at_unix_ms = Some(unix_ms()?);
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn record_test(&self, id: &str, passed: bool, provider: &str) -> Result<ModelRecord> {
+        let mut record = self.read_record(id)?;
+        let provider = provider.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(provider.as_str(), "directml" | "nvtrtx" | "cpu"),
+            "未知推理后端"
+        );
+        record.test_status = Some(if passed { "passed" } else { "failed" }.into());
+        record.last_tested_at_unix_ms = Some(unix_ms()?);
+        if passed {
+            record.recommended_provider = Some(provider);
+        }
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    fn read_record(&self, id: &str) -> Result<ModelRecord> {
+        validate_id(id)?;
+        read_manifest(&self.root.join(id).join(MANIFEST_FILE))
+    }
+
+    fn save_record(&self, record: &ModelRecord) -> Result<()> {
+        validate_id(&record.id)?;
+        let directory = self.root.join(&record.id);
+        anyhow::ensure!(directory.is_dir(), "模型不存在: {}", record.id);
+        write_manifest(&directory.join(MANIFEST_FILE), record)
+    }
+}
+
+fn default_tags(format: ModelFormat) -> Vec<String> {
+    match format {
+        ModelFormat::Onnx => vec!["rvc".into(), "onnx".into()],
+        ModelFormat::PytorchCheckpoint => vec!["rvc".into(), "checkpoint".into()],
+        ModelFormat::FaissIndex => vec!["rvc".into(), "index".into()],
+    }
+}
+
+fn normalize_optional(
+    value: Option<String>,
+    maximum: usize,
+    label: &str,
+) -> Result<Option<String>> {
+    let value = value
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    if let Some(text) = &value {
+        anyhow::ensure!(
+            text.chars().count() <= maximum,
+            "{label}不能超过 {maximum} 个字符"
+        );
+    }
+    Ok(value)
+}
+
+fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>> {
+    anyhow::ensure!(tags.len() <= 20, "标签不能超过 20 个");
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_ascii_lowercase();
+        if tag.is_empty() || normalized.contains(&tag) {
+            continue;
+        }
+        anyhow::ensure!(tag.chars().count() <= 32, "单个标签不能超过 32 个字符");
+        normalized.push(tag);
+    }
+    Ok(normalized)
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +672,86 @@ mod tests {
         let library = ModelLibrary::open(&model_root).unwrap();
         assert!(library.import_file(&source, None).is_err());
         assert!(library.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_legacy_manifest_and_persists_metadata_activity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("models");
+        let id = "model-deadbeefdeadbeef";
+        let directory = root.join(id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("voice.pth"), b"checkpoint").unwrap();
+        fs::write(
+            directory.join(MANIFEST_FILE),
+            format!(
+                r#"{{
+  "id": "{id}",
+  "displayName": "Legacy",
+  "format": "pytorchCheckpoint",
+  "state": "conversionRequired",
+  "fileName": "voice.pth",
+  "sizeBytes": 10,
+  "sha256": "deadbeef",
+  "importedAtUnixMs": 1,
+  "source": null
+}}"#
+            ),
+        )
+        .unwrap();
+        let library = ModelLibrary::open(&root).unwrap();
+        let legacy = library.list().unwrap().remove(0);
+        assert!(legacy.tags.is_empty());
+        assert!(legacy.last_used_at_unix_ms.is_none());
+
+        let updated = library
+            .update_metadata(
+                id,
+                ModelMetadataUpdate {
+                    display_name: "  New voice  ".into(),
+                    author: Some(" Fox ".into()),
+                    license: Some(" MIT ".into()),
+                    tags: vec!["RVC".into(), "game".into(), "rvc".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.display_name, "New voice");
+        assert_eq!(updated.author.as_deref(), Some("Fox"));
+        assert_eq!(updated.tags, vec!["rvc", "game"]);
+        assert!(
+            library
+                .mark_used(id)
+                .unwrap()
+                .last_used_at_unix_ms
+                .is_some()
+        );
+        let tested = library.record_test(id, true, "DirectML").unwrap();
+        assert_eq!(tested.test_status.as_deref(), Some("passed"));
+        assert_eq!(tested.recommended_provider.as_deref(), Some("directml"));
+        assert!(tested.last_tested_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("voice.pth");
+        fs::write(&source, b"checkpoint").unwrap();
+        let library = ModelLibrary::open(temporary.path().join("models")).unwrap();
+        let model = library.import_file(&source, None).unwrap();
+        assert!(
+            library
+                .update_metadata(
+                    &model.id,
+                    ModelMetadataUpdate {
+                        display_name: " ".into(),
+                        author: None,
+                        license: None,
+                        tags: vec![],
+                    }
+                )
+                .is_err()
+        );
+        assert!(library.record_test(&model.id, true, "mystery").is_err());
     }
 
     #[test]
