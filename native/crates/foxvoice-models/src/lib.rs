@@ -69,6 +69,8 @@ pub struct ModelRecord {
     pub last_tested_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_used_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub rights_confirmed_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -185,9 +187,17 @@ impl ModelLibrary {
             test_status: None,
             last_tested_at_unix_ms: None,
             last_used_at_unix_ms: None,
+            rights_confirmed_at_unix_ms: None,
         };
         write_manifest(&temporary_directory.join(MANIFEST_FILE), &record)?;
         fs::rename(&temporary_directory, &destination_directory).context("无法原子提交模型导入")?;
+        Ok(record)
+    }
+
+    pub fn confirm_rights(&self, id: &str) -> Result<ModelRecord> {
+        let mut record = self.read_record(id)?;
+        record.rights_confirmed_at_unix_ms = Some(unix_ms()?);
+        self.save_record(&record)?;
         Ok(record)
     }
 
@@ -700,6 +710,9 @@ mod tests {
         let duplicate = library.import_file(&source, None).unwrap();
         assert_eq!(first.id, duplicate.id);
         assert_eq!(library.list().unwrap(), vec![first.clone()]);
+        assert!(first.rights_confirmed_at_unix_ms.is_none());
+        let confirmed = library.confirm_rights(&first.id).unwrap();
+        assert!(confirmed.rights_confirmed_at_unix_ms.is_some());
         assert_eq!(
             library.model_file(&first.id).unwrap(),
             library.root.join(&first.id).join(&first.file_name)
@@ -771,6 +784,7 @@ mod tests {
         let legacy = library.list().unwrap().remove(0);
         assert!(legacy.tags.is_empty());
         assert!(legacy.last_used_at_unix_ms.is_none());
+        assert!(legacy.rights_confirmed_at_unix_ms.is_none());
 
         let updated = library
             .update_metadata(

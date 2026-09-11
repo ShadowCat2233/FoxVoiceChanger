@@ -241,9 +241,10 @@ fn run_models_command() -> Result<()> {
             let path = env::args().nth(3).map(PathBuf::from).context(
                 "用法: foxvoice-supervisor models import <model.onnx|model.pth|model.index> --rights-confirmed",
             )?;
+            let imported = library.import_file(&path, None)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&library.import_file(&path, None)?)?
+                serde_json::to_string_pretty(&library.confirm_rights(&imported.id)?)?
             );
         }
         "huggingface" => {
@@ -254,9 +255,10 @@ fn run_models_command() -> Result<()> {
             let url = env::args().nth(3).context(
                 "用法: foxvoice-supervisor models huggingface <resolve-url> --rights-confirmed",
             )?;
+            let imported = library.import_huggingface(&url)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&library.import_huggingface(&url)?)?
+                serde_json::to_string_pretty(&library.confirm_rights(&imported.id)?)?
             );
         }
         "huggingface-files" => {

@@ -2195,7 +2195,7 @@ public partial class MainWindow : Window
         string Id, string DisplayName, string Format, string State, long SizeBytes, string Hash,
         string? Author, string? License, IReadOnlyList<string> Tags, string? RvcVersion,
         int? SampleRate, bool? UsesF0, int? SpeakerCount, string? RecommendedProvider,
-        string? TestStatus, long? LastTestedAtUnixMs, long? LastUsedAtUnixMs)
+        string? TestStatus, long? LastTestedAtUnixMs, long? LastUsedAtUnixMs, long? RightsConfirmedAtUnixMs)
     {
         public bool IsUsable => Format == "onnx" && State == "ready";
         public string SizeText => $"{SizeBytes / 1024d / 1024d:N1} MB";
@@ -2226,7 +2226,10 @@ public partial class MainWindow : Window
                 var rate = SampleRate is null ? null : $"{SampleRate / 1000d:0.#} kHz";
                 var test = TestStatus switch { "passed" => $"{ProviderLabel(RecommendedProvider)}{(UiText.IsEnglish(UiText.CurrentLanguage) ? "self-test passed" : "自检通过")}", "failed" => UiText.IsEnglish(UiText.CurrentLanguage) ? "last self-test failed" : "最近自检失败", _ => null };
                 var used = LastUsedAtUnixMs is null ? null : $"{(UiText.IsEnglish(UiText.CurrentLanguage) ? "used " : "使用于 ")}{FormatTimestamp(LastUsedAtUnixMs.Value)}";
-                var parts = new[] { profile, rate, UsesF0 is null ? null : UsesF0.Value ? "F0" : UiText.IsEnglish(UiText.CurrentLanguage) ? "non-F0" : "非 F0", SpeakerCount is null ? null : $"{SpeakerCount} speakers", test, used }
+                var rights = RightsConfirmedAtUnixMs is null
+                    ? UiText.IsEnglish(UiText.CurrentLanguage) ? "rights not confirmed" : "授权未确认"
+                    : UiText.IsEnglish(UiText.CurrentLanguage) ? "rights confirmed" : "授权已确认";
+                var parts = new[] { profile, rate, UsesF0 is null ? null : UsesF0.Value ? "F0" : UiText.IsEnglish(UiText.CurrentLanguage) ? "non-F0" : "非 F0", SpeakerCount is null ? null : $"{SpeakerCount} speakers", rights, test, used }
                     .Where(value => value is not null);
                 return string.Join(" · ", parts);
             }
@@ -2243,7 +2246,8 @@ public partial class MainWindow : Window
                 ? tags.EnumerateArray().Select(tag => tag.GetString() ?? "").Where(tag => tag.Length > 0).ToArray() : [],
             OptionalString(value, "rvcVersion"), OptionalInt(value, "sampleRate"), OptionalBool(value, "usesF0"),
             OptionalInt(value, "speakerCount"), OptionalString(value, "recommendedProvider"),
-            OptionalString(value, "testStatus"), OptionalLong(value, "lastTestedAtUnixMs"), OptionalLong(value, "lastUsedAtUnixMs"));
+            OptionalString(value, "testStatus"), OptionalLong(value, "lastTestedAtUnixMs"), OptionalLong(value, "lastUsedAtUnixMs"),
+            OptionalLong(value, "rightsConfirmedAtUnixMs"));
         private static string? OptionalString(JsonElement value, string name) =>
             value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.String ? item.GetString() : null;
         private static int? OptionalInt(JsonElement value, string name) =>
