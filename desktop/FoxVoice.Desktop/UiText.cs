@@ -159,20 +159,34 @@ internal static class UiText
     public static void Apply(DependencyObject root, string? language)
     {
         CurrentLanguage = IsEnglish(language) ? English : Chinese;
+        ApplyRecursive(root, language);
+    }
+
+    private static void ApplyRecursive(DependencyObject root, string? language)
+    {
         ApplyOne(root, language);
         for (var i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); i++)
-            Apply(System.Windows.Media.VisualTreeHelper.GetChild(root, i), language);
+            ApplyRecursive(System.Windows.Media.VisualTreeHelper.GetChild(root, i), language);
     }
 
     private static void ApplyOne(DependencyObject element, string? language)
     {
         if (element is TextBlock text && !BindingOperations.IsDataBound(text, TextBlock.TextProperty))
-            text.Text = LocalizedValue(text, OriginalTextProperty, text.Text, language);
+        {
+            var translated = LocalizedValue(text, OriginalTextProperty, text.Text, language);
+            if (text.Text != translated) text.Text = translated;
+        }
         if (element is ContentControl content && content.Content is string value &&
             !BindingOperations.IsDataBound(content, ContentControl.ContentProperty))
-            content.Content = LocalizedValue(content, OriginalContentProperty, value, language);
+        {
+            var translated = LocalizedValue(content, OriginalContentProperty, value, language);
+            if (value != translated) content.Content = translated;
+        }
         if (element is FrameworkElement framework && framework.ToolTip is string tooltip)
-            framework.ToolTip = LocalizedValue(framework, OriginalToolTipProperty, tooltip, language);
+        {
+            var translated = LocalizedValue(framework, OriginalToolTipProperty, tooltip, language);
+            if (tooltip != translated) framework.ToolTip = translated;
+        }
     }
 
     private static string LocalizedValue(
