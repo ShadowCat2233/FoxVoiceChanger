@@ -21,7 +21,8 @@ Pinned revision: `81eed5e8f68b6bed1789f682fe78cdd324495afc`
 FoxVoice uses code from `shirohata/vc-rs` at commit
 `2c3b57661c4a38f56e64c521a71e65dc68db5895`, including its pure-Rust
 `vc-convert` component. Copyright (c) 2026 shirohata, licensed under the MIT
-License.
+License. The complete upstream license is also shipped as
+`licenses/vc-rs-MIT.txt`.
 
 ## rvc-onnx-web
 

@@ -114,6 +114,8 @@ $licenseDirectory = Join-Path $stagingDirectory 'licenses'
 New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
 Copy-Item -LiteralPath $windowsAppSdkLicense `
     -Destination (Join-Path $licenseDirectory 'WindowsAppSDK-LICENSE.txt') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'native\vendor\vc-app\LICENSE') `
+    -Destination (Join-Path $licenseDirectory 'vc-rs-MIT.txt') -Force
 $debugSymbols = Join-Path $stagingDirectory 'FoxVoice.pdb'
 if (Test-Path -LiteralPath $debugSymbols) { Remove-Item -LiteralPath $debugSymbols -Force }
 

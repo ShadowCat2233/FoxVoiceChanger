@@ -1,0 +1,32 @@
+[package]
+name = "vc-app"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "FoxVoice patched vc-rs realtime runtime"
+
+[features]
+default = ["windowsml", "tensorrt", "rnnoise", "gtcrn"]
+windowsml = ["vc-core/windowsml"]
+tensorrt = ["vc-core/tensorrt"]
+cuda = ["vc-core/cuda"]
+rnnoise = ["vc-core/rnnoise"]
+gtcrn = ["vc-core/gtcrn"]
+cpu = ["vc-core/ort"]
+asio = ["cpal/asio"]
+jack = ["cpal/jack"]
+
+[dependencies]
+vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }
+anyhow = "1.0.99"
+tracing = "0.1.41"
+cpal = { version = "0.18.2", features = ["realtime"] }
+hound = "3.5"
+rtrb = "0.4"
+thread-priority = "3.0.0"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
+
+[dev-dependencies]
+approx = "0.5"
