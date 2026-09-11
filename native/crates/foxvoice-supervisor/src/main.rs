@@ -234,8 +234,12 @@ fn run_models_command() -> Result<()> {
     match action.as_str() {
         "list" => println!("{}", serde_json::to_string_pretty(&library.list()?)?),
         "import" => {
+            anyhow::ensure!(
+                has_rights_confirmation(env::args()),
+                "导入前必须显式确认你有权使用模型并接受其许可证；缺少 --rights-confirmed"
+            );
             let path = env::args().nth(3).map(PathBuf::from).context(
-                "用法: foxvoice-supervisor models import <model.onnx|model.pth|model.index>",
+                "用法: foxvoice-supervisor models import <model.onnx|model.pth|model.index> --rights-confirmed",
             )?;
             println!(
                 "{}",
@@ -243,9 +247,13 @@ fn run_models_command() -> Result<()> {
             );
         }
         "huggingface" => {
-            let url = env::args()
-                .nth(3)
-                .context("用法: foxvoice-supervisor models huggingface <resolve-url>")?;
+            anyhow::ensure!(
+                has_rights_confirmation(env::args()),
+                "下载前必须显式确认你有权使用模型并接受其许可证；缺少 --rights-confirmed"
+            );
+            let url = env::args().nth(3).context(
+                "用法: foxvoice-supervisor models huggingface <resolve-url> --rights-confirmed",
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&library.import_huggingface(&url)?)?
@@ -390,6 +398,16 @@ fn run_models_command() -> Result<()> {
     Ok(())
 }
 
+fn has_rights_confirmation<I, S>(arguments: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    arguments
+        .into_iter()
+        .any(|argument| argument.as_ref() == "--rights-confirmed")
+}
+
 fn converter_executable() -> Result<PathBuf> {
     if let Some(path) = env::var_os("FOXVOICE_CONVERTER") {
         let path = PathBuf::from(path);
@@ -487,5 +505,22 @@ fn run_bypass_forever() -> Result<()> {
                 "streamErrors": metrics.stream_errors
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_rights_confirmation;
+
+    #[test]
+    fn model_import_requires_exact_rights_confirmation_flag() {
+        assert!(has_rights_confirmation([
+            "models",
+            "import",
+            "voice.onnx",
+            "--rights-confirmed"
+        ]));
+        assert!(!has_rights_confirmation(["models", "import", "voice.onnx"]));
+        assert!(!has_rights_confirmation(["--rights-confirmed=false"]));
     }
 }

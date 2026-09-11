@@ -794,7 +794,7 @@ public partial class MainWindow : Window
                     "导入训练结果", MessageBoxButton.OKCancel, MessageBoxImage.Information);
                 if (answer != MessageBoxResult.OK) return;
             }
-            foreach (var path in paths) await RunSupervisorAsync("models", "import", path);
+            foreach (var path in paths) await RunSupervisorAsync("models", "import", path, "--rights-confirmed");
             await RefreshModelsAsync();
             ModelsNav.IsChecked = true;
             FooterStatus.Text = $"已导入 {paths.Count} 个训练结果；RVC v2 F0 检查点可点击“使用”转换为 ONNX";
@@ -1373,7 +1373,7 @@ public partial class MainWindow : Window
             Multiselect = false
         };
         if (dialog.ShowDialog(this) != true) return;
-        await ImportModelAsync(["models", "import", dialog.FileName], "正在校验并导入本地模型…");
+        await ImportModelAsync(["models", "import", dialog.FileName, "--rights-confirmed"], "正在校验并导入本地模型…");
     }
 
     private async void ImportHuggingFace_Click(object sender, RoutedEventArgs e)
@@ -1484,7 +1484,7 @@ public partial class MainWindow : Window
         try
         {
             FooterStatus.Text = progress + "（可取消并续传）";
-            await RunCancelableModelTransferAsync("models", "huggingface", url);
+            await RunCancelableModelTransferAsync("models", "huggingface", url, "--rights-confirmed");
             await RefreshModelsAsync();
             FooterStatus.Text = "Hugging Face 模型下载、校验和导入完成";
         }
