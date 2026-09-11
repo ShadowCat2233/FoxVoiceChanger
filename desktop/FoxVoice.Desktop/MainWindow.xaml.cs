@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -79,6 +80,7 @@ public partial class MainWindow : Window
     {
         _settings = UserSettings.Load();
         InitializeComponent();
+        VersionText.Text = $"v{Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0"} local";
         AddFoundationModelsCard();
         AddTensorRtAction();
         AddMonitorDevicePicker();

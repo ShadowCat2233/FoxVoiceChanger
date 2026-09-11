@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-audio"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -467,14 +467,14 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-contracts"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "foxvoice-converter"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-engine"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "claxon",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-ipc"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-models"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "foxvoice-supervisor"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "foxvoice-audio",

@@ -10,6 +10,7 @@ namespace FoxVoice.Setup;
 internal static class Program
 {
     private const string PayloadResource = "FoxVoice.Payload.zip";
+    private static readonly string ProductVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
     private static readonly string? TestRoot = Environment.GetEnvironmentVariable("FOXVOICE_SETUP_TEST_ROOT");
     private static readonly string InstallRoot = TestRoot is null
         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "FoxVoice")
@@ -110,6 +111,7 @@ internal static class Program
         Console.WriteLine(JsonSerializer.Serialize(new
         {
             installed = File.Exists(Path.Combine(CurrentDirectory, "FoxVoice.exe")),
+            version = ProductVersion,
             rollbackAvailable = File.Exists(Path.Combine(RollbackDirectory, "FoxVoice.exe")),
             installPath = CurrentDirectory,
             userDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FoxVoice")
@@ -198,6 +200,7 @@ internal static class Program
         using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\FoxVoice");
         key.SetValue("DisplayName", "FoxVoice 狐声");
         key.SetValue("Publisher", "FoxVoice");
+        key.SetValue("DisplayVersion", ProductVersion);
         key.SetValue("InstallLocation", CurrentDirectory);
         key.SetValue("DisplayIcon", Path.Combine(CurrentDirectory, "FoxVoice.exe"));
         key.SetValue("UninstallString", $"\"{CachedInstaller}\" uninstall");
