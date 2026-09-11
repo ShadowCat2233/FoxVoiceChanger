@@ -109,6 +109,8 @@ internal static class UiText
         ["训练完成；正在导入输出模型"] = "Training completed; importing output models", ["训练已停止；已有检查点未删除"] = "Training stopped; existing checkpoints were preserved",
         ["训练组件安装已取消；下次安装会复用已下载内容"] = "Training component installation cancelled; downloaded files will be reused next time",
         ["训练工作台尚未生成 .pth 或 .index 结果"] = "The training workbench has not produced .pth or .index results yet",
+        ["确认本地模型来源"] = "Confirm Local Model Source",
+        ["导入前请确认：你有权使用和转换所选模型及索引，并会遵守模型发布者声明的许可证。FoxVoice 只在本机保存文件，不会替你获得或验证模型授权。"] = "Before importing, confirm that you are authorized to use and convert the selected model and index, and that you will follow the publisher's license. FoxVoice stores files only on this PC and cannot obtain or verify authorization for you.",
         ["FOXVOICE / 实时变声"] = "FOXVOICE / LIVE VOICE", ["FOXVOICE / 模型库"] = "FOXVOICE / MODEL LIBRARY",
         ["FOXVOICE / 音效板"] = "FOXVOICE / SOUNDBOARD", ["FOXVOICE / 模型训练"] = "FOXVOICE / MODEL TRAINING",
         ["FOXVOICE / 组件中心"] = "FOXVOICE / COMPONENT CENTER", ["FOXVOICE / 设置"] = "FOXVOICE / SETTINGS"

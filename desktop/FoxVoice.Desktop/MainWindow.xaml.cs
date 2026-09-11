@@ -1362,6 +1362,10 @@ public partial class MainWindow : Window
     private async void ImportModel_Click(object sender, RoutedEventArgs e)
     {
         if (RejectHeavyWorkDuringGame("模型导入与转换")) return;
+        var permission = MessageBox.Show(this,
+            T("导入前请确认：你有权使用和转换所选模型及索引，并会遵守模型发布者声明的许可证。FoxVoice 只在本机保存文件，不会替你获得或验证模型授权。"),
+            T("确认本地模型来源"), MessageBoxButton.OKCancel, MessageBoxImage.Information);
+        if (permission != MessageBoxResult.OK) return;
         var dialog = new OpenFileDialog
         {
             Title = T("导入 RVC 模型或索引"),
