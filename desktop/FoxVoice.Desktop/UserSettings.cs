@@ -5,6 +5,7 @@ namespace FoxVoice.Desktop;
 
 internal sealed class UserSettings
 {
+    public string Language { get; set; } = "zh-CN";
     public string EmbedderPath { get; set; } = "";
     public string F0Path { get; set; } = "";
     public string InputDevice { get; set; } = "";
@@ -21,9 +22,17 @@ internal sealed class UserSettings
     public List<string> SoundboardLoopFiles { get; set; } = [];
     public double SoundboardGainDb { get; set; } = -3;
 
-    private static string SettingsPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "FoxVoice", "settings.json");
+    private static string SettingsPath
+    {
+        get
+        {
+            var overrideDirectory = Environment.GetEnvironmentVariable("FOXVOICE_SETTINGS_DIR");
+            var directory = string.IsNullOrWhiteSpace(overrideDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FoxVoice")
+                : Path.GetFullPath(overrideDirectory);
+            return Path.Combine(directory, "settings.json");
+        }
+    }
 
     public static UserSettings Load()
     {

@@ -97,7 +97,14 @@ finally {
     }
 }
 
-$ui = Start-Process -FilePath $desktop -WorkingDirectory $releaseDirectory -PassThru
+$uiSettingsDirectory = Join-Path $tempRootForSetup "FoxVoiceUiSmoke-$smokeId"
+New-Item -ItemType Directory -Path $uiSettingsDirectory | Out-Null
+Set-Content -LiteralPath (Join-Path $uiSettingsDirectory 'settings.json') -Encoding UTF8 -Value '{"Language":"en-US"}'
+$uiStart = [Diagnostics.ProcessStartInfo]::new($desktop)
+$uiStart.UseShellExecute = $false
+$uiStart.WorkingDirectory = $releaseDirectory
+$uiStart.Environment['FOXVOICE_SETTINGS_DIR'] = $uiSettingsDirectory
+$ui = [Diagnostics.Process]::Start($uiStart)
 try {
     $uiReady = $false
     $lastTitle = ''
@@ -123,6 +130,7 @@ try {
 finally {
     if (-not $ui.HasExited) { Stop-Process -Id $ui.Id -Force }
     $ui.Dispose()
+    if (Test-Path -LiteralPath $uiSettingsDirectory) { Remove-Item -LiteralPath $uiSettingsDirectory -Recurse -Force }
 }
 
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

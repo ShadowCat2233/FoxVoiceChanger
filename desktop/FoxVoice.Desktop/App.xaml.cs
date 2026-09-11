@@ -23,9 +23,12 @@ public partial class App : Application
     private static void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         var logPath = WriteCrashLog(e.Exception);
+        var english = UiText.IsEnglish(UserSettings.Load().Language);
         MessageBox.Show(
-            $"FoxVoice 遇到错误，但已阻止程序直接闪退。\n\n{e.Exception.Message}\n\n诊断日志：{logPath}",
-            "FoxVoice 错误",
+            english
+                ? $"FoxVoice encountered an error and prevented an abrupt exit.\n\n{e.Exception.Message}\n\nDiagnostic log: {logPath}"
+                : $"FoxVoice 遇到错误，但已阻止程序直接闪退。\n\n{e.Exception.Message}\n\n诊断日志：{logPath}",
+            english ? "FoxVoice Error" : "FoxVoice 错误",
             MessageBoxButton.OK,
             MessageBoxImage.Error);
         e.Handled = true;
@@ -51,7 +54,7 @@ public partial class App : Application
         }
         catch
         {
-            return "日志写入失败";
+            return UiText.IsEnglish(UserSettings.Load().Language) ? "Failed to write log" : "日志写入失败";
         }
     }
 }

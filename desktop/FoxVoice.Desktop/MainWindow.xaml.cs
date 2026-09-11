@@ -77,6 +77,7 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
+        _settings = UserSettings.Load();
         InitializeComponent();
         AddFoundationModelsCard();
         AddTensorRtAction();
@@ -85,9 +86,9 @@ public partial class MainWindow : Window
         AddRvcSelfTestAction();
         AddModelRecycleAction();
         AddModelTransferCancelAction();
-        _settings = UserSettings.Load();
         BuildSoundboardView();
         BuildTrainingView();
+        LanguageCombo.SelectedIndex = UiText.IsEnglish(_settings.Language) ? 1 : 0;
         EmbedderPath.Text = _settings.EmbedderPath;
         F0Path.Text = _settings.F0Path;
         PitchSlider.Value = _settings.Pitch;
@@ -97,6 +98,7 @@ public partial class MainWindow : Window
         MonitorToggle.IsEnabled = false;
         MonitorToggle.ToolTip = "选择虚拟声卡为主输出后，可独立监听到物理耳机";
         UpdateLiveControlLabels();
+        ApplyLocalization();
         _deviceRefreshTimer.Tick += DeviceRefreshTimer_Tick;
         _gameDetectionTimer.Tick += GameDetectionTimer_Tick;
 
@@ -120,6 +122,7 @@ public partial class MainWindow : Window
     {
         _ready = true;
         await RefreshAllAsync();
+        ApplyLocalization();
         _deviceRefreshTimer.Start();
         _gameDetectionTimer.Start();
     }
@@ -1095,9 +1098,28 @@ public partial class MainWindow : Window
             RadioButton button when button == SettingsNav => ("FOXVOICE / 设置", "配置 RVC 基础模型并查看诊断"),
             _ => ("FOXVOICE / 实时变声", "让声音保持在游戏里")
         };
+        ApplyLocalization();
     }
 
-    private async void Refresh_Click(object sender, RoutedEventArgs e) => await RefreshAllAsync();
+    private void LanguageSelection_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (LanguageCombo.SelectedItem is not ComboBoxItem { Tag: string language }) return;
+        _settings.Language = UiText.IsEnglish(language) ? UiText.English : UiText.Chinese;
+        ModelsList.ItemsSource = null;
+        ModelsList.ItemsSource = _models;
+        PresetItems.ItemsSource = null;
+        PresetItems.ItemsSource = _models.Where(model => model.IsUsable).Take(4).ToList();
+        ApplyLocalization();
+        if (IsLoaded) TrySaveSettings();
+    }
+
+    private void ApplyLocalization() => UiText.Apply(this, _settings.Language);
+
+    private async void Refresh_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshAllAsync();
+        ApplyLocalization();
+    }
 
     private async void RefreshModels_Click(object sender, RoutedEventArgs e)
     {
@@ -1600,6 +1622,7 @@ public partial class MainWindow : Window
             BudgetText.Text = $"{milliseconds:0.0} / {budget:0} ms";
             BudgetProgress.Value = Math.Clamp(milliseconds / budget * 100.0, 0, 100);
         }
+        ApplyLocalization();
     }
 
     private void StopAudioProcess()
@@ -2162,7 +2185,7 @@ public partial class MainWindow : Window
             }
         }
         public string FormatLabel => Format switch { "onnx" => "ONNX", "pytorchCheckpoint" => "PyTorch", "faissIndex" => "FAISS index", _ => Format };
-        public string StateLabel => State switch { "ready" => "可使用", "conversionRequired" => "需要转换", "storedOnly" => "仅保存", _ => State };
+        public string StateLabel => UiText.Translate(State switch { "ready" => "可使用", "conversionRequired" => "需要转换", "storedOnly" => "仅保存", _ => State }, UiText.CurrentLanguage);
         public string DetailLine => string.Join(" · ", new[]
         {
             string.IsNullOrWhiteSpace(Author) ? null : Author,
@@ -2176,9 +2199,9 @@ public partial class MainWindow : Window
             {
                 var profile = RvcVersion is null ? null : $"RVC {RvcVersion}";
                 var rate = SampleRate is null ? null : $"{SampleRate / 1000d:0.#} kHz";
-                var test = TestStatus switch { "passed" => $"{ProviderLabel(RecommendedProvider)}自检通过", "failed" => "最近自检失败", _ => null };
-                var used = LastUsedAtUnixMs is null ? null : $"使用于 {FormatTimestamp(LastUsedAtUnixMs.Value)}";
-                var parts = new[] { profile, rate, UsesF0 is null ? null : UsesF0.Value ? "F0" : "非 F0", SpeakerCount is null ? null : $"{SpeakerCount} speakers", test, used }
+                var test = TestStatus switch { "passed" => $"{ProviderLabel(RecommendedProvider)}{(UiText.IsEnglish(UiText.CurrentLanguage) ? "self-test passed" : "自检通过")}", "failed" => UiText.IsEnglish(UiText.CurrentLanguage) ? "last self-test failed" : "最近自检失败", _ => null };
+                var used = LastUsedAtUnixMs is null ? null : $"{(UiText.IsEnglish(UiText.CurrentLanguage) ? "used " : "使用于 ")}{FormatTimestamp(LastUsedAtUnixMs.Value)}";
+                var parts = new[] { profile, rate, UsesF0 is null ? null : UsesF0.Value ? "F0" : UiText.IsEnglish(UiText.CurrentLanguage) ? "non-F0" : "非 F0", SpeakerCount is null ? null : $"{SpeakerCount} speakers", test, used }
                     .Where(value => value is not null);
                 return string.Join(" · ", parts);
             }
