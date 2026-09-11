@@ -7,6 +7,13 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+[xml]$buildProperties = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'Directory.Build.props')
+$productVersion = [string]$buildProperties.Project.PropertyGroup.Version
+$cargoManifest = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'native\Cargo.toml')
+$cargoVersion = [regex]::Match($cargoManifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($productVersion) -or $cargoVersion -ne $productVersion) {
+    throw "Desktop/setup version '$productVersion' does not match native version '$cargoVersion'."
+}
 
 if (-not (Test-Path -LiteralPath $cargoPath)) {
     throw 'Rust is not installed. Run scripts\bootstrap-native.ps1 first.'

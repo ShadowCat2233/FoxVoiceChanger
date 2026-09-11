@@ -10,6 +10,9 @@ $engine = Join-Path $releaseDirectory 'foxvoice-engine.exe'
 $converter = Join-Path $releaseDirectory 'foxvoice-converter.exe'
 $bootstrap = Join-Path $releaseDirectory 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
 $setup = Join-Path $projectRoot 'artifacts\FoxVoiceSetup.exe'
+[xml]$buildProperties = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'Directory.Build.props')
+$expectedVersion = [string]$buildProperties.Project.PropertyGroup.Version
+if ([string]::IsNullOrWhiteSpace($expectedVersion)) { throw 'Directory.Build.props does not define Version.' }
 
 foreach ($path in @($desktop, $supervisor, $engine, $converter, $bootstrap, $setup)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing release file: $path" }
@@ -31,9 +34,17 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $installerTestFullPath 'Programs\FoxVoice\current\FoxVoice.exe'))) {
         throw 'Isolated installer did not install FoxVoice.'
     }
+    $installedStatus = & $setup status | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $installedStatus.currentVersion -ne $expectedVersion -or $installedStatus.installerVersion -ne $expectedVersion) {
+        throw "Isolated installer version mismatch: $($installedStatus | ConvertTo-Json -Compress)"
+    }
     & $setup repair --yes
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $installerTestFullPath 'Programs\FoxVoice\rollback\FoxVoice.exe'))) {
         throw 'Isolated installer did not preserve a rollback version during repair.'
+    }
+    $repairStatus = & $setup status | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $repairStatus.currentVersion -ne $expectedVersion -or $repairStatus.rollbackVersion -ne $expectedVersion) {
+        throw "Isolated repair version mismatch: $($repairStatus | ConvertTo-Json -Compress)"
     }
     & $setup rollback --yes
     if ($LASTEXITCODE -ne 0) { throw 'Isolated installer rollback failed.' }

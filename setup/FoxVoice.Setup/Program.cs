@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -111,7 +112,9 @@ internal static class Program
         Console.WriteLine(JsonSerializer.Serialize(new
         {
             installed = File.Exists(Path.Combine(CurrentDirectory, "FoxVoice.exe")),
-            version = ProductVersion,
+            installerVersion = ProductVersion,
+            currentVersion = InstalledVersion(CurrentDirectory),
+            rollbackVersion = InstalledVersion(RollbackDirectory),
             rollbackAvailable = File.Exists(Path.Combine(RollbackDirectory, "FoxVoice.exe")),
             installPath = CurrentDirectory,
             userDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FoxVoice")
@@ -148,7 +151,11 @@ internal static class Program
             entry.ExtractToFile(destination, true);
         }
         VerifyManifest(staging);
-        if (!File.Exists(Path.Combine(staging, "FoxVoice.exe"))) throw new InvalidDataException("发布负载缺少 FoxVoice.exe。");
+        var desktop = Path.Combine(staging, "FoxVoice.exe");
+        if (!File.Exists(desktop)) throw new InvalidDataException("发布负载缺少 FoxVoice.exe。");
+        var payloadVersion = FileVersionInfo.GetVersionInfo(desktop).ProductVersion;
+        if (!string.Equals(payloadVersion, ProductVersion, StringComparison.Ordinal))
+            throw new InvalidDataException($"安装器版本 {ProductVersion} 与发布负载版本 {payloadVersion ?? "未知"} 不一致。");
     }
 
     private static void VerifyManifest(string directory)
@@ -205,6 +212,12 @@ internal static class Program
         key.SetValue("DisplayIcon", Path.Combine(CurrentDirectory, "FoxVoice.exe"));
         key.SetValue("UninstallString", $"\"{CachedInstaller}\" uninstall");
         key.SetValue("NoModify", 1, RegistryValueKind.DWord);
+    }
+
+    private static string? InstalledVersion(string directory)
+    {
+        var executable = Path.Combine(directory, "FoxVoice.exe");
+        return File.Exists(executable) ? FileVersionInfo.GetVersionInfo(executable).ProductVersion : null;
     }
 
     private static void CreateShortcuts()
