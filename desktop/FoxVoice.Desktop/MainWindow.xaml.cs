@@ -78,6 +78,17 @@ public partial class MainWindow : Window
     private readonly TextBlock _trainingDatasetSummary = new() { Text = "请选择包含 WAV 或 FLAC 的文件夹", TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _trainingProgressText = new() { Text = "等待任务", FontWeight = FontWeights.SemiBold };
     private readonly ProgressBar _trainingProgress = new() { Minimum = 0, Maximum = 100, Height = 7, Margin = new Thickness(0, 8, 0, 0), Foreground = new SolidColorBrush(Color.FromRgb(46, 226, 247)), Background = new SolidColorBrush(Color.FromRgb(38, 48, 64)) };
+    private readonly TextBox _trainingValidationAudio = new() { IsReadOnly = true, MinWidth = 330 };
+    private readonly ComboBox _trainingPreviewModelA = new() { Width = 230, DisplayMemberPath = "DisplayName", Margin = new Thickness(0, 0, 10, 0) };
+    private readonly ComboBox _trainingPreviewModelB = new() { Width = 230, DisplayMemberPath = "DisplayName", Margin = new Thickness(0, 0, 10, 0) };
+    private readonly Button _generateTrainingPreviewsButton = new() { Content = "生成 A/B 试听", Padding = new Thickness(14, 8, 14, 8) };
+    private readonly Button _playTrainingOriginalButton = new() { Content = "播放原声", Padding = new Thickness(12, 7, 12, 7), IsEnabled = false };
+    private readonly Button _playTrainingAButton = new() { Content = "播放 A", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
+    private readonly Button _playTrainingBButton = new() { Content = "播放 B", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
+    private readonly TextBlock _trainingPreviewStatus = new() { Text = "选择固定测试音频与两个可用模型", TextWrapping = TextWrapping.Wrap };
+    private readonly MediaPlayer _trainingPreviewPlayer = new();
+    private string? _trainingPreviewAPath;
+    private string? _trainingPreviewBPath;
 
     public MainWindow()
     {
@@ -123,6 +134,7 @@ public partial class MainWindow : Window
             StopTrainingProcess();
             StopModelTransfer();
             ReleaseSoundboardHotkeys();
+            _trainingPreviewPlayer.Close();
         };
     }
 
@@ -324,6 +336,7 @@ public partial class MainWindow : Window
         var selected = _models.FirstOrDefault(model => model.Id == _settings.SelectedModelId && model.IsUsable)
             ?? usable.FirstOrDefault();
         SelectModel(selected, persist: false);
+        RefreshTrainingPreviewModels(usable);
     }
 
     private async Task RefreshDoctorAsync()
@@ -528,11 +541,16 @@ public partial class MainWindow : Window
         _importTrainingButton.Click += async (_, _) => await ImportTrainingOutputsAsync();
         _browseTrainingDatasetButton.Click += (_, _) => BrowseTrainingDataset();
         _startTrainingButton.Click += async (_, _) => await RunNativeTrainingAsync();
+        _generateTrainingPreviewsButton.Click += async (_, _) => await GenerateTrainingPreviewsAsync();
+        _playTrainingOriginalButton.Click += (_, _) => PlayTrainingPreview(_settings.TrainingValidationAudioPath, false);
+        _playTrainingAButton.Click += (_, _) => PlayTrainingPreview(_trainingPreviewAPath, true);
+        _playTrainingBButton.Click += (_, _) => PlayTrainingPreview(_trainingPreviewBPath, true);
+        _trainingValidationAudio.Text = _settings.TrainingValidationAudioPath;
         TrainingView.Children.Clear();
         var root = new StackPanel { Margin = new Thickness(28, 26, 28, 26) };
         root.Children.Add(new TextBlock { Text = "MODEL TRAINING", Style = (Style)FindResource("Eyebrow") });
         root.Children.Add(new TextBlock { Text = "模型训练", Style = (Style)FindResource("SectionTitle") });
-        var card = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 18, 0, 14), Padding = new Thickness(20) };
+        var card = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 14, 0, 14), Padding = new Thickness(20) };
         var content = new StackPanel();
         content.Children.Add(new TextBlock { Text = "隔离训练组件", FontSize = 18, FontWeight = FontWeights.SemiBold });
         content.Children.Add(new TextBlock
@@ -578,6 +596,33 @@ public partial class MainWindow : Window
         progressCard.Child = progressContent;
         content.Children.Add(progressCard);
         card.Child = content;
+        var previewCard = new Border { Style = (Style)FindResource("Panel"), Margin = new Thickness(0, 0, 0, 14), Padding = new Thickness(20) };
+        var previewContent = new StackPanel();
+        previewContent.Children.Add(new TextBlock { Text = "固定测试音频 · A/B 试听", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        previewContent.Children.Add(new TextBlock { Text = "使用同一段音频和相同参数比较两个训练检查点；切换 A/B 时保持播放位置。", Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 14) });
+        var validationRow = new WrapPanel();
+        validationRow.Children.Add(_trainingValidationAudio);
+        var chooseValidation = new Button { Content = "选择测试音频", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(8, 0, 0, 0) };
+        chooseValidation.Click += ChooseTrainingValidationAudio_Click;
+        validationRow.Children.Add(chooseValidation);
+        previewContent.Children.Add(validationRow);
+        var modelRow = new WrapPanel { Margin = new Thickness(0, 12, 0, 0) };
+        modelRow.Children.Add(new TextBlock { Text = "A", VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 7, 0) });
+        modelRow.Children.Add(_trainingPreviewModelA);
+        modelRow.Children.Add(new TextBlock { Text = "B", VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 7, 0) });
+        modelRow.Children.Add(_trainingPreviewModelB);
+        modelRow.Children.Add(_generateTrainingPreviewsButton);
+        previewContent.Children.Add(modelRow);
+        var playRow = new WrapPanel { Margin = new Thickness(0, 12, 0, 0) };
+        playRow.Children.Add(_playTrainingOriginalButton);
+        playRow.Children.Add(_playTrainingAButton);
+        playRow.Children.Add(_playTrainingBButton);
+        previewContent.Children.Add(playRow);
+        _trainingPreviewStatus.Foreground = (Brush)FindResource("TextSecondary");
+        _trainingPreviewStatus.Margin = new Thickness(0, 10, 0, 0);
+        previewContent.Children.Add(_trainingPreviewStatus);
+        previewCard.Child = previewContent;
+        root.Children.Add(previewCard);
         root.Children.Add(card);
         root.Children.Add(new TextBlock
         {
@@ -610,6 +655,94 @@ public partial class MainWindow : Window
         _launchTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
         _importTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
         _startTrainingButton.IsEnabled = ready && _trainingProcess is not { HasExited: false };
+    }
+
+    private void RefreshTrainingPreviewModels(IReadOnlyList<ModelItem> usable)
+    {
+        var selectedA = (_trainingPreviewModelA.SelectedItem as ModelItem)?.Id;
+        var selectedB = (_trainingPreviewModelB.SelectedItem as ModelItem)?.Id;
+        _trainingPreviewModelA.ItemsSource = usable;
+        _trainingPreviewModelB.ItemsSource = usable;
+        _trainingPreviewModelA.SelectedItem = usable.FirstOrDefault(model => model.Id == selectedA) ?? usable.FirstOrDefault();
+        _trainingPreviewModelB.SelectedItem = usable.FirstOrDefault(model => model.Id == selectedB) ?? usable.Skip(1).FirstOrDefault() ?? usable.FirstOrDefault();
+        _generateTrainingPreviewsButton.IsEnabled = usable.Count > 0 && File.Exists(_settings.TrainingValidationAudioPath);
+        _playTrainingOriginalButton.IsEnabled = File.Exists(_settings.TrainingValidationAudioPath);
+    }
+
+    private void ChooseTrainingValidationAudio_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择固定测试音频",
+            Filter = "支持的音频 (*.wav;*.flac;*.mp3;*.ogg)|*.wav;*.flac;*.mp3;*.ogg"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        _settings.TrainingValidationAudioPath = dialog.FileName;
+        _trainingValidationAudio.Text = dialog.FileName;
+        _trainingPreviewAPath = null;
+        _trainingPreviewBPath = null;
+        _playTrainingOriginalButton.IsEnabled = true;
+        _playTrainingAButton.IsEnabled = false;
+        _playTrainingBButton.IsEnabled = false;
+        _generateTrainingPreviewsButton.IsEnabled = _trainingPreviewModelA.Items.Count > 0;
+        _trainingPreviewStatus.Text = "测试音频已固定；请选择 A/B 模型并生成试听";
+        TrySaveSettings();
+    }
+
+    private async Task GenerateTrainingPreviewsAsync()
+    {
+        if (RejectHeavyWorkDuringGame("训练检查点试听")) return;
+        if (_audioProcess is { HasExited: false }) { _trainingPreviewStatus.Text = "请先停止实时变声"; return; }
+        if (_trainingPreviewModelA.SelectedItem is not ModelItem modelA || _trainingPreviewModelB.SelectedItem is not ModelItem modelB)
+        { _trainingPreviewStatus.Text = "请选择两个可用的 ONNX 模型"; return; }
+        if (!File.Exists(_settings.TrainingValidationAudioPath) || !File.Exists(EmbedderPath.Text) || !File.Exists(F0Path.Text))
+        { _trainingPreviewStatus.Text = "请先选择测试音频并安装 ContentVec 与 RMVPE"; return; }
+
+        _generateTrainingPreviewsButton.IsEnabled = false;
+        _playTrainingAButton.IsEnabled = false;
+        _playTrainingBButton.IsEnabled = false;
+        try
+        {
+            var previewRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FoxVoice", "training-previews");
+            Directory.CreateDirectory(previewRoot);
+            _trainingPreviewStatus.Text = $"正在生成 A：{modelA.DisplayName}";
+            await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Render);
+            _trainingPreviewAPath = await GenerateTrainingPreviewAsync(modelA, Path.Combine(previewRoot, $"A-{modelA.Hash[..Math.Min(12, modelA.Hash.Length)]}.wav"));
+            _trainingPreviewStatus.Text = $"正在生成 B：{modelB.DisplayName}";
+            await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Render);
+            _trainingPreviewBPath = await GenerateTrainingPreviewAsync(modelB, Path.Combine(previewRoot, $"B-{modelB.Hash[..Math.Min(12, modelB.Hash.Length)]}.wav"));
+            _playTrainingAButton.IsEnabled = true;
+            _playTrainingBButton.IsEnabled = true;
+            _trainingPreviewStatus.Text = $"试听已就绪：A {modelA.DisplayName} ↔ B {modelB.DisplayName}";
+        }
+        catch (Exception error) { _trainingPreviewStatus.Text = $"试听生成失败：{FriendlyError(error)}"; }
+        finally { _generateTrainingPreviewsButton.IsEnabled = true; }
+    }
+
+    private async Task<string> GenerateTrainingPreviewAsync(ModelItem model, string outputPath)
+    {
+        using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", model.Id));
+        var modelPath = resolved.RootElement.GetProperty("path").GetString() ?? throw new InvalidOperationException("模型路径解析失败");
+        var arguments = new List<string>
+        {
+            "convert-audio", "--input", _settings.TrainingValidationAudioPath, "--output", outputPath,
+            "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text,
+            "--pitch", PitchSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "--protect", ProtectSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+        if (F0SmoothingToggle.IsChecked == true) arguments.Add("--f0-smoothing");
+        await RunEngineCommandAsync(arguments.ToArray());
+        return outputPath;
+    }
+
+    private void PlayTrainingPreview(string? path, bool preservePosition)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
+        var position = preservePosition ? _trainingPreviewPlayer.Position : TimeSpan.Zero;
+        _trainingPreviewPlayer.Close();
+        _trainingPreviewPlayer.Open(new Uri(path, UriKind.Absolute));
+        _trainingPreviewPlayer.Position = position;
+        _trainingPreviewPlayer.Play();
     }
 
     private async Task InstallTrainingAsync(string backend)

@@ -26,6 +26,7 @@ internal sealed class UserSettings
     public Dictionary<string, string> SoundboardGroups { get; set; } = [];
     public List<string> SoundboardLoopFiles { get; set; } = [];
     public double SoundboardGainDb { get; set; } = -3;
+    public string TrainingValidationAudioPath { get; set; } = "";
 
     private static string SettingsPath
     {
