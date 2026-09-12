@@ -1,66 +1,95 @@
 # 狐声 FoxVoice
 
-面向 Windows 11 x64 的本地实时 RVC 变声器。仓库包含 Windows 桌面程序、Rust 原生音频
-监督层、模型库、硬件/推理后端检测以及产品工作台站点。
+一款面向 Windows 11 的本地实时 RVC 变声器。FoxVoice 使用 WPF 构建桌面界面，使用 Rust
+运行音频、模型管理和推理任务；声音与模型默认留在本机，不依赖云端推理服务。
 
-## 当前能力
+> 当前版本：`0.3.0`。项目仍处于早期开发阶段，请先在非关键语音场景中测试设备路由和模型效果。
 
-- WASAPI 麦克风与输出设备枚举；
-- 独立原生进程运行安全旁路并持续报告音频指标；
-- `.onnx`、`.pth`、`.index` 模型导入、SHA-256 去重和可恢复删除；
-- Hugging Face `resolve` URL 流式下载、域名/HTTPS/体积限制和下载后结构校验；
-- 使用固定 `vc-core` commit 验证 RVC ONNX 输入输出结构；
-- 硬件后端推荐与游戏压力降级状态机；
-- WPF 桌面工作台：诊断、设备、模型库、旁路启停和实时指标；
-- 组件中心可按需安装 ContentVec 与 RMVPE：下载前展示 GPL-3.0，下载后强制校验文件长度与 SHA-256，并自动写入 RVC 路径；
-- 检测 VB-CABLE 并链接到官方安装说明；主输出选择虚拟声卡后，可用独立低优先级进程监听到物理耳机，监听故障不终止游戏语音主链路；
-- 游戏保护根据每秒真实处理耗时、输出欠载和流错误进入观察稳定档，持续超载时通过无重载原子开关切入保声旁路，稳定后恢复 RVC；前台全屏/无边框应用检测还会预先进入稳定观察并暂停新后台重任务；
-- 设置页提供不占用音频设备的 RVC 三模型自检：在 WindowsML/DirectML 上加载 Generator、ContentVec、RMVPE，完成预热及 20 帧合成并报告平均、P95、P99和最大耗时；命令行可扩展到1000帧；
-- Hugging Face 输入框同时接受单文件 `resolve` 地址和仓库/分支地址；仓库会列出可导入文件供选择，下载支持取消、稳定临时文件与 HTTP Range 续传，并自动探测显式环境代理或本机 7897/7890 代理；游戏出现时自动暂停下载；
-- 空闲时每 10 秒刷新 WASAPI 设备；运行中设备丢失由引擎错误隔离触发重新枚举，并恢复到当前默认设备的安全旁路；
-- 音效板支持最多 24 个 PCM/Float WAV、独立增益、重采样、当前主输出共享混音以及前 8 个音效的系统级 `Ctrl+Alt+F1…F8` 热键；每次播放使用低优先级隔离进程；
-- 模型库可把 PCM/Float WAV 送入同一 RVC 三模型管线离线转换，支持音高设置、单声道下混、重采样和临时文件提交；转换时不会占用麦克风或实时音频设备；
-- 模型库为每个模型保存可编辑的名称、作者、许可证与标签；从 ONNX protobuf 只读提取 RVC v1/v2、F0、采样率和 streaming 结构；并记录最近使用时间、最近一次真实推理自检结果和通过的执行后端；旧版 `model.json` 可直接向后兼容读取并自动补扫；
-- 独立 `foxvoice-engine` 进程复用 `vc-app`/`vc-core` 的 RVC、SOLA、重采样和双时钟音频运行时；
-- Windows ML bootstrapper 与再分发许可证经过固定 NuGet SHA-256 后进入发布包和单文件内嵌运行时；NVIDIA RTX 30 系及以上可通过系统 EP 目录按需安装 TensorRT RTX，并以当前三模型真实推理通过后启用；
-- RVC 进程异常退出后刷新设备并自动回退到默认设备安全旁路；
-- 自动安装开发依赖，生成无需 .NET/Rust 的自包含 Windows 发布目录。
-- 生成无需管理员权限的单文件 `FoxVoiceSetup.exe`：内嵌并逐文件校验发布负载，支持当前用户安装、修复、升级、上一版回滚和保留用户模型的卸载；
-- 模型训练页可按需安装固定版本的官方 RVC 训练源代码、Python 3.12、FFmpeg、隔离 venv、CPU/CUDA PyTorch 和训练基础权重；安装可取消，检测到游戏时自动停止并允许稍后续装。
-- 训练环境就绪后可由 FoxVoice 启动/停止本机官方训练工作台；生成的 `.pth` 与 `.index` 可批量经过 FoxVoice 哈希、去重和格式门禁导入模型库。
+## 主要功能
 
-真实 RVC 长稳测试会自动读取当前模型、音频设备和已校验基础模型，默认运行 4 小时并把 P99、预算余量及欠载/溢出写入 `artifacts/stress-reports`：
+- WASAPI 实时麦克风输入和虚拟声卡输出；
+- 标准 RVC v2 F0 ONNX 实时推理，支持 ContentVec、RMVPE 和 Generator 三模型自检；
+- 本地及 Hugging Face 模型导入、SHA-256 去重、授权确认和可恢复删除；
+- 每模型独立保存音高、索引混合率、清辅音保护和 F0 平滑设置；
+- `.index` 特征检索、离线 WAV 转换和音效板混音；
+- DirectML/Windows ML 后端，以及自检通过后启用的可选 TensorRT RTX 后端；
+- 游戏保护：监测处理预算、欠载和流错误，超载时优先保持语音链路连续；
+- 隔离的 RVC v2 训练环境、一键训练、阶段进度和训练结果导入；
+- 自包含便携版和当前用户安装器，支持升级、修复、回滚与保留模型卸载。
 
-```powershell
-.\scripts\stress-rvc.ps1
+## 快速开始
+
+1. 从 [Releases](https://github.com/ShadowCat2233/FoxVoiceChanger/releases) 下载安装器或便携版。
+2. 安装 [VB-CABLE](https://vb-audio.com/Cable/) 或兼容虚拟音频设备。
+3. FoxVoice 输入选择物理麦克风，主输出选择 `CABLE Input`。
+4. KOOK、Discord 或游戏的麦克风选择 `CABLE Output`。
+5. 在“组件中心”安装并自检 RVC 基础模型。
+6. 导入你有权使用的标准 RVC v2 F0 模型，选择模型后启动变声。
+
+```text
+物理麦克风 → FoxVoice → CABLE Input → CABLE Output → KOOK / Discord / 游戏
+                                      └→ 可选物理耳机监听
 ```
 
-若要重复验证无重载保护档切换，可增加 `-GuardCycleSeconds 60`。该循环用于实验室测试，不会模拟真实 GPU 95% 负载；游戏压力仍需同时运行目标游戏。
+本地监听默认应关闭。需要监听时请选择独立物理耳机，避免重复监听、回声或扬声器啸叫。
 
-桌面端会把 ContentVec、RMVPE 和音频设备选择保存在
-`%LOCALAPPDATA%\FoxVoice\settings.json`。模型文件保存在相邻的 `models` 目录。
+## 模型兼容性
+
+当前主要支持标准 RVC v2 F0 模型。PyTorch `.pth` 检查点需要先转换为兼容 ONNX；模型结构、
+训练数据和音高范围都会影响最终效果。严重失真、辅音破碎或异常音色不一定能通过参数调节修复。
+
+FoxVoice 不附带第三方人物模型。请只使用自行训练、获得明确授权或许可证允许使用的模型与声音素材。
+ContentVec、RMVPE、训练权重和其他外部资产也分别受各自许可证约束。
+
+## 模型训练
+
+训练页可在 `%LOCALAPPDATA%\FoxVoice\training` 安装隔离的 RVC 训练环境，支持 CPU 或 NVIDIA
+CUDA 后端。选择包含 WAV/FLAC 的授权数据集后，程序会执行数据清洗、特征提取、模型训练和索引生成。
+训练任务可停止，已有检查点会保留。
+
+训练会消耗大量磁盘、CPU/GPU 和时间。训练期间不要运行游戏或实时变声；CPU 训练仅适合验证流程，
+正式训练推荐使用兼容的 NVIDIA GPU。
 
 ## 构建
+
+需要 Windows 11 x64、.NET 8 SDK、Rust MSVC 工具链和 Visual Studio C++ Build Tools：
 
 ```powershell
 .\scripts\bootstrap-native.ps1
 .\scripts\build-release.ps1
 ```
 
-成品位于 `artifacts\FoxVoice-win-x64`，运行 `FoxVoice.exe`。发布脚本同时生成可直接分享的
-`FoxVoice-win-x64.zip`、当前用户安装器 `FoxVoiceSetup.exe` 和各自的 `.sha256` 文件。
+发布产物位于 `artifacts/`：便携目录、便携压缩包、当前用户安装器及对应 SHA-256 校验文件。
 
-## 目录
+## 项目结构
 
-- `desktop/`：Windows WPF 桌面应用；
-- `native/`：Rust 音频、IPC、模型与 supervisor；
-- `app/`：交互式产品工作台原型；
-- `docs/`：架构、实施状态和上游集成边界；
-- `scripts/`：依赖引导与发布构建。
-- `setup/`：当前用户安装、修复、升级、回滚和卸载工具；
+- `desktop/`：.NET 8 WPF 桌面应用；
+- `native/`：Rust 音频引擎、模型层、转换器和 supervisor；
+- `setup/`：安装、修复、升级、回滚和卸载程序；
+- `scripts/`：环境引导、测试和发布脚本；
+- `docs/`：架构、实施状态与上游集成说明；
+- `app/`：早期产品界面原型，仅供设计参考。
 
-实时推理需要用户合法取得的 RVC Generator、ContentVec 和 RMVPE 模型。外部权重不随 MIT
-源码自动授权，模型来源、许可证与哈希必须分别记录。
+## 当前限制
 
-基础模型可在“组件中心”由用户明确确认后从上游直接下载。FoxVoice 不重新分发这些权重；
-取消许可确认、下载不完整或哈希不匹配都会终止安装，原文件不会被覆盖。
+- 尚未接入 Seed-VC 独立高质量引擎；
+- 不保证所有社区 RVC 模型都能兼容或获得理想音质；
+- 尚未完成覆盖所有游戏、KOOK/Discord 版本和 GPU 满载场景的系统性验收；
+- TensorRT 仅在依赖、硬件和三模型真实推理自检全部通过后启用；
+- Windows 原生环境不提供 AMD ROCm 训练后端。
+
+## 隐私与安全
+
+实时音频、模型和训练数据默认只在本机处理。设置保存在 `%LOCALAPPDATA%\FoxVoice`。Hugging Face
+下载会在导入前进行地址、体积、哈希和模型结构检查。提交问题时请移除用户名、绝对路径、模型哈希及
+无权公开的音频或模型。
+
+## 参与贡献
+
+欢迎通过 Issue 报告问题或提出建议。请附上 FoxVoice 版本、Windows 版本、CPU/GPU、推理后端、
+模型类型、复现步骤和已脱敏的诊断信息。提交代码前请确保构建通过，并保留第三方许可证和来源声明。
+
+## 开源许可
+
+FoxVoice 自有代码采用 [MIT License](LICENSE) 开源。第三方组件及可选下载内容不自动适用本项目许可，
+详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
