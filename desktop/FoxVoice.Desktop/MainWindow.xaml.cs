@@ -66,7 +66,7 @@ public partial class MainWindow : Window
     private readonly TextBlock _trainingStateText = new() { Text = "检测中", TextWrapping = TextWrapping.Wrap };
     private readonly Button _installCudaTrainingButton = new() { Content = "安装 NVIDIA CUDA 训练环境", Padding = new Thickness(14, 8, 14, 8) };
     private readonly Button _installCpuTrainingButton = new() { Content = "安装 CPU 训练环境", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0) };
-    private readonly Button _cancelTrainingButton = new() { Content = "取消安装", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
+    private readonly Button _cancelTrainingButton = new() { Content = "停止当前任务", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
     private readonly Button _launchTrainingButton = new() { Content = "打开训练工作台", Padding = new Thickness(14, 8, 14, 8), IsEnabled = false };
     private readonly Button _importTrainingButton = new() { Content = "导入训练结果", Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
     private readonly TextBox _trainingDatasetText = new() { MinWidth = 360 };
@@ -75,6 +75,9 @@ public partial class MainWindow : Window
     private readonly TextBox _trainingBatchText = new() { Text = "4", Width = 70 };
     private readonly Button _browseTrainingDatasetButton = new() { Content = "选择数据集", Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(8, 0, 0, 0) };
     private readonly Button _startTrainingButton = new() { Content = "开始一键训练", Padding = new Thickness(14, 8, 14, 8), IsEnabled = false };
+    private readonly TextBlock _trainingDatasetSummary = new() { Text = "请选择包含 WAV 或 FLAC 的文件夹", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _trainingProgressText = new() { Text = "等待任务", FontWeight = FontWeights.SemiBold };
+    private readonly ProgressBar _trainingProgress = new() { Minimum = 0, Maximum = 100, Height = 7, Margin = new Thickness(0, 8, 0, 0), Foreground = new SolidColorBrush(Color.FromRgb(46, 226, 247)), Background = new SolidColorBrush(Color.FromRgb(38, 48, 64)) };
 
     public MainWindow()
     {
@@ -538,7 +541,7 @@ public partial class MainWindow : Window
             Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 7, 0, 14)
         });
         content.Children.Add(_trainingStateText);
-        var actions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 16, 0, 0) };
+        var actions = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) };
         actions.Children.Add(_installCudaTrainingButton);
         actions.Children.Add(_installCpuTrainingButton);
         actions.Children.Add(_cancelTrainingButton);
@@ -549,7 +552,10 @@ public partial class MainWindow : Window
         datasetRow.Children.Add(_trainingDatasetText);
         datasetRow.Children.Add(_browseTrainingDatasetButton);
         content.Children.Add(datasetRow);
-        var parameters = new StackPanel { Orientation = Orientation.Horizontal };
+        _trainingDatasetSummary.Foreground = (Brush)FindResource("TextSecondary");
+        _trainingDatasetSummary.Margin = new Thickness(0, 0, 0, 12);
+        content.Children.Add(_trainingDatasetSummary);
+        var parameters = new WrapPanel();
         parameters.Children.Add(new TextBlock { Text = "名称", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 7, 0) });
         parameters.Children.Add(_trainingNameText);
         parameters.Children.Add(new TextBlock { Text = "轮数", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
@@ -557,13 +563,20 @@ public partial class MainWindow : Window
         parameters.Children.Add(new TextBlock { Text = "批大小", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
         parameters.Children.Add(_trainingBatchText);
         content.Children.Add(parameters);
-        var nativeActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+        var nativeActions = new WrapPanel { Margin = new Thickness(0, 12, 0, 0) };
         nativeActions.Children.Add(_startTrainingButton);
         content.Children.Add(nativeActions);
-        var workbenchActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+        var workbenchActions = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
         workbenchActions.Children.Add(_launchTrainingButton);
         workbenchActions.Children.Add(_importTrainingButton);
         content.Children.Add(workbenchActions);
+        var progressCard = new Border { Background = new SolidColorBrush(Color.FromRgb(16, 27, 39)), BorderBrush = new SolidColorBrush(Color.FromRgb(35, 68, 63)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(14), Margin = new Thickness(0, 18, 0, 0) };
+        var progressContent = new StackPanel();
+        progressContent.Children.Add(_trainingProgressText);
+        progressContent.Children.Add(_trainingProgress);
+        progressContent.Children.Add(new TextBlock { Text = "数据清洗 → 特征提取 → 模型训练 → 生成索引", Foreground = (Brush)FindResource("TextSecondary"), FontSize = 11, Margin = new Thickness(0, 7, 0, 0) });
+        progressCard.Child = progressContent;
+        content.Children.Add(progressCard);
         card.Child = content;
         root.Children.Add(card);
         root.Children.Add(new TextBlock
@@ -618,6 +631,8 @@ public partial class MainWindow : Window
         };
         _trainingProcess = process;
         SetTrainingButtons(true);
+        _trainingProgressText.Text = $"正在安装 {label} 训练环境";
+        _trainingProgress.IsIndeterminate = true;
         try
         {
             process.Start();
@@ -644,6 +659,7 @@ public partial class MainWindow : Window
         {
             if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
             process.Dispose();
+            _trainingProgress.IsIndeterminate = false;
             SetTrainingButtons(false);
         }
     }
@@ -656,6 +672,8 @@ public partial class MainWindow : Window
         {
             try { process.Kill(entireProcessTree: true); } catch { }
         }
+        _trainingProgress.IsIndeterminate = false;
+        _trainingProgressText.Text = "任务已停止，已有检查点会保留";
         SetTrainingButtons(false);
     }
 
@@ -673,7 +691,46 @@ public partial class MainWindow : Window
     private void BrowseTrainingDataset()
     {
         var dialog = new OpenFolderDialog { Title = T("选择已获授权的训练音频目录"), Multiselect = false };
-        if (dialog.ShowDialog(this) == true) _trainingDatasetText.Text = dialog.FolderName;
+        if (dialog.ShowDialog(this) == true)
+        {
+            _trainingDatasetText.Text = dialog.FolderName;
+            UpdateTrainingDatasetSummary(dialog.FolderName);
+        }
+    }
+
+    private void UpdateTrainingDatasetSummary(string dataset)
+    {
+        try
+        {
+            var files = Directory.EnumerateFiles(dataset, "*", SearchOption.AllDirectories)
+                .Where(path => Path.GetExtension(path).Equals(".wav", StringComparison.OrdinalIgnoreCase)
+                    || Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase))
+                .Take(10001).ToList();
+            var bytes = files.Sum(path => new FileInfo(path).Length);
+            _trainingDatasetSummary.Text = files.Count == 0
+                ? "未找到可训练的 WAV/FLAC 音频"
+                : $"已找到 {(files.Count > 10000 ? "10000+" : files.Count)} 个音频 · 约 {bytes / 1024d / 1024d:F1} MB";
+            _trainingDatasetSummary.Foreground = files.Count == 0
+                ? new SolidColorBrush(Color.FromRgb(249, 200, 106))
+                : (Brush)FindResource("SuccessBrush");
+        }
+        catch (Exception)
+        {
+            _trainingDatasetSummary.Text = "无法读取该文件夹，请检查访问权限";
+            _trainingDatasetSummary.Foreground = new SolidColorBrush(Color.FromRgb(249, 200, 106));
+        }
+    }
+
+    private void UpdateTrainingStage(string stage)
+    {
+        _trainingProgress.IsIndeterminate = false;
+        _trainingProgressText.Text = stage;
+        _trainingProgress.Value = stage.StartsWith("1/4", StringComparison.Ordinal) ? 10
+            : stage.StartsWith("2/4", StringComparison.Ordinal) ? 30
+            : stage.StartsWith("3/4", StringComparison.Ordinal) ? 55
+            : stage.StartsWith("4/4", StringComparison.Ordinal) ? 85
+            : stage.Contains("完成", StringComparison.Ordinal) ? 100 : _trainingProgress.Value;
+        FooterStatus.Text = stage;
     }
 
     private async Task RunNativeTrainingAsync()
@@ -683,6 +740,8 @@ public partial class MainWindow : Window
         var dataset = _trainingDatasetText.Text.Trim();
         var name = _trainingNameText.Text.Trim();
         if (!Directory.Exists(dataset)) { FooterStatus.Text = "请选择有效的训练数据集目录"; return; }
+        var hasAudio = Directory.EnumerateFiles(dataset, "*", SearchOption.AllDirectories).Any(path => Path.GetExtension(path).Equals(".wav", StringComparison.OrdinalIgnoreCase) || Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase));
+        if (!hasAudio) { FooterStatus.Text = "数据集中没有找到 WAV 或 FLAC 音频"; UpdateTrainingDatasetSummary(dataset); return; }
         if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[A-Za-z0-9_-]{1,64}$")) { FooterStatus.Text = "实验名称只能包含英文、数字、下划线或连字符"; return; }
         if (!ushort.TryParse(_trainingEpochsText.Text, out var epochs) || epochs is < 1 or > 1200) { FooterStatus.Text = "训练轮数必须为 1-1200"; return; }
         if (!byte.TryParse(_trainingBatchText.Text, out var batch) || batch is < 1 or > 64) { FooterStatus.Text = "批大小必须为 1-64"; return; }
@@ -696,6 +755,8 @@ public partial class MainWindow : Window
         };
         _trainingProcess = process;
         SetTrainingButtons(true);
+        _trainingProgress.Value = 2;
+        _trainingProgressText.Text = "正在准备训练任务";
         var lastError = "";
         try
         {
@@ -706,12 +767,12 @@ public partial class MainWindow : Window
             {
                 lastError = line;
                 if (line.StartsWith("FOXVOICE_TRAINING_STAGE="))
-                    FooterStatus.Text = line["FOXVOICE_TRAINING_STAGE=".Length..];
+                    UpdateTrainingStage(line["FOXVOICE_TRAINING_STAGE=".Length..]);
             }
             await process.WaitForExitAsync();
             await outputTask;
             if (process.ExitCode != 0) throw new InvalidOperationException(lastError.Length == 0 ? "训练任务失败" : lastError);
-            FooterStatus.Text = "训练完成；正在导入输出模型";
+            UpdateTrainingStage("训练完成；正在导入输出模型");
             await ImportTrainingOutputsAsync(confirm: false);
         }
         catch (Exception) when (!ReferenceEquals(_trainingProcess, process)) { FooterStatus.Text = "训练已停止；已有检查点未删除"; }
@@ -735,6 +796,8 @@ public partial class MainWindow : Window
         };
         _trainingProcess = process;
         SetTrainingButtons(true);
+        _trainingProgressText.Text = "训练工作台正在启动";
+        _trainingProgress.IsIndeterminate = true;
         var lastError = "";
         process.ErrorDataReceived += (_, args) =>
         {
@@ -774,6 +837,7 @@ public partial class MainWindow : Window
         {
             if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
             process.Dispose();
+            _trainingProgress.IsIndeterminate = false;
             SetTrainingButtons(false);
         }
     }
