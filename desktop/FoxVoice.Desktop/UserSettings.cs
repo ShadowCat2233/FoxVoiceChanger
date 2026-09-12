@@ -12,6 +12,8 @@ internal sealed class UserSettings
     public string OutputDevice { get; set; } = "";
     public string MonitorOutputDevice { get; set; } = "";
     public string SelectedModelId { get; set; } = "";
+    public string FeatureIndexPath { get; set; } = "";
+    public double IndexRate { get; set; } = 0.75;
     public double Pitch { get; set; }
     public double OutputGainDb { get; set; }
     public bool NoiseGateEnabled { get; set; }

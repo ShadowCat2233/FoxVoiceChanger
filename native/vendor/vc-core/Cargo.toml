@@ -1,0 +1,83 @@
+[package]
+name = "vc-core"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "Reusable RVC voice conversion pipeline (model_rvc, dsp, sola)"
+# Declares the native TensorRT shim as a linked native lib so the detected
+# nvinfer/CUDA major versions propagate to dependent build scripts as
+# DEP_VC_RS_NATIVE_TENSORRT_* env vars (used to emit /DELAYLOAD link args).
+links = "vc_rs_native_tensorrt"
+
+[features]
+# Enables `clap::ValueEnum` derivation on shared config enums (e.g. `Provider`)
+# so the CLI can use them directly as `value_enum` args. Plugins leave it off.
+clap = ["dep:clap"]
+# Enables the ONNX Runtime backend: the CPU execution provider (`Provider::Cpu`)
+# and all ORT-based inference. Pulls in the `ort` dependency. A TensorRT-only
+# build leaves this off and drops ORT entirely, so ORT and TensorRT can never
+# share a process. Structural model inspection uses the dependency-free
+# `onnx_meta` reader instead of an ORT session, so it works without this feature.
+ort = ["dep:ort"]
+# Enables native TensorRT support. This deliberately does not enable ONNX
+# Runtime's TensorRT EP; `Provider::TensorRt` builds serialized engines through
+# TensorRT's builder API and runs them through the native shim. Needs no ORT.
+tensorrt = ["dep:libloading"]
+# Enables ONNX Runtime's CUDA execution provider (`Provider::Cuda`). Implies the
+# `ort` backend. Off by default so a TensorRT-only build can drop the large CUDA
+# EP binaries. When disabled, selecting `Provider::Cuda` fails with a clear error.
+cuda = ["ort", "ort/cuda", "dep:libloading"]
+# Enables Windows ML providers. On Windows this bootstraps Windows App SDK
+# Runtime 2.1+ and dynamically loads its shared ONNX Runtime + DirectML binaries,
+# reducing redistributed DLL size. Keep ORT API 24 compatible with this floor;
+# the workspace dependency must not enable a newer API through default features.
+windowsml = ["ort", "ort/load-dynamic", "ort/api-24", "ort/directml"]
+# Pure-Rust RNNoise-compatible input denoising. Kept optional so package-scoped
+# VST3 builds do not compile or ship the standalone denoiser.
+rnnoise = ["dep:nnnoiseless"]
+# GTCRN ultra-light (≈48 K params) input denoiser at 16 kHz. We own the
+# STFT/iSTFT (pure-Rust `realfft`, DSP-only — no `ndarray`, no git pin); the
+# streaming graph is backend-swappable: ORT CPU when the `ort` feature is present,
+# native TensorRT when `tensorrt` is present. VST3 deliberately does not expose
+# this feature.
+gtcrn = ["dep:realfft"]
+
+[dependencies]
+anyhow = "1.0"
+tracing = "0.1"
+rubato = "5"
+libloading = { version = "0.8", optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "preload-dylibs", "api-24"], optional = true }
+xxhash-rust = { version = "0.8.15", default-features = false, features = ["xxh3"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
+nnnoiseless = { version = "0.5.2", default-features = false, optional = true }
+# STFT/iSTFT for the GTCRN denoiser. Pinned exactly: this is an audio-quality
+# dependency whose FFT planning must not drift under us, and the plan requires a
+# fixed rev cleared via cargo-about/cargo-deny. Pure Rust (wraps `rustfft`), no
+# `ndarray`, no git source.
+realfft = { version = "=3.5.0", optional = true }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+approx = "0.5"
+vc-convert = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", features = ["test-fixtures"] }
+# The .pth→.onnx converter, tested here against the real onnx_meta gatekeepers
+# (round-trip) and ORT CPU (streaming phase contract). Dev-only: nothing shipped
+# links it, and `test-fixtures` merely exposes the tiny checked-in checkpoints.
+# Microbenchmark harness for the CPU hot paths (dsp/sola). Dev-only, so it never
+# ships in a distribution build. Pure-CPU benches don't enable the `tensorrt`
+# feature, so build.rs never compiles the native shim — `cargo bench -p vc-core`
+# needs no GPU stack.
+divan = "0.1"
+
+# Microbenchmarks for the vc-core CPU hot paths (resample, RMS, SOLA/PSOLA join,
+# noise gate). `harness = false` hands the binary to divan's own runner.
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "fixed_resample"
+harness = false

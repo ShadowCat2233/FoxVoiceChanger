@@ -1345,11 +1345,14 @@ public partial class MainWindow : Window
             using var resolved = JsonDocument.Parse(await RunSupervisorAsync("models", "resolve", _selectedModel.Id));
             var modelPath = resolved.RootElement.GetProperty("path").GetString()
                 ?? throw new InvalidOperationException("模型路径解析失败");
-            using var result = JsonDocument.Parse(await RunEngineCommandAsync(
+            var convertArguments = new List<string> {
                 "convert-audio", "--input", inputDialog.FileName, "--output", outputDialog.FileName,
                 "--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text,
                 "--pitch", PitchSlider.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                "--start-ms", trim.StartMs.ToString(), "--end-ms", trim.EndMs.ToString()));
+                "--start-ms", trim.StartMs.ToString(), "--end-ms", trim.EndMs.ToString()
+            };
+            AddFeatureIndexArguments(convertArguments);
+            using var result = JsonDocument.Parse(await RunEngineCommandAsync(convertArguments.ToArray()));
             var elapsed = result.RootElement.GetProperty("elapsedMs").GetDouble();
             FooterStatus.Text = $"离线转换完成：{Path.GetFileName(outputDialog.FileName)}（{elapsed / 1000:N1} 秒）";
             if (MessageBox.Show(this, T("转换完成。是否立即试听结果？"), T("离线转换"), MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
@@ -1527,6 +1530,7 @@ public partial class MainWindow : Window
                 ?? throw new InvalidOperationException("模型路径解析失败");
             var arguments = BuildEngineArguments("rvc");
             arguments.AddRange(["--model", modelPath, "--embedder", EmbedderPath.Text, "--f0", F0Path.Text]);
+            AddFeatureIndexArguments(arguments);
             TrySaveSettings();
             StartAudioProcess(arguments.ToArray());
         }
@@ -1552,6 +1556,15 @@ public partial class MainWindow : Window
         if (InputDeviceCombo.SelectedItem is AudioDevice input) arguments.AddRange(["--input", input.Name]);
         if (OutputDeviceCombo.SelectedItem is AudioDevice output) arguments.AddRange(["--output", output.Name]);
         return arguments;
+    }
+
+    private void AddFeatureIndexArguments(List<string> arguments)
+    {
+        if (!File.Exists(_settings.FeatureIndexPath)) return;
+        arguments.AddRange([
+            "--index", _settings.FeatureIndexPath,
+            "--index-rate", _settings.IndexRate.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
+        ]);
     }
 
     private void StartAudioProcess(params string[] arguments)

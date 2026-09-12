@@ -17,7 +17,7 @@ asio = ["cpal/asio"]
 jack = ["cpal/jack"]
 
 [dependencies]
-vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895", default-features = false }
+vc-core = { path = "../vc-core", default-features = false }
 anyhow = "1.0.99"
 tracing = "0.1.41"
 cpal = { version = "0.18.2", features = ["realtime"] }

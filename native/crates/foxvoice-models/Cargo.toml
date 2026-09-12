@@ -12,7 +12,7 @@ serde_json.workspace = true
 sha2.workspace = true
 ureq = "3.4.1"
 url = "2.5.7"
-vc-core = { git = "https://github.com/shirohata/vc-rs.git", rev = "2c3b57661c4a38f56e64c521a71e65dc68db5895" }
+vc-core = { path = "../../vendor/vc-core" }
 
 [dev-dependencies]
 tempfile = "3.23.0"

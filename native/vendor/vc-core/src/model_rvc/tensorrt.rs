@@ -1,0 +1,1701 @@
+use std::env;
+#[cfg(feature = "ort")]
+use std::ffi::CString;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "ort")]
+use std::time::Instant;
+
+use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "ort")]
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+#[cfg(feature = "ort")]
+use ort::session::{IoBinding, Session};
+#[cfg(feature = "ort")]
+use ort::value::Tensor;
+#[cfg(feature = "ort")]
+use ort::{ortsys, AsPointer};
+#[cfg(feature = "ort")]
+use tracing::info;
+use tracing::warn;
+
+use crate::Provider;
+
+use super::onnx_meta::RvcIoNames;
+#[cfg(feature = "ort")]
+use super::sessions::HubertEmbedderSession;
+use super::shape::onnx_silence_front_feature_frames;
+
+// Fixed-shape GPU bindings are intentionally model-worker state, not audio callback state.
+// Keep CUDA Graph tensor addresses stable for each session; do not allocate or re-bind them on chunk runs.
+
+pub(super) const TENSORRT_CACHE_DIR_ENV: &str = "VC_RS_TENSORRT_CACHE_DIR";
+pub(super) const TENSORRT_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+pub(super) const CUDA_GRAPH_ENV: &str = "VC_RS_CUDA_GRAPH";
+pub(super) const CPU_ONNX_INTRA_THREADS: usize = 4;
+pub(super) const CPU_ONNX_INTER_THREADS: usize = 4;
+
+// These benchmark profiles intentionally match the trtexec-validated static
+// shapes from the original TensorRT investigation. Normal pipeline execution
+// derives exact profiles from chunk settings instead; do not mix the two
+// casually because CUDA graph capture and engine cache reuse depend on stable
+// input dimensions.
+#[cfg(test)]
+pub(super) const CONTENTVEC_AUDIO_DIMS: &[usize] = &[1, 24_000];
+#[cfg(test)]
+pub(super) const RMVPE_WAVEFORM_DIMS: &[usize] = &[1, 24_000];
+#[cfg(test)]
+pub(super) const RVC_FEATS_DIMS: &[usize] = &[1, 75, 768];
+#[cfg(test)]
+pub(super) const RVC_PITCH_DIMS: &[usize] = &[1, 75];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TensorRtInputShape {
+    pub(super) name: String,
+    pub(super) dims: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TensorRtSessionProfile {
+    pub(super) role: ModelRole,
+    pub(super) model_cache_key: Option<String>,
+    pub(super) profile_shapes: String,
+    pub(super) fixed_inputs: Vec<TensorRtInputShape>,
+    pub(super) gpu_priority: super::GpuPriority,
+    pub(super) gpu_device_id: u32,
+}
+
+impl TensorRtSessionProfile {
+    pub(super) fn new(role: ModelRole, fixed_inputs: Vec<TensorRtInputShape>) -> Self {
+        let profile_shapes = tensor_rt_profile_shapes(&fixed_inputs);
+        Self {
+            role,
+            model_cache_key: None,
+            profile_shapes,
+            fixed_inputs,
+            gpu_priority: super::GpuPriority::default(),
+            gpu_device_id: 0,
+        }
+    }
+
+    pub(super) fn with_gpu_priority(mut self, gpu_priority: super::GpuPriority) -> Self {
+        self.gpu_priority = gpu_priority;
+        self
+    }
+
+    pub(super) fn with_gpu_device_id(mut self, gpu_device_id: u32) -> Self {
+        self.gpu_device_id = gpu_device_id;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_model_cache_key(mut self, model_cache_key: impl Into<String>) -> Self {
+        self.model_cache_key = Some(model_cache_key.into());
+        self
+    }
+
+    pub(super) fn with_optional_model_cache_key(mut self, model_cache_key: Option<String>) -> Self {
+        self.model_cache_key = model_cache_key;
+        self
+    }
+
+    pub(super) fn single_input(
+        role: ModelRole,
+        input_name: impl Into<String>,
+        samples: usize,
+    ) -> Self {
+        Self::new(
+            role,
+            vec![TensorRtInputShape {
+                name: input_name.into(),
+                dims: vec![1, samples],
+            }],
+        )
+    }
+
+    // Profile/cache and the native builder key the optimization profile by the
+    // model's actual input names, so use the resolved aliases, not the canonical
+    // vcclient `feats`/`pitch`/`pitchf` literals (RVC WebUI and third-party
+    // converter exports name them differently).
+    //
+    // `stream_frame_hop` is `Some(frame_hop)` for a streaming export, which adds
+    // the dynamic NSF source-noise input `nsf_noise` `[1, frames*frame_hop, 1]` to
+    // the optimization profile (`phase_in` is static `[1,1,1]`, so it needs no
+    // profile entry and is added as a scalar at engine load).
+    pub(super) fn rvc(
+        frames: usize,
+        channels: usize,
+        names: &RvcIoNames,
+        stream_frame_hop: Option<usize>,
+    ) -> Self {
+        let mut inputs = vec![
+            TensorRtInputShape {
+                name: names.feats.clone(),
+                dims: vec![1, frames, channels],
+            },
+            TensorRtInputShape {
+                name: names.pitch.clone(),
+                dims: vec![1, frames],
+            },
+            TensorRtInputShape {
+                name: names.pitchf.clone(),
+                dims: vec![1, frames],
+            },
+        ];
+        // Latent-noise input, when the export exposes it: [1, inter_channels,
+        // frames]. Including it in the fixed profile makes the native builder's
+        // optimization profile and the IoBinding shapes agree with the model.
+        if let Some(rnd) = names.rnd.as_ref() {
+            inputs.push(TensorRtInputShape {
+                name: rnd.name.clone(),
+                dims: vec![1, rnd.channels.max(0) as usize, frames],
+            });
+        }
+        // Streaming NSF source noise on the output-sample grid. `audio_len` is
+        // `frames * frame_hop`; it must be in the profile because that axis is
+        // dynamic in the model.
+        if let (Some(frame_hop), Some(nsf_noise)) = (stream_frame_hop, names.nsf_noise.as_ref()) {
+            inputs.push(TensorRtInputShape {
+                name: nsf_noise.clone(),
+                dims: vec![1, frames.saturating_mul(frame_hop), 1],
+            });
+        }
+        Self::new(ModelRole::Rvc, inputs)
+    }
+
+    pub(super) fn cache_dir_from_root(&self, cache_root: &Path) -> Result<PathBuf> {
+        let model_cache_key = self.model_cache_key()?;
+        Ok(cache_root
+            .join(format!("device-{}", self.gpu_device_id))
+            .join(self.role.label())
+            .join(model_cache_key)
+            .join(tensor_rt_cache_key(&self.profile_shapes)))
+    }
+
+    pub(super) fn model_cache_key(&self) -> Result<&str> {
+        self.model_cache_key.as_deref().ok_or_else(|| {
+            anyhow!(
+                "TensorRT cache profile for {} is missing a model cache key",
+                self.role.label()
+            )
+        })
+    }
+
+    pub(super) fn fixed_input_dims(&self, input_name: &str) -> Result<&[usize]> {
+        self.fixed_inputs
+            .iter()
+            .find(|shape| shape.name == input_name)
+            .map(|shape| shape.dims.as_slice())
+            .ok_or_else(|| {
+                anyhow!(
+                    "TensorRT profile for {} does not include input '{input_name}'",
+                    self.role.label()
+                )
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ModelRole {
+    ContentVec,
+    Rmvpe,
+    Rvc,
+    Gtcrn,
+    Inspect,
+}
+
+impl ModelRole {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ModelRole::ContentVec => "contentvec",
+            ModelRole::Rmvpe => "rmvpe",
+            ModelRole::Rvc => "rvc",
+            ModelRole::Gtcrn => "gtcrn",
+            ModelRole::Inspect => "inspect",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TensorRtRunMode {
+    PinnedCpu,
+    DeviceIo,
+    CudaGraph,
+}
+
+impl TensorRtRunMode {
+    pub(super) fn cuda_from_env() -> Self {
+        let value = env::var(CUDA_GRAPH_ENV).ok();
+        let mode = Self::parse_cuda_env(value.as_deref());
+        if let Some(value) = value.as_deref() {
+            if !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no" | "1" | "true" | "on" | "yes"
+            ) {
+                warn!(
+                    "{}={value:?} is not recognized; defaulting CUDA Graph to disabled",
+                    CUDA_GRAPH_ENV
+                );
+            }
+        }
+        mode
+    }
+
+    pub(super) fn parse_cuda_env(value: Option<&str>) -> Self {
+        match value.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes") => Self::CudaGraph,
+            _ => Self::DeviceIo,
+        }
+    }
+
+    pub(super) fn cuda_graph(self) -> bool {
+        matches!(self, Self::CudaGraph)
+    }
+
+    pub(super) fn device_io(self) -> bool {
+        matches!(self, Self::DeviceIo | Self::CudaGraph)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::PinnedCpu => "pinned-cpu-iobinding",
+            Self::DeviceIo => "cuda-device-iobinding",
+            Self::CudaGraph => "cuda-graph-device-iobinding",
+        }
+    }
+
+    pub(super) fn bound_input_memory(self) -> &'static str {
+        match self {
+            Self::PinnedCpu => "CUDA_PINNED/CPUInput",
+            Self::DeviceIo => "CUDA/Default",
+            Self::CudaGraph => "CUDA/Default",
+        }
+    }
+
+    pub(super) fn bound_output_memory(self) -> &'static str {
+        match self {
+            Self::PinnedCpu => "CUDA_PINNED/CPUOutput",
+            Self::DeviceIo => "CUDA/Default",
+            Self::CudaGraph => "CUDA/Default",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TensorRtSessionPurpose {
+    Main,
+    Probe,
+    Final,
+}
+
+impl TensorRtSessionPurpose {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Probe => "probe",
+            Self::Final => "final",
+        }
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct TensorRtWarmupInfo {
+    pub(super) rvc_feature_len: usize,
+    pub(super) contentvec_output_shape: Vec<i64>,
+}
+
+// ContentVec keeps the full fixed 16 kHz context in a pipeline-owned tensor so
+// CUDA Graph replay can bind one stable device address. RMVPE uses its upstream
+// RVC bucket window and therefore owns a separate input binding.
+#[cfg(feature = "ort")]
+pub(super) struct TensorRtSharedWaveform {
+    pub(super) host_waveform: Tensor<f32>,
+    pub(super) device_waveform: Tensor<f32>,
+    pub(super) _host_input_allocator: Allocator,
+    pub(super) _device_allocator: Allocator,
+    pub(super) shape: Vec<usize>,
+}
+
+#[cfg(feature = "ort")]
+impl TensorRtSharedWaveform {
+    pub(super) fn new(session: &Session, shape: &[usize], gpu_device_id: u32) -> Result<Self> {
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
+        let mut host_waveform = Tensor::<f32>::new(&host_input_allocator, shape.to_vec())
+            .context("failed to allocate shared CUDA-pinned waveform input")?;
+        zero_f32_tensor(&mut host_waveform, "shared_waveform")?;
+        let mut device_waveform = Tensor::<f32>::new(&device_allocator, shape.to_vec())
+            .context("failed to allocate shared CUDA waveform input")?;
+        copy_f32_tensor_to_device(&host_waveform, &mut device_waveform, "shared_waveform")?;
+        info!(
+            "GPU shared waveform input allocated shape={} consumers=contentvec host_memory=CUDA_PINNED/CPUInput device_memory=CUDA/Default",
+            format_usize_shape(shape)
+        );
+        Ok(Self {
+            host_waveform,
+            device_waveform,
+            _host_input_allocator: host_input_allocator,
+            _device_allocator: device_allocator,
+            shape: shape.to_vec(),
+        })
+    }
+
+    pub(super) fn copy_from_slice(&mut self, waveform: &[f32]) -> Result<u128> {
+        let h2d_start = Instant::now();
+        copy_f32_tensor(&mut self.host_waveform, waveform, "shared_waveform")?;
+        copy_f32_tensor_to_device(
+            &self.host_waveform,
+            &mut self.device_waveform,
+            "shared_waveform",
+        )?;
+        Ok(h2d_start.elapsed().as_micros())
+    }
+}
+
+#[cfg(feature = "ort")]
+fn validate_shared_waveform_shape(
+    shared_waveform: &TensorRtSharedWaveform,
+    expected_shape: &[usize],
+    consumer: &str,
+) -> Result<()> {
+    if shared_waveform.shape != expected_shape {
+        bail!(
+            "shared CUDA waveform shape {} cannot be bound to {consumer} input shape {}",
+            format_usize_shape(&shared_waveform.shape),
+            format_usize_shape(expected_shape)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct HubertTensorRtPinnedBinding {
+    pub(super) binding: IoBinding,
+    pub(super) audio: Tensor<f32>,
+    pub(super) output: Tensor<f32>,
+    pub(super) _input_allocator: Allocator,
+    pub(super) _output_allocator: Allocator,
+    pub(super) input_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+}
+
+#[cfg(feature = "ort")]
+impl HubertTensorRtPinnedBinding {
+    pub(super) fn new(
+        session: &Session,
+        input_name: &str,
+        input_shape: &[usize],
+        output_name: &str,
+        output_shape: &[usize],
+        gpu_device_id: u32,
+    ) -> Result<Self> {
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let audio =
+            Tensor::<f32>::new(&input_allocator, input_shape.to_vec()).with_context(|| {
+                format!("failed to allocate TensorRT ContentVec input '{input_name}'")
+            })?;
+        let mut output = Tensor::<f32>::new(&output_allocator, output_shape.to_vec())
+            .with_context(|| {
+                format!("failed to allocate TensorRT ContentVec output '{output_name}'")
+            })?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create TensorRT ContentVec IoBinding")?;
+        bind_output_tensor(&mut binding, output_name, &mut output).with_context(|| {
+            format!("failed to bind TensorRT ContentVec output '{output_name}'")
+        })?;
+        Ok(Self {
+            binding,
+            audio,
+            output,
+            _input_allocator: input_allocator,
+            _output_allocator: output_allocator,
+            input_shape: input_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+        })
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct RmvpeTensorRtPinnedBinding {
+    pub(super) binding: IoBinding,
+    pub(super) waveform: Tensor<f32>,
+    pub(super) threshold: Tensor<f32>,
+    pub(super) output: Tensor<f32>,
+    pub(super) _input_allocator: Allocator,
+    pub(super) _output_allocator: Allocator,
+    pub(super) waveform_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+    pub(super) bound_threshold: f32,
+}
+
+#[cfg(feature = "ort")]
+impl RmvpeTensorRtPinnedBinding {
+    pub(super) fn new(
+        session: &Session,
+        waveform_shape: &[usize],
+        output_shape: &[usize],
+        threshold_value: f32,
+        gpu_device_id: u32,
+    ) -> Result<Self> {
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let waveform = Tensor::<f32>::new(&input_allocator, waveform_shape.to_vec())
+            .context("failed to allocate TensorRT RMVPE input 'waveform'")?;
+        let mut threshold = Tensor::<f32>::new(&input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RMVPE input 'threshold'")?;
+        write_scalar_f32_tensor(&mut threshold, threshold_value, "threshold")?;
+        let mut output = Tensor::<f32>::new(&output_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RMVPE output 'pitchf'")?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create TensorRT RMVPE IoBinding")?;
+        binding
+            .bind_input("threshold", &threshold)
+            .context("failed to bind TensorRT RMVPE input 'threshold'")?;
+        bind_output_tensor(&mut binding, "pitchf", &mut output)
+            .context("failed to bind TensorRT RMVPE output 'pitchf'")?;
+        Ok(Self {
+            binding,
+            waveform,
+            threshold,
+            output,
+            _input_allocator: input_allocator,
+            _output_allocator: output_allocator,
+            waveform_shape: waveform_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+            bound_threshold: threshold_value,
+        })
+    }
+
+    pub(super) fn bind_threshold_if_changed(&mut self, threshold_value: f32) -> Result<()> {
+        if self.bound_threshold == threshold_value {
+            return Ok(());
+        }
+        write_scalar_f32_tensor(&mut self.threshold, threshold_value, "threshold")?;
+        self.binding
+            .bind_input("threshold", &self.threshold)
+            .context("failed to re-bind TensorRT RMVPE input 'threshold'")?;
+        self.bound_threshold = threshold_value;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct RvcTensorRtPinnedBinding {
+    pub(super) binding: IoBinding,
+    pub(super) feats: Tensor<f32>,
+    pub(super) pitch: Tensor<i64>,
+    pub(super) pitchf: Tensor<f32>,
+    pub(super) p_len: Tensor<i64>,
+    pub(super) sid: Tensor<i64>,
+    /// Latent-noise input buffer, when the export takes `rnd`. Re-bound per run
+    /// like `feats`, since fresh noise is copied in each chunk.
+    pub(super) rnd: Option<Tensor<f32>>,
+    /// Streaming-export NSF source noise `[1, audio_len, 1]`. Re-bound per run
+    /// like `rnd`; present iff the model is a streaming export.
+    pub(super) nsf_noise: Option<Tensor<f32>>,
+    /// Streaming-export window-start NSF phase `[1, 1, 1]`. Re-bound per run
+    /// (it changes every chunk).
+    pub(super) phase_in: Option<Tensor<f32>>,
+    /// Streaming-export per-sample NSF phase output `[1, audio_len, 1]`, bound
+    /// once like `audio`; the caller reads the next window's `phase_in` from it.
+    pub(super) phase_out: Option<Tensor<f32>>,
+    pub(super) output: Tensor<f32>,
+    pub(super) _input_allocator: Allocator,
+    pub(super) _output_allocator: Allocator,
+    pub(super) feats_shape: Vec<usize>,
+    pub(super) pitch_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+    pub(super) bound_p_len: i64,
+    pub(super) bound_sid: i64,
+    pub(super) names: RvcIoNames,
+}
+
+// Fixed `rnd` tensor shape `[1, inter_channels, frame_len]` for a fixed-shape
+// RVC binding, or `None` when the export samples its own noise. Shared by the
+// pinned and CUDA-graph constructors so both agree with the profile's `rnd` dims.
+#[cfg(feature = "ort")]
+fn rvc_rnd_shape(names: &RvcIoNames, frame_len: i64) -> Result<Option<Vec<usize>>> {
+    let Some(rnd) = names.rnd.as_ref() else {
+        return Ok(None);
+    };
+    let channels = rnd.validate_channels()?.get();
+    let frames = usize::try_from(frame_len).context("RVC rnd frame count does not fit usize")?;
+    Ok(Some(vec![1, channels, frames]))
+}
+
+#[cfg(feature = "ort")]
+impl RvcTensorRtPinnedBinding {
+    // The RVC binding needs each input shape, both fixed scalars, the device id,
+    // and the resolved tensor names; bundling them into a struct would only hide
+    // the IoBinding contract this constructor sets up.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        session: &Session,
+        feats_shape: &[usize],
+        pitch_shape: &[usize],
+        output_shape: &[usize],
+        frame_len: i64,
+        speaker_id: i64,
+        gpu_device_id: u32,
+        names: &RvcIoNames,
+        // Streaming exports: NSF output-sample length `audio_len = frames *
+        // frame_hop`. `Some` iff the model is a streaming export, in which case
+        // the NSF noise/phase I/O is allocated and bound below.
+        stream_audio_len: Option<usize>,
+    ) -> Result<Self> {
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let feats = Tensor::<f32>::new(&input_allocator, feats_shape.to_vec())
+            .context("failed to allocate TensorRT RVC input 'feats'")?;
+        let pitch = Tensor::<i64>::new(&input_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC input 'pitch'")?;
+        let pitchf = Tensor::<f32>::new(&input_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC input 'pitchf'")?;
+        let mut p_len = Tensor::<i64>::new(&input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC input 'p_len'")?;
+        let mut sid = Tensor::<i64>::new(&input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC input 'sid'")?;
+        write_scalar_i64_tensor(&mut p_len, frame_len, "p_len")?;
+        write_scalar_i64_tensor(&mut sid, speaker_id, "sid")?;
+        // Latent-noise input buffer (allocated only when the export takes it);
+        // bound per run alongside feats, since fresh noise is copied each chunk.
+        let rnd = match rvc_rnd_shape(names, frame_len)? {
+            Some(shape) => Some(
+                Tensor::<f32>::new(&input_allocator, shape)
+                    .context("failed to allocate TensorRT RVC input 'rnd'")?,
+            ),
+            None => None,
+        };
+        // Streaming NSF I/O (allocated only for streaming exports). `nsf_noise`
+        // and `phase_in` are inputs re-bound per run like `rnd`; `phase_out` is a
+        // per-sample output bound once like `audio`. Require all three names so a
+        // partially-exported model fails loudly rather than binding a subset.
+        let (nsf_noise, phase_in, mut phase_out) = match stream_audio_len {
+            Some(audio_len) => {
+                if names.nsf_noise.is_none() {
+                    bail!("streaming RVC binding requires an 'nsf_noise' input name");
+                }
+                if names.phase_in.is_none() {
+                    bail!("streaming RVC binding requires a 'phase_in' input name");
+                }
+                let nsf_noise = Tensor::<f32>::new(&input_allocator, vec![1, audio_len, 1])
+                    .context("failed to allocate TensorRT RVC input 'nsf_noise'")?;
+                let phase_in = Tensor::<f32>::new(&input_allocator, vec![1usize, 1, 1])
+                    .context("failed to allocate TensorRT RVC input 'phase_in'")?;
+                let phase_out = match names.phase_out.as_deref() {
+                    Some(_) => Some(
+                        Tensor::<f32>::new(&output_allocator, vec![1, audio_len, 1]).context(
+                            "failed to allocate TensorRT RVC output 'streaming_nsf_phase'",
+                        )?,
+                    ),
+                    None => None,
+                };
+                (Some(nsf_noise), Some(phase_in), phase_out)
+            }
+            None => (None, None, None),
+        };
+        let mut output = Tensor::<f32>::new(&output_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RVC output 'audio'")?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create TensorRT RVC IoBinding")?;
+        binding
+            .bind_input(names.p_len.as_str(), &p_len)
+            .context("failed to bind TensorRT RVC input 'p_len'")?;
+        binding
+            .bind_input(names.sid.as_str(), &sid)
+            .context("failed to bind TensorRT RVC input 'sid'")?;
+        // Bind the per-sample NSF phase output once; its address stays stable and
+        // the pinned buffer is read back after each run.
+        if let (Some(phase_out_name), Some(phase_out)) =
+            (names.phase_out.as_deref(), phase_out.as_mut())
+        {
+            bind_output_tensor(&mut binding, phase_out_name, phase_out)
+                .context("failed to bind TensorRT RVC output 'streaming_nsf_phase'")?;
+        }
+        bind_output_tensor(&mut binding, names.audio.as_str(), &mut output)
+            .context("failed to bind TensorRT RVC output 'audio'")?;
+        Ok(Self {
+            binding,
+            feats,
+            pitch,
+            pitchf,
+            p_len,
+            sid,
+            rnd,
+            nsf_noise,
+            phase_in,
+            phase_out,
+            output,
+            _input_allocator: input_allocator,
+            _output_allocator: output_allocator,
+            feats_shape: feats_shape.to_vec(),
+            pitch_shape: pitch_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+            bound_p_len: frame_len,
+            bound_sid: speaker_id,
+            names: names.clone(),
+        })
+    }
+
+    pub(super) fn bind_fixed_scalars_if_changed(
+        &mut self,
+        frame_len: i64,
+        speaker_id: i64,
+    ) -> Result<()> {
+        if self.bound_p_len != frame_len {
+            write_scalar_i64_tensor(&mut self.p_len, frame_len, "p_len")?;
+            self.binding
+                .bind_input(self.names.p_len.as_str(), &self.p_len)
+                .context("failed to re-bind TensorRT RVC input 'p_len'")?;
+            self.bound_p_len = frame_len;
+        }
+        if self.bound_sid != speaker_id {
+            write_scalar_i64_tensor(&mut self.sid, speaker_id, "sid")?;
+            self.binding
+                .bind_input(self.names.sid.as_str(), &self.sid)
+                .context("failed to re-bind TensorRT RVC input 'sid'")?;
+            self.bound_sid = speaker_id;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct HubertTensorRtGraphBinding {
+    pub(super) binding: IoBinding,
+    pub(super) host_audio: Option<Tensor<f32>>,
+    pub(super) device_audio: Option<Tensor<f32>>,
+    pub(super) device_output: Tensor<f32>,
+    pub(super) host_output: Tensor<f32>,
+    pub(super) _host_input_allocator: Option<Allocator>,
+    pub(super) _host_output_allocator: Allocator,
+    pub(super) _device_allocator: Allocator,
+    pub(super) input_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+    pub(super) shared_waveform_input: bool,
+}
+
+#[cfg(feature = "ort")]
+impl HubertTensorRtGraphBinding {
+    pub(super) fn new(
+        session: &Session,
+        input_name: &str,
+        input_shape: &[usize],
+        output_name: &str,
+        output_shape: &[usize],
+        shared_waveform: Option<&TensorRtSharedWaveform>,
+        gpu_device_id: u32,
+    ) -> Result<Self> {
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
+        let mut device_output = Tensor::<f32>::new(&device_allocator, output_shape.to_vec())
+            .with_context(|| {
+                format!("failed to allocate TensorRT ContentVec CUDA output '{output_name}'")
+            })?;
+        let host_output = Tensor::<f32>::new(&host_output_allocator, output_shape.to_vec())
+            .with_context(|| {
+                format!("failed to allocate TensorRT ContentVec host output '{output_name}'")
+            })?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create ContentVec CUDA device IoBinding")?;
+        let (host_input_allocator, host_audio, device_audio, shared_waveform_input) =
+            if let Some(shared_waveform) = shared_waveform {
+                validate_shared_waveform_shape(shared_waveform, input_shape, "ContentVec")?;
+                binding
+                    .bind_input(input_name, &shared_waveform.device_waveform)
+                    .with_context(|| {
+                        format!("failed to bind shared ContentVec CUDA input '{input_name}'")
+                    })?;
+                (None, None, None, true)
+            } else {
+                let host_input_allocator =
+                    tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+                let mut host_audio = Tensor::<f32>::new(
+                    &host_input_allocator,
+                    input_shape.to_vec(),
+                )
+                .with_context(|| {
+                    format!("failed to allocate TensorRT ContentVec host input '{input_name}'")
+                })?;
+                zero_f32_tensor(&mut host_audio, input_name)?;
+                let mut device_audio = Tensor::<f32>::new(&device_allocator, input_shape.to_vec())
+                    .with_context(|| {
+                        format!("failed to allocate TensorRT ContentVec CUDA input '{input_name}'")
+                    })?;
+                copy_f32_tensor_to_device(&host_audio, &mut device_audio, input_name)?;
+                binding
+                    .bind_input(input_name, &device_audio)
+                    .with_context(|| {
+                        format!("failed to bind TensorRT ContentVec CUDA input '{input_name}'")
+                    })?;
+                (
+                    Some(host_input_allocator),
+                    Some(host_audio),
+                    Some(device_audio),
+                    false,
+                )
+            };
+        bind_output_tensor(&mut binding, output_name, &mut device_output).with_context(|| {
+            format!("failed to bind TensorRT ContentVec CUDA output '{output_name}'")
+        })?;
+        Ok(Self {
+            binding,
+            host_audio,
+            device_audio,
+            device_output,
+            host_output,
+            _host_input_allocator: host_input_allocator,
+            _host_output_allocator: host_output_allocator,
+            _device_allocator: device_allocator,
+            input_shape: input_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+            shared_waveform_input,
+        })
+    }
+
+    pub(super) fn copy_audio_to_device_if_owned(
+        &mut self,
+        audio: &[f32],
+        input_name: &str,
+    ) -> Result<Option<u128>> {
+        if self.shared_waveform_input {
+            return Ok(None);
+        }
+        let host_audio = self
+            .host_audio
+            .as_mut()
+            .ok_or_else(|| anyhow!("ContentVec owned host input is missing"))?;
+        let device_audio = self
+            .device_audio
+            .as_mut()
+            .ok_or_else(|| anyhow!("ContentVec owned CUDA input is missing"))?;
+        let h2d_start = Instant::now();
+        copy_f32_tensor(host_audio, audio, input_name)?;
+        copy_f32_tensor_to_device(host_audio, device_audio, input_name)?;
+        Ok(Some(h2d_start.elapsed().as_micros()))
+    }
+
+    pub(super) fn warmup_capture(
+        &mut self,
+        session: &mut Session,
+        output_name: &str,
+        role: ModelRole,
+        provider: Provider,
+        cuda_graph: bool,
+    ) -> Result<()> {
+        let run_start = Instant::now();
+        let _outputs = session.run_binding(&self.binding)?;
+        let run_us = run_start.elapsed().as_micros();
+        let d2h_start = Instant::now();
+        copy_f32_tensor_to_host(&self.device_output, &mut self.host_output, output_name)?;
+        let d2h_us = d2h_start.elapsed().as_micros();
+        validate_host_output_shape(&self.host_output, &self.output_shape, output_name)?;
+        info!(
+            "{} device IoBinding warmup completed model_role={} cuda_graph={} graph_capture={} input_shape={} output_shape={} run_us={} d2h_us={}",
+            provider.label(),
+            role.label(),
+            cuda_graph,
+            cuda_graph,
+            format_usize_shape(&self.input_shape),
+            format_usize_shape(&self.output_shape),
+            run_us,
+            d2h_us
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct RmvpeTensorRtGraphBinding {
+    pub(super) binding: IoBinding,
+    pub(super) host_waveform: Option<Tensor<f32>>,
+    pub(super) device_waveform: Option<Tensor<f32>>,
+    pub(super) host_threshold: Tensor<f32>,
+    pub(super) device_threshold: Tensor<f32>,
+    pub(super) device_output: Tensor<f32>,
+    pub(super) host_output: Tensor<f32>,
+    pub(super) _host_input_allocator: Allocator,
+    pub(super) _host_output_allocator: Allocator,
+    pub(super) _device_allocator: Allocator,
+    pub(super) waveform_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+    pub(super) bound_threshold: f32,
+    pub(super) shared_waveform_input: bool,
+}
+
+#[cfg(feature = "ort")]
+impl RmvpeTensorRtGraphBinding {
+    pub(super) fn new(
+        session: &Session,
+        waveform_shape: &[usize],
+        output_shape: &[usize],
+        threshold_value: f32,
+        shared_waveform: Option<&TensorRtSharedWaveform>,
+        gpu_device_id: u32,
+    ) -> Result<Self> {
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
+        let mut host_threshold = Tensor::<f32>::new(&host_input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RMVPE host input 'threshold'")?;
+        write_scalar_f32_tensor(&mut host_threshold, threshold_value, "threshold")?;
+        let mut device_threshold = Tensor::<f32>::new(&device_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RMVPE CUDA input 'threshold'")?;
+        copy_f32_tensor_to_device(&host_threshold, &mut device_threshold, "threshold")?;
+        let mut device_output = Tensor::<f32>::new(&device_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RMVPE CUDA output 'pitchf'")?;
+        let host_output = Tensor::<f32>::new(&host_output_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RMVPE host output 'pitchf'")?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create RMVPE CUDA device IoBinding")?;
+        let (host_waveform, device_waveform, shared_waveform_input) =
+            if let Some(shared_waveform) = shared_waveform {
+                validate_shared_waveform_shape(shared_waveform, waveform_shape, "RMVPE")?;
+                binding
+                    .bind_input("waveform", &shared_waveform.device_waveform)
+                    .context("failed to bind shared RMVPE CUDA input 'waveform'")?;
+                (None, None, true)
+            } else {
+                let mut host_waveform =
+                    Tensor::<f32>::new(&host_input_allocator, waveform_shape.to_vec())
+                        .context("failed to allocate TensorRT RMVPE host input 'waveform'")?;
+                zero_f32_tensor(&mut host_waveform, "waveform")?;
+                let mut device_waveform =
+                    Tensor::<f32>::new(&device_allocator, waveform_shape.to_vec())
+                        .context("failed to allocate TensorRT RMVPE CUDA input 'waveform'")?;
+                copy_f32_tensor_to_device(&host_waveform, &mut device_waveform, "waveform")?;
+                binding
+                    .bind_input("waveform", &device_waveform)
+                    .context("failed to bind TensorRT RMVPE CUDA input 'waveform'")?;
+                (Some(host_waveform), Some(device_waveform), false)
+            };
+        binding
+            .bind_input("threshold", &device_threshold)
+            .context("failed to bind TensorRT RMVPE CUDA input 'threshold'")?;
+        bind_output_tensor(&mut binding, "pitchf", &mut device_output)
+            .context("failed to bind TensorRT RMVPE CUDA output 'pitchf'")?;
+        Ok(Self {
+            binding,
+            host_waveform,
+            device_waveform,
+            host_threshold,
+            device_threshold,
+            device_output,
+            host_output,
+            _host_input_allocator: host_input_allocator,
+            _host_output_allocator: host_output_allocator,
+            _device_allocator: device_allocator,
+            waveform_shape: waveform_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+            bound_threshold: threshold_value,
+            shared_waveform_input,
+        })
+    }
+
+    pub(super) fn copy_waveform_to_device_if_owned(
+        &mut self,
+        waveform: &[f32],
+    ) -> Result<Option<u128>> {
+        if self.shared_waveform_input {
+            return Ok(None);
+        }
+        let host_waveform = self
+            .host_waveform
+            .as_mut()
+            .ok_or_else(|| anyhow!("RMVPE owned host input is missing"))?;
+        let device_waveform = self
+            .device_waveform
+            .as_mut()
+            .ok_or_else(|| anyhow!("RMVPE owned CUDA input is missing"))?;
+        let h2d_start = Instant::now();
+        copy_f32_tensor(host_waveform, waveform, "waveform")?;
+        copy_f32_tensor_to_device(host_waveform, device_waveform, "waveform")?;
+        Ok(Some(h2d_start.elapsed().as_micros()))
+    }
+
+    pub(super) fn copy_threshold_if_changed(&mut self, threshold_value: f32) -> Result<()> {
+        if self.bound_threshold == threshold_value {
+            return Ok(());
+        }
+        write_scalar_f32_tensor(&mut self.host_threshold, threshold_value, "threshold")?;
+        copy_f32_tensor_to_device(
+            &self.host_threshold,
+            &mut self.device_threshold,
+            "threshold",
+        )?;
+        self.bound_threshold = threshold_value;
+        Ok(())
+    }
+
+    pub(super) fn warmup_capture(
+        &mut self,
+        session: &mut Session,
+        provider: Provider,
+        cuda_graph: bool,
+    ) -> Result<()> {
+        let run_start = Instant::now();
+        let _outputs = session.run_binding(&self.binding)?;
+        let run_us = run_start.elapsed().as_micros();
+        let d2h_start = Instant::now();
+        copy_f32_tensor_to_host(&self.device_output, &mut self.host_output, "pitchf")?;
+        let d2h_us = d2h_start.elapsed().as_micros();
+        validate_host_output_shape(&self.host_output, &self.output_shape, "pitchf")?;
+        info!(
+            "{} device IoBinding warmup completed model_role={} cuda_graph={} graph_capture={} input_shape={} output_shape={} run_us={} d2h_us={}",
+            provider.label(),
+            ModelRole::Rmvpe.label(),
+            cuda_graph,
+            cuda_graph,
+            format_usize_shape(&self.waveform_shape),
+            format_usize_shape(&self.output_shape),
+            run_us,
+            d2h_us
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) struct RvcTensorRtGraphBinding {
+    pub(super) binding: IoBinding,
+    pub(super) host_feats: Tensor<f32>,
+    pub(super) device_feats: Tensor<f32>,
+    pub(super) host_pitch: Tensor<i64>,
+    pub(super) device_pitch: Tensor<i64>,
+    pub(super) host_pitchf: Tensor<f32>,
+    pub(super) device_pitchf: Tensor<f32>,
+    pub(super) host_p_len: Tensor<i64>,
+    pub(super) device_p_len: Tensor<i64>,
+    pub(super) host_sid: Tensor<i64>,
+    pub(super) device_sid: Tensor<i64>,
+    /// Latent-noise input (host staging + device buffer), when the export takes
+    /// `rnd`. The device tensor keeps a stable bound address; fresh noise is
+    /// staged into `host_rnd` and copied into `device_rnd` each chunk.
+    pub(super) host_rnd: Option<Tensor<f32>>,
+    pub(super) device_rnd: Option<Tensor<f32>>,
+    pub(super) device_output: Tensor<f32>,
+    pub(super) host_output: Tensor<f32>,
+    pub(super) _host_input_allocator: Allocator,
+    pub(super) _host_output_allocator: Allocator,
+    pub(super) _device_allocator: Allocator,
+    pub(super) feats_shape: Vec<usize>,
+    pub(super) pitch_shape: Vec<usize>,
+    pub(super) output_shape: Vec<usize>,
+    pub(super) bound_p_len: i64,
+    pub(super) bound_sid: i64,
+}
+
+#[cfg(feature = "ort")]
+impl RvcTensorRtGraphBinding {
+    // See RvcTensorRtPinnedBinding::new: the inputs mirror the RVC IoBinding
+    // contract (shapes + fixed scalars + device id + resolved names).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        session: &Session,
+        feats_shape: &[usize],
+        pitch_shape: &[usize],
+        output_shape: &[usize],
+        frame_len: i64,
+        speaker_id: i64,
+        gpu_device_id: u32,
+        names: &RvcIoNames,
+    ) -> Result<Self> {
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
+        let mut host_feats = Tensor::<f32>::new(&host_input_allocator, feats_shape.to_vec())
+            .context("failed to allocate TensorRT RVC host input 'feats'")?;
+        zero_f32_tensor(&mut host_feats, "feats")?;
+        let mut device_feats = Tensor::<f32>::new(&device_allocator, feats_shape.to_vec())
+            .context("failed to allocate TensorRT RVC CUDA input 'feats'")?;
+        copy_f32_tensor_to_device(&host_feats, &mut device_feats, "feats")?;
+        let mut host_pitch = Tensor::<i64>::new(&host_input_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC host input 'pitch'")?;
+        fill_i64_tensor(&mut host_pitch, 1, "pitch")?;
+        let mut device_pitch = Tensor::<i64>::new(&device_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC CUDA input 'pitch'")?;
+        copy_i64_tensor_to_device(&host_pitch, &mut device_pitch, "pitch")?;
+        let mut host_pitchf = Tensor::<f32>::new(&host_input_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC host input 'pitchf'")?;
+        zero_f32_tensor(&mut host_pitchf, "pitchf")?;
+        let mut device_pitchf = Tensor::<f32>::new(&device_allocator, pitch_shape.to_vec())
+            .context("failed to allocate TensorRT RVC CUDA input 'pitchf'")?;
+        copy_f32_tensor_to_device(&host_pitchf, &mut device_pitchf, "pitchf")?;
+        let mut host_p_len = Tensor::<i64>::new(&host_input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC host input 'p_len'")?;
+        write_scalar_i64_tensor(&mut host_p_len, frame_len, "p_len")?;
+        let mut device_p_len = Tensor::<i64>::new(&device_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC CUDA input 'p_len'")?;
+        copy_i64_tensor_to_device(&host_p_len, &mut device_p_len, "p_len")?;
+        let mut host_sid = Tensor::<i64>::new(&host_input_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC host input 'sid'")?;
+        write_scalar_i64_tensor(&mut host_sid, speaker_id, "sid")?;
+        let mut device_sid = Tensor::<i64>::new(&device_allocator, vec![1usize])
+            .context("failed to allocate TensorRT RVC CUDA input 'sid'")?;
+        copy_i64_tensor_to_device(&host_sid, &mut device_sid, "sid")?;
+        let mut device_output = Tensor::<f32>::new(&device_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RVC CUDA output 'audio'")?;
+        let host_output = Tensor::<f32>::new(&host_output_allocator, output_shape.to_vec())
+            .context("failed to allocate TensorRT RVC host output 'audio'")?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create RVC CUDA device IoBinding")?;
+        binding
+            .bind_input(names.feats.as_str(), &device_feats)
+            .context("failed to bind TensorRT RVC CUDA input 'feats'")?;
+        binding
+            .bind_input(names.pitch.as_str(), &device_pitch)
+            .context("failed to bind TensorRT RVC CUDA input 'pitch'")?;
+        binding
+            .bind_input(names.pitchf.as_str(), &device_pitchf)
+            .context("failed to bind TensorRT RVC CUDA input 'pitchf'")?;
+        binding
+            .bind_input(names.p_len.as_str(), &device_p_len)
+            .context("failed to bind TensorRT RVC CUDA input 'p_len'")?;
+        binding
+            .bind_input(names.sid.as_str(), &device_sid)
+            .context("failed to bind TensorRT RVC CUDA input 'sid'")?;
+        // Latent noise: device buffer keeps a stable bound address for CUDA Graph
+        // replay; per-chunk noise is staged through host_rnd into device_rnd.
+        let (host_rnd, device_rnd) = match rvc_rnd_shape(names, frame_len)? {
+            Some(shape) => {
+                let rnd_name = names
+                    .rnd
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("RVC rnd shape without a resolved name"))?
+                    .name
+                    .as_str();
+                let mut host_rnd = Tensor::<f32>::new(&host_input_allocator, shape.clone())
+                    .context("failed to allocate TensorRT RVC host input 'rnd'")?;
+                zero_f32_tensor(&mut host_rnd, "rnd")?;
+                let mut device_rnd = Tensor::<f32>::new(&device_allocator, shape)
+                    .context("failed to allocate TensorRT RVC CUDA input 'rnd'")?;
+                copy_f32_tensor_to_device(&host_rnd, &mut device_rnd, "rnd")?;
+                binding
+                    .bind_input(rnd_name, &device_rnd)
+                    .context("failed to bind TensorRT RVC CUDA input 'rnd'")?;
+                (Some(host_rnd), Some(device_rnd))
+            }
+            None => (None, None),
+        };
+        bind_output_tensor(&mut binding, names.audio.as_str(), &mut device_output)
+            .context("failed to bind TensorRT RVC CUDA output 'audio'")?;
+        Ok(Self {
+            binding,
+            host_feats,
+            device_feats,
+            host_pitch,
+            device_pitch,
+            host_pitchf,
+            device_pitchf,
+            host_p_len,
+            device_p_len,
+            host_sid,
+            device_sid,
+            host_rnd,
+            device_rnd,
+            device_output,
+            host_output,
+            _host_input_allocator: host_input_allocator,
+            _host_output_allocator: host_output_allocator,
+            _device_allocator: device_allocator,
+            feats_shape: feats_shape.to_vec(),
+            pitch_shape: pitch_shape.to_vec(),
+            output_shape: output_shape.to_vec(),
+            bound_p_len: frame_len,
+            bound_sid: speaker_id,
+        })
+    }
+
+    pub(super) fn copy_fixed_scalars_if_changed(
+        &mut self,
+        frame_len: i64,
+        speaker_id: i64,
+    ) -> Result<()> {
+        if self.bound_p_len != frame_len {
+            write_scalar_i64_tensor(&mut self.host_p_len, frame_len, "p_len")?;
+            copy_i64_tensor_to_device(&self.host_p_len, &mut self.device_p_len, "p_len")?;
+            self.bound_p_len = frame_len;
+        }
+        if self.bound_sid != speaker_id {
+            write_scalar_i64_tensor(&mut self.host_sid, speaker_id, "sid")?;
+            copy_i64_tensor_to_device(&self.host_sid, &mut self.device_sid, "sid")?;
+            self.bound_sid = speaker_id;
+        }
+        Ok(())
+    }
+
+    pub(super) fn warmup_capture(
+        &mut self,
+        session: &mut Session,
+        provider: Provider,
+        cuda_graph: bool,
+    ) -> Result<()> {
+        let run_start = Instant::now();
+        let _outputs = session.run_binding(&self.binding)?;
+        let run_us = run_start.elapsed().as_micros();
+        let d2h_start = Instant::now();
+        copy_f32_tensor_to_host(&self.device_output, &mut self.host_output, "audio")?;
+        let d2h_us = d2h_start.elapsed().as_micros();
+        validate_host_output_shape(&self.host_output, &self.output_shape, "audio")?;
+        info!(
+            "{} device IoBinding warmup completed model_role={} cuda_graph={} graph_capture={} feats_shape={} pitch_shape={} output_shape={} run_us={} d2h_us={}",
+            provider.label(),
+            ModelRole::Rvc.label(),
+            cuda_graph,
+            cuda_graph,
+            format_usize_shape(&self.feats_shape),
+            format_usize_shape(&self.pitch_shape),
+            format_usize_shape(&self.output_shape),
+            run_us,
+            d2h_us
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ort")]
+pub(super) enum HubertTensorRtBinding {
+    Pinned(HubertTensorRtPinnedBinding),
+    CudaGraph(HubertTensorRtGraphBinding),
+}
+
+#[cfg(feature = "ort")]
+pub(super) enum RmvpeTensorRtBinding {
+    Pinned(RmvpeTensorRtPinnedBinding),
+    CudaGraph(RmvpeTensorRtGraphBinding),
+}
+
+#[cfg(feature = "ort")]
+pub(super) enum RvcTensorRtBinding {
+    Pinned(RvcTensorRtPinnedBinding),
+    CudaGraph(RvcTensorRtGraphBinding),
+}
+
+#[cfg(test)]
+pub(super) fn tensor_rt_benchmark_profile(role: ModelRole) -> Result<TensorRtSessionProfile> {
+    match role {
+        ModelRole::ContentVec => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![TensorRtInputShape {
+                name: "audio".to_string(),
+                dims: CONTENTVEC_AUDIO_DIMS.to_vec(),
+            }],
+        )),
+        ModelRole::Rmvpe => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![TensorRtInputShape {
+                name: "waveform".to_string(),
+                dims: RMVPE_WAVEFORM_DIMS.to_vec(),
+            }],
+        )),
+        ModelRole::Rvc => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![
+                TensorRtInputShape {
+                    name: "feats".to_string(),
+                    dims: RVC_FEATS_DIMS.to_vec(),
+                },
+                TensorRtInputShape {
+                    name: "pitch".to_string(),
+                    dims: RVC_PITCH_DIMS.to_vec(),
+                },
+                TensorRtInputShape {
+                    name: "pitchf".to_string(),
+                    dims: RVC_PITCH_DIMS.to_vec(),
+                },
+            ],
+        )),
+        ModelRole::Gtcrn => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![
+                TensorRtInputShape {
+                    name: "mix".to_string(),
+                    dims: vec![1, 257, 1, 2],
+                },
+                TensorRtInputShape {
+                    name: "conv_cache".to_string(),
+                    dims: vec![2, 1, 16, 16, 33],
+                },
+                TensorRtInputShape {
+                    name: "tra_cache".to_string(),
+                    dims: vec![2, 3, 1, 1, 16],
+                },
+                TensorRtInputShape {
+                    name: "inter_cache".to_string(),
+                    dims: vec![2, 1, 33, 16],
+                },
+            ],
+        )),
+        ModelRole::Inspect => bail!("TensorRT inspect profile requires a concrete model role"),
+    }
+}
+
+/// Derive the RVC `feature_len` from the ContentVec output frame count, purely
+/// arithmetically. Mirrors the realtime feature pipeline: ContentVec frames are
+/// doubled (`repeat_frames(2)`) and the leading silence frames are trimmed. The
+/// result is a deterministic function of the (fixed) input shape, so neither the
+/// run-based warmup nor the engine-based path needs to run the model to learn it.
+pub(super) fn derive_rvc_feature_len(
+    contentvec_frames: usize,
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> Result<usize> {
+    let frames2 = contentvec_frames
+        .checked_mul(2)
+        .context("RVC feature length overflow")?;
+    let silence_front_frames =
+        onnx_silence_front_feature_frames(extra_convert_samples, rvc_sample_rate);
+    let feature_len = if silence_front_frames > 0 && silence_front_frames < frames2 {
+        frames2 - silence_front_frames
+    } else {
+        frames2
+    };
+    if feature_len == 0 {
+        bail!("derived zero RVC frames");
+    }
+    Ok(feature_len)
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn tensor_rt_warmup_feature_len(
+    embedder: &mut HubertEmbedderSession,
+    input_samples_16k: usize,
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> Result<TensorRtWarmupInfo> {
+    let silence = vec![0.0; input_samples_16k];
+    // Warmup is a one-shot load-time probe, so a local tensor is fine here.
+    let mut features = super::feature::FeatureTensor::default();
+    embedder.extract_into(&silence, &mut features)?;
+    let contentvec_output_shape = features.shape.clone();
+    let contentvec_frames = feature_len_from_shape(&features.shape, "embedder warmup output")?;
+    let feature_len =
+        derive_rvc_feature_len(contentvec_frames, extra_convert_samples, rvc_sample_rate)?;
+    info!(
+        "TensorRT warmup derived RVC frame count: contentvec_input_samples={} rvc_frames={}",
+        input_samples_16k, feature_len
+    );
+    Ok(TensorRtWarmupInfo {
+        rvc_feature_len: feature_len,
+        contentvec_output_shape,
+    })
+}
+
+pub(super) fn feature_len_from_shape(shape: &[i64], context: &str) -> Result<usize> {
+    let len = shape
+        .get(1)
+        .copied()
+        .with_context(|| format!("{context} must be rank-3 [1, frames, channels]"))?;
+    if len <= 0 {
+        bail!("{context} has non-positive frame length {len}");
+    }
+    usize::try_from(len).with_context(|| format!("{context} frame length does not fit in usize"))
+}
+
+pub(super) fn tensor_rt_profile_shapes(inputs: &[TensorRtInputShape]) -> String {
+    inputs
+        .iter()
+        .map(|input| format!("{}:{}", input.name, format_usize_shape(&input.dims)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(super) fn tensor_rt_cache_root() -> Result<PathBuf> {
+    let override_dir = env::var_os(TENSORRT_CACHE_DIR_ENV);
+    tensor_rt_cache_root_from_override(override_dir.as_deref())
+}
+
+pub(super) fn tensor_rt_cache_root_from_override(
+    override_dir: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(root) = override_dir {
+        if !root.is_empty() {
+            return Ok(PathBuf::from(root));
+        }
+    }
+    tensor_rt_default_cache_root()
+}
+
+#[cfg(windows)]
+pub(super) fn tensor_rt_default_cache_root() -> Result<PathBuf> {
+    let local_app_data = env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        anyhow!(
+            "LOCALAPPDATA is not set; set {} to choose a TensorRT cache directory",
+            TENSORRT_CACHE_DIR_ENV
+        )
+    })?;
+    Ok(PathBuf::from(local_app_data)
+        .join("vc-rs")
+        .join("tensorrt-cache"))
+}
+
+#[cfg(not(windows))]
+pub(super) fn tensor_rt_default_cache_root() -> Result<PathBuf> {
+    if let Some(xdg_cache_home) = env::var_os("XDG_CACHE_HOME") {
+        if !xdg_cache_home.is_empty() {
+            return Ok(PathBuf::from(xdg_cache_home)
+                .join("vc-rs")
+                .join("tensorrt-cache"));
+        }
+    }
+    let home = env::var_os("HOME").ok_or_else(|| {
+        anyhow!(
+            "HOME is not set; set {} to choose a TensorRT cache directory",
+            TENSORRT_CACHE_DIR_ENV
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("vc-rs")
+        .join("tensorrt-cache"))
+}
+
+// Keep the model fingerprint in the cache path. ORT/TensorRT engine file names
+// do not include the original ONNX path, so shape-only cache dirs let different
+// models overwrite or invalidate each other's engines.
+pub(super) fn tensor_rt_model_cache_key(path: &Path) -> Result<String> {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(tensor_rt_sanitize_cache_component)
+        .unwrap_or_else(|| "model".to_string());
+    let hash = tensor_rt_model_file_hash(path)?;
+    Ok(format!("{stem}_{hash:016x}"))
+}
+
+pub(super) fn tensor_rt_model_file_hash(path: &Path) -> Result<u64> {
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open TensorRT model for cache key {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buffer = vec![0u8; TENSORRT_MODEL_HASH_BUFFER_BYTES];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read TensorRT model {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.digest())
+}
+
+pub(super) fn tensor_rt_sanitize_cache_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    if sanitized.is_empty() {
+        "model".to_string()
+    } else {
+        sanitized
+    }
+}
+
+pub(super) fn tensor_rt_cache_key(profile_shapes: &str) -> String {
+    profile_shapes
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+pub(super) fn provider_uses_fixed_shape(provider: Provider) -> bool {
+    provider.uses_fixed_shape()
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn tensor_rt_pinned_allocator(
+    session: &Session,
+    memory_type: MemoryType,
+    gpu_device_id: u32,
+) -> Result<Allocator> {
+    let gpu_device_id = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
+    let memory_info = MemoryInfo::new(
+        AllocationDevice::CUDA_PINNED,
+        gpu_device_id,
+        AllocatorType::Device,
+        memory_type,
+    )
+    .map_err(|err| anyhow!("failed to create CUDA pinned MemoryInfo ({memory_type:?}): {err}"))?;
+    Allocator::new(session, memory_info)
+        .map_err(|err| anyhow!("failed to create CUDA pinned allocator ({memory_type:?}): {err}"))
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn tensor_rt_device_allocator(
+    session: &Session,
+    gpu_device_id: u32,
+) -> Result<Allocator> {
+    let gpu_device_id = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
+    let memory_info = MemoryInfo::new(
+        AllocationDevice::CUDA,
+        gpu_device_id,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )
+    .map_err(|err| anyhow!("failed to create CUDA device MemoryInfo: {err}"))?;
+    Allocator::new(session, memory_info)
+        .map_err(|err| anyhow!("failed to create CUDA device allocator: {err}"))
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn bind_output_tensor(
+    binding: &mut IoBinding,
+    output_name: &str,
+    output: &mut Tensor<f32>,
+) -> Result<()> {
+    let output_name = CString::new(output_name)
+        .with_context(|| format!("ONNX output name contains NUL: {output_name:?}"))?;
+    ortsys![unsafe BindOutput(binding.ptr_mut(), output_name.as_ptr(), output.ptr())?];
+    Ok(())
+}
+
+// Guardrail: the pinned CPU path below is intentionally kept as the explicit
+// TensorRT CUDA Graph opt-out. ort::IoBinding::bind_input copies CPU/CUDA-pinned
+// data at bind time, so changing inputs must be re-bound before run_binding.
+// The CUDA Graph path must not copy this pattern: graph capture requires stable
+// CUDA device tensor addresses that remain bound for the session lifetime.
+#[cfg(feature = "ort")]
+pub(super) fn copy_f32_tensor(tensor: &mut Tensor<f32>, src: &[f32], name: &str) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.len() != src.len() {
+        bail!(
+            "fixed-shape IoBinding input '{name}' length mismatch: expected {}, got {}",
+            dst.len(),
+            src.len()
+        );
+    }
+    dst.copy_from_slice(src);
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn zero_f32_tensor(tensor: &mut Tensor<f32>, name: &str) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.is_empty() {
+        bail!("fixed-shape IoBinding input '{name}' must not be empty");
+    }
+    dst.fill(0.0);
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn copy_i64_tensor(tensor: &mut Tensor<i64>, src: &[i64], name: &str) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.len() != src.len() {
+        bail!(
+            "fixed-shape IoBinding input '{name}' length mismatch: expected {}, got {}",
+            dst.len(),
+            src.len()
+        );
+    }
+    dst.copy_from_slice(src);
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn fill_i64_tensor(tensor: &mut Tensor<i64>, value: i64, name: &str) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.is_empty() {
+        bail!("fixed-shape IoBinding input '{name}' must not be empty");
+    }
+    dst.fill(value);
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn write_scalar_f32_tensor(
+    tensor: &mut Tensor<f32>,
+    value: f32,
+    name: &str,
+) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.len() != 1 {
+        bail!(
+            "fixed-shape IoBinding scalar input '{name}' length mismatch: expected 1, got {}",
+            dst.len()
+        );
+    }
+    dst[0] = value;
+    Ok(())
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn write_scalar_i64_tensor(
+    tensor: &mut Tensor<i64>,
+    value: i64,
+    name: &str,
+) -> Result<()> {
+    let (_, dst) = tensor.extract_tensor_mut();
+    if dst.len() != 1 {
+        bail!(
+            "fixed-shape IoBinding scalar input '{name}' length mismatch: expected 1, got {}",
+            dst.len()
+        );
+    }
+    dst[0] = value;
+    Ok(())
+}
+
+// Guardrail: CUDA device IoBinding fixes tensor shapes and GPU addresses, which
+// are separate requirements for CUDA Graph replay. Do not allocate or re-bind
+// these device tensors on the runtime path. Tensor::copy_into currently routes
+// through ort's cached identity sessions guarded by an internal mutex, so this
+// model path must remain outside the real-time audio callback. The owning model
+// runs through &mut self; do not introduce concurrent runs against a
+// graph-enabled session.
+#[cfg(feature = "ort")]
+pub(super) fn copy_f32_tensor_to_device(
+    host_tensor: &Tensor<f32>,
+    device_tensor: &mut Tensor<f32>,
+    name: &str,
+) -> Result<()> {
+    host_tensor
+        .copy_into(device_tensor)
+        .with_context(|| format!("failed to copy TensorRT input '{name}' to CUDA device tensor"))
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn copy_i64_tensor_to_device(
+    host_tensor: &Tensor<i64>,
+    device_tensor: &mut Tensor<i64>,
+    name: &str,
+) -> Result<()> {
+    host_tensor
+        .copy_into(device_tensor)
+        .with_context(|| format!("failed to copy TensorRT input '{name}' to CUDA device tensor"))
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn copy_f32_tensor_to_host(
+    device_tensor: &Tensor<f32>,
+    host_tensor: &mut Tensor<f32>,
+    name: &str,
+) -> Result<()> {
+    device_tensor
+        .copy_into(host_tensor)
+        .with_context(|| format!("failed to copy TensorRT output '{name}' to host tensor"))
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn validate_host_output_shape(
+    tensor: &Tensor<f32>,
+    expected_shape: &[usize],
+    output_name: &str,
+) -> Result<()> {
+    let (shape, _) = tensor.try_extract_tensor::<f32>()?;
+    let actual_shape = i64_shape_to_usize(shape, output_name)?;
+    if actual_shape != expected_shape {
+        bail!(
+            "TensorRT bound output '{output_name}' shape changed from {} to {}",
+            format_usize_shape(expected_shape),
+            format_usize_shape(&actual_shape)
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_tensorrt_input_shape(
+    provider: Provider,
+    tensor_rt_profile: Option<&TensorRtSessionProfile>,
+    input_name: &str,
+    actual: &[usize],
+) -> Result<()> {
+    if !provider_uses_fixed_shape(provider) {
+        return Ok(());
+    }
+    let tensor_rt_profile = tensor_rt_profile
+        .ok_or_else(|| anyhow!("fixed-shape input validation requires a session profile"))?;
+    let expected = tensor_rt_profile.fixed_input_dims(input_name)?;
+    if actual != expected {
+        bail!(
+            "{} fixed profile for {} requires input '{}' shape {}, got {}; changing chunk-related settings requires a matching fixed-shape model load",
+            provider.label(),
+            tensor_rt_profile.role.label(),
+            input_name,
+            format_usize_shape(expected),
+            format_usize_shape(actual)
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn i64_shape_to_usize(shape: &[i64], input_name: &str) -> Result<Vec<usize>> {
+    shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).with_context(|| {
+                format!("input '{input_name}' shape contains negative or too-large dim {dim}")
+            })
+        })
+        .collect()
+}
+
+pub(super) fn format_usize_shape(shape: &[usize]) -> String {
+    shape
+        .iter()
+        .map(|dim| dim.to_string())
+        .collect::<Vec<_>>()
+        .join("x")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_rvc_feature_len_doubles_then_trims_silence_front() {
+        let rvc_rate = 48_000;
+        // No extra convert window -> no leading silence to trim -> exactly 2x,
+        // matching the realtime pipeline's repeat_frames(2).
+        assert_eq!(derive_rvc_feature_len(100, 0, rvc_rate).unwrap(), 200);
+
+        // With a nonzero extra window the result is 2x minus the trimmed leading
+        // silence frames, exactly what tensor_rt_warmup_feature_len computes from
+        // a run (repeat_frames(2) followed by trim_front_frames).
+        let frames = 100usize;
+        let extra = 48_000usize;
+        let silence_front = onnx_silence_front_feature_frames(extra, rvc_rate);
+        assert!(
+            silence_front > 0,
+            "test input should exercise the trim branch"
+        );
+        let frames2 = frames * 2;
+        let expected = frames2 - silence_front;
+        assert_eq!(
+            derive_rvc_feature_len(frames, extra, rvc_rate).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn derive_rvc_feature_len_rejects_zero_frames() {
+        assert!(derive_rvc_feature_len(0, 0, 48_000).is_err());
+    }
+}

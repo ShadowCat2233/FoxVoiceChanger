@@ -1,0 +1,2181 @@
+use std::path::Path;
+#[cfg(feature = "ort")]
+use std::time::Instant;
+
+use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "ort")]
+use ort::ep;
+#[cfg(feature = "ort")]
+use ort::memory::Allocator;
+#[cfg(feature = "ort")]
+use ort::session::builder::GraphOptimizationLevel;
+#[cfg(feature = "ort")]
+use ort::session::{IoBinding, Session};
+#[cfg(feature = "ort")]
+use ort::value::{Tensor, TensorRef, ValueType};
+#[cfg(feature = "ort")]
+use tracing::debug;
+use tracing::info;
+
+use crate::Provider;
+
+use super::feature::FeatureTensor;
+use super::native_tensorrt::{NativeContentVecEngine, NativeRmvpeEngine, NativeRvcEngine};
+use super::onnx_meta::{read_model_io, RvcIoNames};
+use super::tensorrt::*;
+
+/// Copies an embedder output (`shape` + `data`) into a reused `FeatureTensor`,
+/// clearing it first. Lets the extract paths fill a caller-owned buffer instead
+/// of allocating a fresh tensor each chunk.
+fn fill_feature_tensor(out: &mut FeatureTensor, shape: &[i64], data: &[f32]) {
+    out.data.clear();
+    out.data.extend_from_slice(data);
+    out.shape.clear();
+    out.shape.extend_from_slice(shape);
+}
+
+pub(super) struct HubertEmbedderSession {
+    // Present only in the ORT build, where it backs CPU/CUDA inference. The
+    // native TensorRT-only build drops ORT entirely and runs through `native`.
+    #[cfg(feature = "ort")]
+    pub(super) session: Session,
+    pub(super) provider: Provider,
+    pub(super) tensor_rt_profile: Option<TensorRtSessionProfile>,
+    pub(super) tensor_rt_run_mode: TensorRtRunMode,
+    #[cfg(feature = "ort")]
+    pub(super) tensor_rt_binding: Option<HubertTensorRtBinding>,
+    native: Option<NativeContentVecEngine>,
+    pub(super) input_name: String,
+    pub(super) output_name: String,
+}
+
+impl HubertEmbedderSession {
+    pub(super) fn load(
+        path: &Path,
+        provider: Provider,
+        expected_channels: i64,
+        requested_output: Option<&str>,
+        tensor_rt_profile: Option<TensorRtSessionProfile>,
+        tensor_rt_run_mode: TensorRtRunMode,
+        tensor_rt_session_purpose: TensorRtSessionPurpose,
+    ) -> Result<Self> {
+        // Names/validation come from the provider-neutral ONNX reader so the
+        // native TensorRT path needs no ORT session.
+        let io = read_model_io(path)?;
+        let input_name = io.single_input_name()?.to_string();
+        let output_name = io.select_embedder_output(expected_channels, requested_output)?;
+        let native = if provider.is_tensorrt() {
+            let profile = tensor_rt_profile.as_ref().ok_or_else(|| {
+                anyhow!("native TensorRT ContentVec requires a fixed-shape profile")
+            })?;
+            Some(NativeContentVecEngine::load(
+                path,
+                profile,
+                input_name.as_str(),
+                output_name.as_str(),
+                expected_channels,
+            )?)
+        } else {
+            None
+        };
+        // In the ORT build the session backs CPU/CUDA inference; the native
+        // TensorRT path keeps a CPU session only as an unused placeholder there
+        // (it is compiled out of the TensorRT-only build).
+        #[cfg(feature = "ort")]
+        let session = {
+            let session_provider = if provider.is_tensorrt() {
+                Provider::Cpu
+            } else {
+                provider
+            };
+            load_session(
+                path,
+                session_provider,
+                ModelRole::ContentVec,
+                tensor_rt_profile.as_ref(),
+                tensor_rt_run_mode,
+                tensor_rt_session_purpose,
+                // ContentVec is never a streaming export; keep its runtime cache.
+                false,
+            )?
+        };
+        info!(
+            "loaded embedder: {} input={} output={}",
+            path.display(),
+            input_name,
+            output_name
+        );
+        Ok(Self {
+            #[cfg(feature = "ort")]
+            session,
+            provider,
+            tensor_rt_profile,
+            tensor_rt_run_mode,
+            #[cfg(feature = "ort")]
+            tensor_rt_binding: None,
+            native,
+            input_name,
+            output_name,
+        })
+    }
+
+    /// ContentVec output frame count from the native TensorRT engine, when this
+    /// embedder is backed by one. `None` for ORT-backed sessions. The engine
+    /// self-reports its fixed output length, so this needs no warmup inference.
+    pub(super) fn native_contentvec_output_frames(&self) -> Option<Result<usize>> {
+        self.native.as_ref().map(|native| native.output_frames())
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn enable_tensorrt_binding(
+        &mut self,
+        output_shape: &[i64],
+        shared_waveform: Option<&TensorRtSharedWaveform>,
+    ) -> Result<()> {
+        if !provider_uses_fixed_shape(self.provider) {
+            return Ok(());
+        }
+        if self.native.is_some() {
+            return Ok(());
+        }
+        let profile = self
+            .tensor_rt_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("ContentVec IoBinding requires a fixed-shape profile"))?;
+        let input_shape = profile.fixed_input_dims(self.input_name.as_str())?;
+        let output_shape = i64_shape_to_usize(output_shape, "contentvec output")?;
+        let binding = match self.tensor_rt_run_mode {
+            TensorRtRunMode::PinnedCpu => {
+                HubertTensorRtBinding::Pinned(HubertTensorRtPinnedBinding::new(
+                    &self.session,
+                    self.input_name.as_str(),
+                    input_shape,
+                    self.output_name.as_str(),
+                    &output_shape,
+                    profile.gpu_device_id,
+                )?)
+            }
+            TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
+                let mut binding = HubertTensorRtGraphBinding::new(
+                    &self.session,
+                    self.input_name.as_str(),
+                    input_shape,
+                    self.output_name.as_str(),
+                    &output_shape,
+                    shared_waveform,
+                    profile.gpu_device_id,
+                )?;
+                binding.warmup_capture(
+                    &mut self.session,
+                    self.output_name.as_str(),
+                    ModelRole::ContentVec,
+                    self.provider,
+                    self.tensor_rt_run_mode.cuda_graph(),
+                )?;
+                HubertTensorRtBinding::CudaGraph(binding)
+            }
+        };
+        let shared_waveform_input = match &binding {
+            HubertTensorRtBinding::Pinned(_) => false,
+            HubertTensorRtBinding::CudaGraph(binding) => binding.shared_waveform_input,
+        };
+        info!(
+            "GPU IoBinding enabled backend={} model_role={} mode={} cuda_graph={} device_io={} input={} input_shape={} output={} output_shape={} shared_waveform_input={} host_input_memory=CUDA_PINNED/CPUInput host_output_memory=CUDA_PINNED/CPUOutput bound_input_memory={} bound_output_memory={}",
+            self.provider.label(),
+            ModelRole::ContentVec.label(),
+            self.tensor_rt_run_mode.label(),
+            self.tensor_rt_run_mode.cuda_graph(),
+            self.tensor_rt_run_mode.device_io(),
+            self.input_name,
+            format_usize_shape(input_shape),
+            self.output_name,
+            format_usize_shape(&output_shape),
+            shared_waveform_input,
+            self.tensor_rt_run_mode.bound_input_memory(),
+            self.tensor_rt_run_mode.bound_output_memory()
+        );
+        self.tensor_rt_binding = Some(binding);
+        Ok(())
+    }
+
+    /// Runs ContentVec, writing the rank-3 feature tensor into `out` (a
+    /// caller-owned buffer reused across chunks) instead of allocating a fresh
+    /// `FeatureTensor` each call.
+    pub(super) fn extract_into(
+        &mut self,
+        audio_16k: &[f32],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
+        let input_shape = [1usize, audio_16k.len()];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            self.input_name.as_str(),
+            &input_shape,
+        )?;
+        #[cfg(feature = "ort")]
+        if self.tensor_rt_binding.is_some() {
+            return self.extract_with_binding(audio_16k, out);
+        }
+        if let Some(native) = self.native.as_mut() {
+            // The native TensorRT FFI still returns an owned tensor; copy it into
+            // the reused buffer so the contract matches the ORT paths.
+            let ft = native.extract(audio_16k)?;
+            fill_feature_tensor(out, &ft.shape, &ft.data);
+            return Ok(());
+        }
+        #[cfg(feature = "ort")]
+        {
+            self.extract_with_session_run(audio_16k, &input_shape, out)
+        }
+        #[cfg(not(feature = "ort"))]
+        {
+            let _ = out;
+            bail!("ContentVec session inference requires the `ort` feature; this build supports native TensorRT only")
+        }
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn extract_with_session_run(
+        &mut self,
+        audio_16k: &[f32],
+        input_shape: &[usize; 2],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
+        // Borrow the worker-owned input slice for synchronous ORT runs. Using
+        // Tensor::from_array here would allocate and copy the full waveform on
+        // every realtime chunk.
+        let input = TensorRef::from_array_view((*input_shape, audio_16k))?;
+        let run_start = Instant::now();
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])?;
+        debug!(
+            "embedder session.run backend={} input={} shape={} elapsed_us={}",
+            self.provider.label(),
+            self.input_name,
+            format_usize_shape(input_shape),
+            run_start.elapsed().as_micros()
+        );
+        let value = outputs
+            .get(self.output_name.as_str())
+            .ok_or_else(|| anyhow!("embedder output '{}' not found", self.output_name))?;
+        let (shape, data) = value.try_extract_tensor::<f32>()?;
+        if shape.len() != 3 {
+            bail!("embedder output must be rank-3 [1, frames, channels], got {shape}");
+        }
+        fill_feature_tensor(out, shape, data);
+        Ok(())
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn extract_with_binding(
+        &mut self,
+        audio_16k: &[f32],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
+        let binding = self
+            .tensor_rt_binding
+            .as_mut()
+            .ok_or_else(|| anyhow!("TensorRT ContentVec IoBinding is not initialized"))?;
+        match binding {
+            HubertTensorRtBinding::Pinned(binding) => {
+                copy_f32_tensor(&mut binding.audio, audio_16k, "audio")?;
+                binding
+                    .binding
+                    .bind_input(self.input_name.as_str(), &binding.audio)
+                    .with_context(|| {
+                        format!(
+                            "failed to bind TensorRT ContentVec input '{}'",
+                            self.input_name
+                        )
+                    })?;
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                binding
+                    .binding
+                    .synchronize_outputs()
+                    .context("failed to synchronize TensorRT ContentVec bound output")?;
+                debug!(
+                    "embedder session.run_binding backend={} cuda_graph=false device_io=false input={} shape={} output={} output_shape={} elapsed_us={}",
+                    self.provider.label(),
+                    self.input_name,
+                    format_usize_shape(&binding.input_shape),
+                    self.output_name,
+                    format_usize_shape(&binding.output_shape),
+                    run_start.elapsed().as_micros()
+                );
+                let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                if shape.len() != 3 {
+                    bail!("embedder output must be rank-3 [1, frames, channels], got {shape}");
+                }
+                let actual_shape = i64_shape_to_usize(shape, "contentvec output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT ContentVec bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                fill_feature_tensor(out, shape, data);
+                Ok(())
+            }
+            HubertTensorRtBinding::CudaGraph(binding) => {
+                let h2d_us = binding
+                    .copy_audio_to_device_if_owned(audio_16k, self.input_name.as_str())?
+                    .unwrap_or(0);
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                let run_us = run_start.elapsed().as_micros();
+                let d2h_start = Instant::now();
+                copy_f32_tensor_to_host(
+                    &binding.device_output,
+                    &mut binding.host_output,
+                    self.output_name.as_str(),
+                )?;
+                let d2h_us = d2h_start.elapsed().as_micros();
+                debug!(
+                    "embedder session.run_binding(device_io=true) backend={} cuda_graph={} shared_waveform_input={} input={} shape={} output={} output_shape={} h2d_us={} run_us={} d2h_us={} elapsed_us={}",
+                    self.provider.label(),
+                    self.tensor_rt_run_mode.cuda_graph(),
+                    binding.shared_waveform_input,
+                    self.input_name,
+                    format_usize_shape(&binding.input_shape),
+                    self.output_name,
+                    format_usize_shape(&binding.output_shape),
+                    h2d_us,
+                    run_us,
+                    d2h_us,
+                    h2d_us + run_us + d2h_us
+                );
+                let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                if shape.len() != 3 {
+                    bail!("embedder output must be rank-3 [1, frames, channels], got {shape}");
+                }
+                let actual_shape = i64_shape_to_usize(shape, "contentvec output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT ContentVec bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                fill_feature_tensor(out, shape, data);
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(super) struct RmvpePitchSession {
+    #[cfg(feature = "ort")]
+    pub(super) session: Session,
+    pub(super) provider: Provider,
+    pub(super) tensor_rt_profile: Option<TensorRtSessionProfile>,
+    pub(super) tensor_rt_run_mode: TensorRtRunMode,
+    #[cfg(feature = "ort")]
+    pub(super) tensor_rt_binding: Option<RmvpeTensorRtBinding>,
+    native: Option<NativeRmvpeEngine>,
+    // Reused buffer for the pitch-shift-scaled F0 output, so `extract` does not
+    // allocate a fresh Vec every chunk. Returned as a borrowed slice.
+    pitchf_scratch: Vec<f32>,
+}
+
+impl RmvpePitchSession {
+    pub(super) fn load(
+        path: &Path,
+        provider: Provider,
+        tensor_rt_profile: Option<TensorRtSessionProfile>,
+        tensor_rt_run_mode: TensorRtRunMode,
+        tensor_rt_session_purpose: TensorRtSessionPurpose,
+    ) -> Result<Self> {
+        let io = read_model_io(path)?;
+        io.require_inputs(&["waveform", "threshold"])?;
+        io.require_output("pitchf")?;
+        let native = if provider.is_tensorrt() {
+            let profile = tensor_rt_profile
+                .as_ref()
+                .ok_or_else(|| anyhow!("native TensorRT RMVPE requires a fixed-shape profile"))?;
+            Some(NativeRmvpeEngine::load(path, profile)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "ort")]
+        let session = {
+            let session_provider = if provider.is_tensorrt() {
+                Provider::Cpu
+            } else {
+                provider
+            };
+            load_session(
+                path,
+                session_provider,
+                ModelRole::Rmvpe,
+                tensor_rt_profile.as_ref(),
+                tensor_rt_run_mode,
+                tensor_rt_session_purpose,
+                // RMVPE is never a streaming export; keep its runtime cache.
+                false,
+            )?
+        };
+        info!("loaded RMVPE f0 model: {}", path.display());
+        Ok(Self {
+            #[cfg(feature = "ort")]
+            session,
+            provider,
+            tensor_rt_profile,
+            tensor_rt_run_mode,
+            #[cfg(feature = "ort")]
+            tensor_rt_binding: None,
+            native,
+            pitchf_scratch: Vec::new(),
+        })
+    }
+
+    pub(super) fn warmup_output_shape(
+        &mut self,
+        audio_16k_samples: usize,
+        threshold: f32,
+    ) -> Result<Vec<i64>> {
+        let waveform_shape = [1usize, audio_16k_samples];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            "waveform",
+            &waveform_shape,
+        )?;
+        if let Some(native) = self.native.as_ref() {
+            return Ok(native.warmup_output_shape());
+        }
+        #[cfg(feature = "ort")]
+        {
+            let waveform = Tensor::from_array((waveform_shape, vec![0.0f32; audio_16k_samples]))?;
+            let threshold = Tensor::from_array(([1usize], vec![threshold]))?;
+            let run_start = Instant::now();
+            let outputs = self.session.run(ort::inputs![
+                "waveform" => waveform,
+                "threshold" => threshold,
+            ])?;
+            debug!(
+                "rmvpe warmup session.run backend={} input=waveform shape={} elapsed_us={}",
+                self.provider.label(),
+                format_usize_shape(&waveform_shape),
+                run_start.elapsed().as_micros()
+            );
+            let value = outputs
+                .get("pitchf")
+                .ok_or_else(|| anyhow!("RMVPE output 'pitchf' not found"))?;
+            let (shape, _) = value.try_extract_tensor::<f32>()?;
+            Ok(shape.to_vec())
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!("RMVPE warmup requires the `ort` feature; native TensorRT reports its own shape")
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn enable_tensorrt_binding(
+        &mut self,
+        output_shape: &[i64],
+        threshold: f32,
+        shared_waveform: Option<&TensorRtSharedWaveform>,
+    ) -> Result<()> {
+        if !provider_uses_fixed_shape(self.provider) {
+            return Ok(());
+        }
+        if self.native.is_some() {
+            return Ok(());
+        }
+        let profile = self
+            .tensor_rt_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("RMVPE IoBinding requires a fixed-shape profile"))?;
+        let waveform_shape = profile.fixed_input_dims("waveform")?;
+        let output_shape = i64_shape_to_usize(output_shape, "rmvpe output")?;
+        let binding = match self.tensor_rt_run_mode {
+            TensorRtRunMode::PinnedCpu => {
+                RmvpeTensorRtBinding::Pinned(RmvpeTensorRtPinnedBinding::new(
+                    &self.session,
+                    waveform_shape,
+                    &output_shape,
+                    threshold,
+                    profile.gpu_device_id,
+                )?)
+            }
+            TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
+                let mut binding = RmvpeTensorRtGraphBinding::new(
+                    &self.session,
+                    waveform_shape,
+                    &output_shape,
+                    threshold,
+                    shared_waveform,
+                    profile.gpu_device_id,
+                )?;
+                binding.warmup_capture(
+                    &mut self.session,
+                    self.provider,
+                    self.tensor_rt_run_mode.cuda_graph(),
+                )?;
+                RmvpeTensorRtBinding::CudaGraph(binding)
+            }
+        };
+        let shared_waveform_input = match &binding {
+            RmvpeTensorRtBinding::Pinned(_) => false,
+            RmvpeTensorRtBinding::CudaGraph(binding) => binding.shared_waveform_input,
+        };
+        info!(
+            "GPU IoBinding enabled backend={} model_role={} mode={} cuda_graph={} device_io={} input=waveform input_shape={} output=pitchf output_shape={} shared_waveform_input={} host_input_memory=CUDA_PINNED/CPUInput host_output_memory=CUDA_PINNED/CPUOutput bound_input_memory={} bound_output_memory={}",
+            self.provider.label(),
+            ModelRole::Rmvpe.label(),
+            self.tensor_rt_run_mode.label(),
+            self.tensor_rt_run_mode.cuda_graph(),
+            self.tensor_rt_run_mode.device_io(),
+            format_usize_shape(waveform_shape),
+            format_usize_shape(&output_shape),
+            shared_waveform_input,
+            self.tensor_rt_run_mode.bound_input_memory(),
+            self.tensor_rt_run_mode.bound_output_memory()
+        );
+        self.tensor_rt_binding = Some(binding);
+        Ok(())
+    }
+
+    /// Extracts F0, returning a borrowed slice into a reused internal buffer so
+    /// the realtime path does not allocate a fresh Vec each chunk. The result is
+    /// valid until the next `extract` call.
+    pub(super) fn extract(
+        &mut self,
+        audio_16k: &[f32],
+        pitch_shift: f32,
+        threshold: f32,
+    ) -> Result<&[f32]> {
+        let waveform_shape = [1usize, audio_16k.len()];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            "waveform",
+            &waveform_shape,
+        )?;
+        #[cfg(feature = "ort")]
+        if self.tensor_rt_binding.is_some() {
+            return self.extract_with_binding(audio_16k, pitch_shift, threshold);
+        }
+        if let Some(native) = self.native.as_mut() {
+            // The native TensorRT FFI still returns an owned Vec; copy it into the
+            // reused scratch so the borrowed-slice contract holds across backends.
+            let raw = native.extract(audio_16k, pitch_shift, threshold)?;
+            self.pitchf_scratch.clear();
+            self.pitchf_scratch.extend_from_slice(&raw);
+            return Ok(self.pitchf_scratch.as_slice());
+        }
+        #[cfg(feature = "ort")]
+        {
+            self.extract_with_session_run(audio_16k, pitch_shift, threshold, &waveform_shape)
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!("RMVPE session inference requires the `ort` feature; this build supports native TensorRT only")
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn extract_with_session_run(
+        &mut self,
+        audio_16k: &[f32],
+        pitch_shift: f32,
+        threshold: f32,
+        waveform_shape: &[usize; 2],
+    ) -> Result<&[f32]> {
+        let threshold_value = [threshold];
+        let waveform = TensorRef::from_array_view((*waveform_shape, audio_16k))?;
+        let threshold = TensorRef::from_array_view(([1usize], threshold_value.as_slice()))?;
+        let run_start = Instant::now();
+        let outputs = self.session.run(ort::inputs![
+            "waveform" => waveform,
+            "threshold" => threshold,
+        ])?;
+        debug!(
+            "rmvpe session.run backend={} input=waveform shape={} elapsed_us={}",
+            self.provider.label(),
+            format_usize_shape(waveform_shape),
+            run_start.elapsed().as_micros()
+        );
+        let value = outputs
+            .get("pitchf")
+            .ok_or_else(|| anyhow!("RMVPE output 'pitchf' not found"))?;
+        let (_, data) = value.try_extract_tensor::<f32>()?;
+        let factor = 2.0f32.powf(pitch_shift / 12.0);
+        // `data` borrows `outputs` (i.e. `self.session`); `pitchf_scratch` is a
+        // disjoint field, so scaling into it here is a valid split borrow.
+        self.pitchf_scratch.clear();
+        self.pitchf_scratch
+            .extend(data.iter().map(|f0| f0 * factor));
+        Ok(self.pitchf_scratch.as_slice())
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn extract_with_binding(
+        &mut self,
+        audio_16k: &[f32],
+        pitch_shift: f32,
+        threshold: f32,
+    ) -> Result<&[f32]> {
+        let binding = self
+            .tensor_rt_binding
+            .as_mut()
+            .ok_or_else(|| anyhow!("TensorRT RMVPE IoBinding is not initialized"))?;
+        match binding {
+            RmvpeTensorRtBinding::Pinned(binding) => {
+                copy_f32_tensor(&mut binding.waveform, audio_16k, "waveform")?;
+                binding
+                    .binding
+                    .bind_input("waveform", &binding.waveform)
+                    .context("failed to bind TensorRT RMVPE input 'waveform'")?;
+                binding.bind_threshold_if_changed(threshold)?;
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                binding
+                    .binding
+                    .synchronize_outputs()
+                    .context("failed to synchronize TensorRT RMVPE bound output")?;
+                debug!(
+                    "rmvpe session.run_binding backend={} cuda_graph=false device_io=false input=waveform shape={} output=pitchf output_shape={} elapsed_us={}",
+                    self.provider.label(),
+                    format_usize_shape(&binding.waveform_shape),
+                    format_usize_shape(&binding.output_shape),
+                    run_start.elapsed().as_micros()
+                );
+                let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                let actual_shape = i64_shape_to_usize(shape, "rmvpe output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT RMVPE bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                let factor = 2.0f32.powf(pitch_shift / 12.0);
+                // `data` borrows the bound output (self.tensor_rt_binding); the
+                // scratch is a disjoint field, so scaling into it is valid here.
+                self.pitchf_scratch.clear();
+                self.pitchf_scratch
+                    .extend(data.iter().map(|f0| f0 * factor));
+                Ok(self.pitchf_scratch.as_slice())
+            }
+            RmvpeTensorRtBinding::CudaGraph(binding) => {
+                let h2d_start = Instant::now();
+                let waveform_h2d_us = binding
+                    .copy_waveform_to_device_if_owned(audio_16k)?
+                    .unwrap_or(0);
+                binding.copy_threshold_if_changed(threshold)?;
+                let h2d_us = h2d_start.elapsed().as_micros();
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                let run_us = run_start.elapsed().as_micros();
+                let d2h_start = Instant::now();
+                copy_f32_tensor_to_host(
+                    &binding.device_output,
+                    &mut binding.host_output,
+                    "pitchf",
+                )?;
+                let d2h_us = d2h_start.elapsed().as_micros();
+                debug!(
+                    "rmvpe session.run_binding(device_io=true) backend={} cuda_graph={} shared_waveform_input={} input=waveform shape={} output=pitchf output_shape={} waveform_h2d_us={} h2d_us={} run_us={} d2h_us={} elapsed_us={}",
+                    self.provider.label(),
+                    self.tensor_rt_run_mode.cuda_graph(),
+                    binding.shared_waveform_input,
+                    format_usize_shape(&binding.waveform_shape),
+                    format_usize_shape(&binding.output_shape),
+                    waveform_h2d_us,
+                    h2d_us,
+                    run_us,
+                    d2h_us,
+                    h2d_us + run_us + d2h_us
+                );
+                let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                let actual_shape = i64_shape_to_usize(shape, "rmvpe output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT RMVPE bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                let factor = 2.0f32.powf(pitch_shift / 12.0);
+                // `data` borrows the bound output (self.tensor_rt_binding); the
+                // scratch is a disjoint field, so scaling into it is valid here.
+                self.pitchf_scratch.clear();
+                self.pitchf_scratch
+                    .extend(data.iter().map(|f0| f0 * factor));
+                Ok(self.pitchf_scratch.as_slice())
+            }
+        }
+    }
+}
+
+// Resolved latent-noise binding: the model's `rnd` input name, its
+// `[1, channels, frame_len]` shape, and the caller-supplied channel-major data.
+#[cfg(feature = "ort")]
+type RndBinding<'a> = (&'a str, [usize; 3], &'a [f32]);
+
+// Resolve the model's optional `rnd` (latent-noise) input into a bindable tensor
+// view from the caller-supplied CPU noise window. The noise itself is produced
+// once, backend-neutrally, by the rolling state in `time_state` — this only maps
+// the flat channel-major slice to the model's resolved input name and shape.
+//
+// `(Some(info), Some(data))` -> bind under `info.name` with shape
+// `[1, channels, frame_len]`; `(Some, None)` -> the model needs noise but none
+// was provided (error); `(None, _)` -> the model samples its own noise, so any
+// provided slice is ignored.
+#[cfg(feature = "ort")]
+fn resolve_rnd_input<'a>(
+    io_names: &'a RvcIoNames,
+    frame_len: usize,
+    rnd: Option<&'a [f32]>,
+) -> Result<Option<RndBinding<'a>>> {
+    match (io_names.rnd.as_ref(), rnd) {
+        (Some(info), Some(data)) => {
+            let channels =
+                usize::try_from(info.channels).context("invalid RVC rnd channel count")?;
+            let expected = channels
+                .checked_mul(frame_len)
+                .context("RVC rnd input length overflow")?;
+            if data.len() != expected {
+                bail!(
+                    "RVC rnd length {} does not match channels*frame_len {} ({}*{})",
+                    data.len(),
+                    expected,
+                    channels,
+                    frame_len
+                );
+            }
+            Ok(Some((info.name.as_str(), [1, channels, frame_len], data)))
+        }
+        (Some(info), None) => bail!(
+            "RVC model requires an '{}' latent-noise input but none was provided",
+            info.name
+        ),
+        (None, _) => Ok(None),
+    }
+}
+
+// Pair an optional model input name with caller-supplied data: `(Some, Some)`
+// binds, `(Some, None)` is a contract violation (the model needs it), `(None, _)`
+// means the model has no such input so the data is ignored. Used for the optional
+// streaming `nsf_noise` input.
+#[cfg(feature = "ort")]
+fn resolve_optional_input<'a>(
+    name: Option<&'a str>,
+    data: Option<&'a [f32]>,
+    label: &str,
+) -> Result<Option<(&'a str, &'a [f32])>> {
+    match (name, data) {
+        (Some(name), Some(data)) => Ok(Some((name, data))),
+        (Some(name), None) => {
+            bail!("RVC model requires a '{name}' input but no {label} was provided")
+        }
+        (None, _) => Ok(None),
+    }
+}
+
+// CPU output binding is deliberately output-only: inputs still borrow the
+// worker-owned buffers for each synchronous run, while the RVC "audio" tensor
+// keeps stable preallocated storage across chunks with the same shapes.
+#[cfg(feature = "ort")]
+struct RvcCpuOutputBinding {
+    binding: IoBinding,
+    output: Tensor<f32>,
+    output_shape: Vec<usize>,
+    feats_shape: Vec<usize>,
+    pitch_shape: Vec<usize>,
+}
+
+#[cfg(feature = "ort")]
+impl RvcCpuOutputBinding {
+    fn new(
+        session: &Session,
+        feats_shape: &[usize],
+        pitch_shape: &[usize],
+        output_shape: &[usize],
+        audio_name: &str,
+    ) -> Result<Self> {
+        let allocator = Allocator::default();
+        let mut output = Tensor::<f32>::new(&allocator, output_shape.to_vec())
+            .context("failed to allocate CPU RVC output 'audio'")?;
+        let mut binding = session
+            .create_binding()
+            .context("failed to create CPU RVC output IoBinding")?;
+        bind_output_tensor(&mut binding, audio_name, &mut output)
+            .context("failed to bind CPU RVC output 'audio'")?;
+        Ok(Self {
+            binding,
+            output,
+            output_shape: output_shape.to_vec(),
+            feats_shape: feats_shape.to_vec(),
+            pitch_shape: pitch_shape.to_vec(),
+        })
+    }
+
+    fn matches_input(&self, feats_shape: &[usize], pitch_shape: &[usize]) -> bool {
+        self.feats_shape == feats_shape && self.pitch_shape == pitch_shape
+    }
+}
+
+pub(super) struct RvcModelSession {
+    #[cfg(feature = "ort")]
+    pub(super) session: Option<Session>,
+    pub(super) provider: Provider,
+    pub(super) tensor_rt_profile: Option<TensorRtSessionProfile>,
+    pub(super) tensor_rt_run_mode: TensorRtRunMode,
+    #[cfg(feature = "ort")]
+    pub(super) tensor_rt_binding: Option<RvcTensorRtBinding>,
+    native_rvc: Option<NativeRvcEngine>,
+    #[cfg(feature = "ort")]
+    cpu_output_binding: Option<RvcCpuOutputBinding>,
+    pub(super) expected_feat_channels: i64,
+    /// Generator I/O names for this model's export convention; every ORT/TensorRT
+    /// bind site uses these instead of the canonical vcclient literals so RVC
+    /// WebUI / converter exports (`phone`/`nsff0`/`ds`/`rnd`/...) bind correctly.
+    io_names: RvcIoNames,
+}
+
+impl RvcModelSession {
+    pub(super) fn load(
+        path: &Path,
+        provider: Provider,
+        tensor_rt_profile: Option<TensorRtSessionProfile>,
+        expected_feat_channels_override: Option<i64>,
+        tensor_rt_run_mode: TensorRtRunMode,
+        tensor_rt_session_purpose: TensorRtSessionPurpose,
+        io_names: RvcIoNames,
+    ) -> Result<Self> {
+        if provider.is_tensorrt() {
+            let profile = tensor_rt_profile.as_ref().ok_or_else(|| {
+                anyhow!("native TensorRT RVC requires a fixed-shape TensorRT profile")
+            })?;
+            let feats_shape = profile.fixed_input_dims(&io_names.feats)?;
+            let channels = feats_shape
+                .get(2)
+                .copied()
+                .ok_or_else(|| anyhow!("native TensorRT RVC feats profile must be rank-3"))?;
+            let expected_feat_channels = expected_feat_channels_override
+                .unwrap_or_else(|| i64::try_from(channels).unwrap_or(i64::MAX));
+            let native_rvc = NativeRvcEngine::load(path, profile, channels, &io_names)?;
+            info!(
+                "loaded native TensorRT RVC model={} frames={} channels={} session_purpose={}",
+                path.display(),
+                native_rvc.frames(),
+                native_rvc.channels(),
+                tensor_rt_session_purpose.label()
+            );
+            return Ok(Self {
+                #[cfg(feature = "ort")]
+                session: None,
+                provider,
+                tensor_rt_profile,
+                tensor_rt_run_mode,
+                #[cfg(feature = "ort")]
+                tensor_rt_binding: None,
+                native_rvc: Some(native_rvc),
+                #[cfg(feature = "ort")]
+                cpu_output_binding: None,
+                expected_feat_channels,
+                io_names,
+            });
+        }
+        // CPU/CUDA only: validate via the provider-neutral reader, then load the
+        // ORT session for inference. Unreachable in the TensorRT-only build.
+        #[cfg(feature = "ort")]
+        {
+            let io = read_model_io(path)?;
+            let mut required_inputs = vec![
+                io_names.feats.as_str(),
+                io_names.p_len.as_str(),
+                io_names.pitch.as_str(),
+                io_names.pitchf.as_str(),
+                io_names.sid.as_str(),
+            ];
+            if let Some(rnd) = io_names.rnd.as_ref() {
+                required_inputs.push(rnd.name.as_str());
+            }
+            io.require_inputs(&required_inputs)?;
+            io.require_output(io_names.audio.as_str())?;
+            let expected_feat_channels = match expected_feat_channels_override {
+                Some(channels) => channels,
+                None => io.feat_channels(&io_names.feats)?,
+            };
+            io.validate_rvc_metadata()?;
+            let session = load_session(
+                path,
+                provider,
+                ModelRole::Rvc,
+                tensor_rt_profile.as_ref(),
+                tensor_rt_run_mode,
+                tensor_rt_session_purpose,
+                // Streaming RVC exports (nsf_noise/phase I/O) crash the NvTensorRtRtx
+                // EP when it writes its runtime cache on session destroy; disable
+                // that cache for them. Non-streaming RVC keeps it.
+                io_names.nsf_noise.is_some(),
+            )?;
+            info!("loaded RVC model: {}", path.display());
+            Ok(Self {
+                session: Some(session),
+                provider,
+                tensor_rt_profile,
+                tensor_rt_run_mode,
+                tensor_rt_binding: None,
+                native_rvc: None,
+                cpu_output_binding: None,
+                expected_feat_channels,
+                io_names,
+            })
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!(
+            "provider {} requires the `ort` feature; this build supports native TensorRT only",
+            provider.label()
+        )
+    }
+
+    pub(super) fn warmup_output_shape(
+        &mut self,
+        feature_len: usize,
+        feature_channels: i64,
+        speaker_id: i64,
+    ) -> Result<Vec<i64>> {
+        if let Some(native) = self.native_rvc.as_ref() {
+            if native.frames() != feature_len {
+                bail!(
+                    "native TensorRT RVC engine frame count {} does not match runtime feature_len {}",
+                    native.frames(),
+                    feature_len
+                );
+            }
+            if native.channels()
+                != usize::try_from(feature_channels).context("invalid RVC channel count")?
+            {
+                bail!(
+                    "native TensorRT RVC engine channel count {} does not match model channel count {}",
+                    native.channels(),
+                    feature_channels
+                );
+            }
+            // The engine self-reports its fixed `audio` output length after
+            // deserialize, so no warmup inference is needed to learn the shape.
+            // `speaker_id` is consumed only by the ORT branch below.
+            return Ok(vec![
+                i64::try_from(native.output_len()).context("native RVC output length overflow")?
+            ]);
+        }
+        #[cfg(not(feature = "ort"))]
+        {
+            let _ = (feature_len, feature_channels, speaker_id);
+            bail!("RVC warmup requires the `ort` feature; native TensorRT reports its own shape")
+        }
+        #[cfg(feature = "ort")]
+        {
+            let feats_shape = vec![1i64, feature_len as i64, feature_channels];
+            let feats_shape_usize = i64_shape_to_usize(&feats_shape, "feats")?;
+            validate_tensorrt_input_shape(
+                self.provider,
+                self.tensor_rt_profile.as_ref(),
+                self.io_names.feats.as_str(),
+                &feats_shape_usize,
+            )?;
+            let pitch_shape = [1usize, feature_len];
+            validate_tensorrt_input_shape(
+                self.provider,
+                self.tensor_rt_profile.as_ref(),
+                self.io_names.pitch.as_str(),
+                &pitch_shape,
+            )?;
+            validate_tensorrt_input_shape(
+                self.provider,
+                self.tensor_rt_profile.as_ref(),
+                self.io_names.pitchf.as_str(),
+                &pitch_shape,
+            )?;
+            let feats_len = feature_len
+                .checked_mul(
+                    usize::try_from(feature_channels).context("invalid RVC channel count")?,
+                )
+                .context("RVC warmup feats input length overflow")?;
+            let feats = Tensor::from_array((feats_shape.clone(), vec![0.0f32; feats_len]))?;
+            let p_len = Tensor::from_array(([1usize], vec![feature_len as i64]))?;
+            let pitch = Tensor::from_array((pitch_shape, vec![1i64; feature_len]))?;
+            let pitchf = Tensor::from_array((pitch_shape, vec![0.0f32; feature_len]))?;
+            let sid = Tensor::from_array(([1usize], vec![speaker_id]))?;
+            // Latent noise (when this export takes it): warmup only learns the
+            // output shape, so zeros suffice — the per-chunk path feeds real noise.
+            let rnd = match self.io_names.rnd.as_ref() {
+                Some(rnd) => {
+                    let channels =
+                        usize::try_from(rnd.channels).context("invalid RVC rnd channel count")?;
+                    let len = channels
+                        .checked_mul(feature_len)
+                        .context("RVC rnd warmup length overflow")?;
+                    Some((
+                        rnd.name.as_str(),
+                        Tensor::from_array(([1usize, channels, feature_len], vec![0.0f32; len]))?,
+                    ))
+                }
+                None => None,
+            };
+            // Streaming exports require `nsf_noise` + `phase_in` to run at all;
+            // warmup only learns the output shape, so zeros suffice. Size the NSF
+            // noise from the profile's `[1, audio_len, 1]` entry so it matches the
+            // fixed-shape session. Both names are present together for streaming.
+            let stream = match (
+                self.io_names.nsf_noise.as_deref(),
+                self.io_names.phase_in.as_deref(),
+            ) {
+                (Some(nsf_name), Some(phase_name)) => {
+                    let profile = self.tensor_rt_profile.as_ref().ok_or_else(|| {
+                        anyhow!("streaming RVC warmup requires a fixed-shape profile")
+                    })?;
+                    let dims = profile.fixed_input_dims(nsf_name)?;
+                    let audio_len = *dims.get(1).ok_or_else(|| {
+                        anyhow!("TensorRT RVC 'nsf_noise' profile must be rank-3")
+                    })?;
+                    Some((
+                        nsf_name,
+                        Tensor::from_array(([1usize, audio_len, 1usize], vec![0.0f32; audio_len]))?,
+                        phase_name,
+                        Tensor::from_array(([1usize, 1, 1], vec![0.0f32]))?,
+                    ))
+                }
+                _ => None,
+            };
+            let run_start = Instant::now();
+            let names = &self.io_names;
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+            let outputs = match (rnd, stream) {
+                // Streaming export: feats/p_len/pitch/pitchf/sid + rnd + nsf_noise
+                // + phase_in (all present together).
+                (Some((rnd_name, rnd)), Some((nsf_name, nsf, phase_name, phase))) => {
+                    session.run(ort::inputs![
+                        names.feats.as_str() => feats,
+                        names.p_len.as_str() => p_len,
+                        names.pitch.as_str() => pitch,
+                        names.pitchf.as_str() => pitchf,
+                        names.sid.as_str() => sid,
+                        rnd_name => rnd,
+                        nsf_name => nsf,
+                        phase_name => phase,
+                    ])?
+                }
+                (Some((rnd_name, rnd)), None) => session.run(ort::inputs![
+                    names.feats.as_str() => feats,
+                    names.p_len.as_str() => p_len,
+                    names.pitch.as_str() => pitch,
+                    names.pitchf.as_str() => pitchf,
+                    names.sid.as_str() => sid,
+                    rnd_name => rnd,
+                ])?,
+                (None, None) => session.run(ort::inputs![
+                    names.feats.as_str() => feats,
+                    names.p_len.as_str() => p_len,
+                    names.pitch.as_str() => pitch,
+                    names.pitchf.as_str() => pitchf,
+                    names.sid.as_str() => sid,
+                ])?,
+                (None, Some(_)) => {
+                    bail!("RVC streaming warmup requires the export's 'rnd' input")
+                }
+            };
+            debug!(
+                "rvc warmup session.run backend={} feats_shape={} pitch_shape={} elapsed_us={}",
+                self.provider.label(),
+                format_usize_shape(&feats_shape_usize),
+                format_usize_shape(&pitch_shape),
+                run_start.elapsed().as_micros()
+            );
+            let value = outputs
+                .get(self.io_names.audio.as_str())
+                .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
+            let (shape, _) = value.try_extract_tensor::<f32>()?;
+            Ok(shape.to_vec())
+        }
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn enable_tensorrt_binding(
+        &mut self,
+        output_shape: &[i64],
+        speaker_id: i64,
+    ) -> Result<()> {
+        if self.native_rvc.is_some() {
+            return Ok(());
+        }
+        if !provider_uses_fixed_shape(self.provider) {
+            return Ok(());
+        }
+        let profile = self
+            .tensor_rt_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("RVC IoBinding requires a fixed-shape profile"))?;
+        let feats_shape = profile.fixed_input_dims(&self.io_names.feats)?;
+        let pitch_shape = profile.fixed_input_dims(&self.io_names.pitch)?;
+        let frame_len = pitch_shape
+            .get(1)
+            .copied()
+            .ok_or_else(|| anyhow!("TensorRT RVC pitch profile must be rank-2"))?;
+        let output_shape = i64_shape_to_usize(output_shape, "rvc output")?;
+        // Streaming exports add the NSF noise/phase I/O. Its output-sample length
+        // comes from the profile's `nsf_noise` `[1, audio_len, 1]` entry (added
+        // only when the model is a streaming export and the run mode supports it),
+        // so the binding buffers agree with the profiled shapes. Only the
+        // pinned-CPU IoBinding binds streaming I/O today.
+        let stream_audio_len =
+            match self.io_names.nsf_noise.as_deref() {
+                Some(nsf_name) => {
+                    let dims = profile.fixed_input_dims(nsf_name)?;
+                    Some(*dims.get(1).ok_or_else(|| {
+                        anyhow!("TensorRT RVC 'nsf_noise' profile must be rank-3")
+                    })?)
+                }
+                None => None,
+            };
+        let binding = match self.tensor_rt_run_mode {
+            TensorRtRunMode::PinnedCpu => {
+                RvcTensorRtBinding::Pinned(RvcTensorRtPinnedBinding::new(
+                    self.session
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?,
+                    feats_shape,
+                    pitch_shape,
+                    &output_shape,
+                    frame_len as i64,
+                    speaker_id,
+                    profile.gpu_device_id,
+                    &self.io_names,
+                    stream_audio_len,
+                )?)
+            }
+            TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+                let mut binding = RvcTensorRtGraphBinding::new(
+                    session,
+                    feats_shape,
+                    pitch_shape,
+                    &output_shape,
+                    frame_len as i64,
+                    speaker_id,
+                    profile.gpu_device_id,
+                    &self.io_names,
+                )?;
+                binding.warmup_capture(
+                    session,
+                    self.provider,
+                    self.tensor_rt_run_mode.cuda_graph(),
+                )?;
+                RvcTensorRtBinding::CudaGraph(binding)
+            }
+        };
+        info!(
+            "GPU IoBinding enabled backend={} model_role={} mode={} cuda_graph={} device_io={} inputs=feats:{},pitch:{},pitchf:{},p_len:1,sid:1 output=audio output_shape={} host_input_memory=CUDA_PINNED/CPUInput host_output_memory=CUDA_PINNED/CPUOutput bound_input_memory={} bound_output_memory={}",
+            self.provider.label(),
+            ModelRole::Rvc.label(),
+            self.tensor_rt_run_mode.label(),
+            self.tensor_rt_run_mode.cuda_graph(),
+            self.tensor_rt_run_mode.device_io(),
+            format_usize_shape(feats_shape),
+            format_usize_shape(pitch_shape),
+            format_usize_shape(pitch_shape),
+            format_usize_shape(&output_shape),
+            self.tensor_rt_run_mode.bound_input_memory(),
+            self.tensor_rt_run_mode.bound_output_memory()
+        );
+        self.tensor_rt_binding = Some(binding);
+        Ok(())
+    }
+
+    #[cfg(feature = "ort")]
+    fn enable_cpu_output_binding(
+        &mut self,
+        feats_shape: &[usize],
+        pitch_shape: &[usize],
+        output_shape: &[usize],
+    ) -> Result<()> {
+        if self.provider != Provider::Cpu {
+            return Ok(());
+        }
+        // Streaming exports have extra inputs (nsf_noise) and an extra output
+        // (phase_out) this output-only binding does not model; keep them on the
+        // plain session-run path so all I/O is bound by name each call.
+        if self.io_names.phase_in.is_some() {
+            return Ok(());
+        }
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+        let binding = RvcCpuOutputBinding::new(
+            session,
+            feats_shape,
+            pitch_shape,
+            output_shape,
+            self.io_names.audio.as_str(),
+        )?;
+        info!(
+            "CPU output IoBinding enabled model_role={} inputs=feats:{},pitch:{},pitchf:{} output=audio output_shape={}",
+            ModelRole::Rvc.label(),
+            format_usize_shape(feats_shape),
+            format_usize_shape(pitch_shape),
+            format_usize_shape(pitch_shape),
+            format_usize_shape(output_shape)
+        );
+        self.cpu_output_binding = Some(binding);
+        Ok(())
+    }
+
+    // Inputs mirror the ONNX RVC contract (feats/p_len/pitch/pitchf/sid) plus the
+    // reused output buffer; an ad-hoc struct would only obscure that contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn infer(
+        &mut self,
+        feats: &[f32],
+        feats_shape: &[i64],
+        frame_len: usize,
+        pitch: &[i64],
+        pitchf: &[f32],
+        speaker_id: i64,
+        // Latent noise for `rnd`-input models, produced backend-neutrally by the
+        // rolling CPU state; `None` when the model samples its own noise. Each
+        // backend below only binds this slice.
+        rnd: Option<&[f32]>,
+        // Streaming-export NSF source noise `[1, audio_len, 1]` and window-start
+        // NSF phase. `None` for conventional exports. Consumed by the dynamic-shape
+        // session-run path and the native TensorRT path; the ORT fixed-shape
+        // IoBinding paths reject streaming at load.
+        nsf_noise: Option<&[f32]>,
+        phase_in: Option<f32>,
+        // Filled (when streaming) with the model's per-sample `streaming_nsf_phase`
+        // output, from which the caller picks the next chunk's `phase_in`.
+        phase_out: Option<&mut Vec<f32>>,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        // Streaming NSF noise/phase I/O is bound by the dynamic-shape session-run
+        // path, the native engine, and the pinned-CPU IoBinding; only the
+        // CUDA-graph IoBinding still rejects it (inside `infer_with_binding`).
+        let feats_shape_usize = i64_shape_to_usize(feats_shape, "feats")?;
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            self.io_names.feats.as_str(),
+            &feats_shape_usize,
+        )?;
+        let pitch_shape = [1usize, frame_len];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            self.io_names.pitch.as_str(),
+            &pitch_shape,
+        )?;
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            self.io_names.pitchf.as_str(),
+            &pitch_shape,
+        )?;
+        if let Some(native) = self.native_rvc.as_mut() {
+            // The native TensorRT FFI still returns an owned Vec; copy it into the
+            // caller buffer so the reuse contract holds for the ORT paths below.
+            // Refactoring the native shim to write in place is out of scope here.
+            // Streaming exports pass their NSF noise/phase here too (the engine
+            // binds them when built with the streaming profile) and read back the
+            // per-sample phase output for the next window's `phase_in`.
+            let converted = native.infer(
+                feats, pitch, pitchf, speaker_id, rnd, nsf_noise, phase_in, phase_out,
+            )?;
+            out.clear();
+            out.extend_from_slice(&converted);
+            return Ok(());
+        }
+        #[cfg(feature = "ort")]
+        {
+            if self.tensor_rt_binding.is_some() {
+                // The pinned-CPU IoBinding binds streaming NSF noise/phase I/O; the
+                // CUDA-graph IoBinding does not (it rejects streaming inside
+                // `infer_with_binding`).
+                return self.infer_with_binding(
+                    feats, frame_len, pitch, pitchf, speaker_id, rnd, nsf_noise, phase_in,
+                    phase_out, out,
+                );
+            }
+            // The CPU output-binding fast path binds a fixed input set; it is never
+            // enabled for streaming exports (see `enable_cpu_output_binding`), so
+            // streaming always takes the session-run path below.
+            if self.provider == Provider::Cpu
+                && self
+                    .cpu_output_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.matches_input(&feats_shape_usize, &pitch_shape))
+            {
+                return self.infer_with_cpu_output_binding(
+                    feats,
+                    feats_shape,
+                    &feats_shape_usize,
+                    frame_len,
+                    pitch,
+                    pitchf,
+                    speaker_id,
+                    &pitch_shape,
+                    rnd,
+                    out,
+                );
+            }
+            self.infer_with_session_run(
+                feats,
+                feats_shape,
+                &feats_shape_usize,
+                frame_len,
+                pitch,
+                pitchf,
+                speaker_id,
+                &pitch_shape,
+                rnd,
+                nsf_noise,
+                phase_in,
+                phase_out,
+                out,
+            )
+        }
+        #[cfg(not(feature = "ort"))]
+        {
+            // `rnd`/streaming inputs are consumed only by the ORT/native paths
+            // above; in the native build with no ORT they are referenced there.
+            let _ = (rnd, nsf_noise, phase_in, phase_out);
+            let _ = out;
+            bail!("RVC session inference requires the `ort` feature; this build supports native TensorRT only")
+        }
+    }
+
+    // Keep the RVC tensor inputs explicit here: collapsing them into an ad-hoc
+    // struct would obscure the ONNX input contract this function validates.
+    #[cfg(feature = "ort")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn infer_with_session_run(
+        &mut self,
+        feats: &[f32],
+        feats_shape: &[i64],
+        feats_shape_usize: &[usize],
+        frame_len: usize,
+        pitch: &[i64],
+        pitchf: &[f32],
+        speaker_id: i64,
+        pitch_shape: &[usize; 2],
+        rnd: Option<&[f32]>,
+        nsf_noise: Option<&[f32]>,
+        phase_in: Option<f32>,
+        phase_out: Option<&mut Vec<f32>>,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        let p_len_value = [frame_len as i64];
+        let sid_value = [speaker_id];
+        let phase_value = [phase_in.unwrap_or(0.0)];
+        let feats = TensorRef::from_array_view((feats_shape, feats))?;
+        let p_len = TensorRef::from_array_view(([1usize], p_len_value.as_slice()))?;
+        let pitch = TensorRef::from_array_view((*pitch_shape, pitch))?;
+        let pitchf = TensorRef::from_array_view((*pitch_shape, pitchf))?;
+        let sid = TensorRef::from_array_view(([1usize], sid_value.as_slice()))?;
+        let names = &self.io_names;
+        let rnd = resolve_rnd_input(names, frame_len, rnd)?;
+        // Streaming NSF inputs: resolve name + data here (validation), build the
+        // tensor views after taking the session borrow below.
+        let nsf = resolve_optional_input(names.nsf_noise.as_deref(), nsf_noise, "nsf_noise")?;
+        let phase = match (names.phase_in.as_deref(), phase_in) {
+            (Some(name), Some(_)) => Some(name),
+            (Some(name), None) => {
+                bail!("RVC model requires a '{name}' input but no NSF phase was provided")
+            }
+            (None, _) => None,
+        };
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+        let rnd = match rnd {
+            Some((name, shape, data)) => Some((name, TensorRef::from_array_view((shape, data))?)),
+            None => None,
+        };
+        let nsf = match nsf {
+            Some((name, data)) => Some((
+                name,
+                TensorRef::from_array_view(([1usize, data.len(), 1usize], data))?,
+            )),
+            None => None,
+        };
+        let phase = match phase {
+            Some(name) => Some((
+                name,
+                TensorRef::from_array_view(([1usize, 1, 1], phase_value.as_slice()))?,
+            )),
+            None => None,
+        };
+        let output_shape = {
+            let run_start = Instant::now();
+            let outputs = match (rnd, nsf, phase) {
+                // Streaming export: feats/p_len/pitch/pitchf/sid + rnd + nsf_noise
+                // + phase_in (all present together).
+                (Some((rnd_name, rnd)), Some((nsf_name, nsf)), Some((phase_name, phase))) => {
+                    session.run(ort::inputs![
+                        names.feats.as_str() => feats,
+                        names.p_len.as_str() => p_len,
+                        names.pitch.as_str() => pitch,
+                        names.pitchf.as_str() => pitchf,
+                        names.sid.as_str() => sid,
+                        rnd_name => rnd,
+                        nsf_name => nsf,
+                        phase_name => phase,
+                    ])?
+                }
+                // Conventional `rnd`-input export.
+                (Some((rnd_name, rnd)), None, None) => session.run(ort::inputs![
+                    names.feats.as_str() => feats,
+                    names.p_len.as_str() => p_len,
+                    names.pitch.as_str() => pitch,
+                    names.pitchf.as_str() => pitchf,
+                    names.sid.as_str() => sid,
+                    rnd_name => rnd,
+                ])?,
+                // Model samples its own noise.
+                (None, None, None) => session.run(ort::inputs![
+                    names.feats.as_str() => feats,
+                    names.p_len.as_str() => p_len,
+                    names.pitch.as_str() => pitch,
+                    names.pitchf.as_str() => pitchf,
+                    names.sid.as_str() => sid,
+                ])?,
+                _ => bail!("inconsistent RVC streaming inputs (rnd/nsf_noise/phase_in)"),
+            };
+            debug!(
+                "rvc session.run backend={} feats_shape={} pitch_shape={} elapsed_us={}",
+                self.provider.label(),
+                format_usize_shape(feats_shape_usize),
+                format_usize_shape(pitch_shape),
+                run_start.elapsed().as_micros()
+            );
+            // Streaming exports emit the per-sample `streaming_nsf_phase`; copy it
+            // into the caller's buffer so it can select the next window's
+            // `phase_in`. Absent/unrequested for conventional exports.
+            if let (Some(phase_out), Some(phase_out_name)) = (phase_out, names.phase_out.as_deref())
+            {
+                phase_out.clear();
+                if let Some(value) = outputs.get(phase_out_name) {
+                    let (_, data) = value.try_extract_tensor::<f32>()?;
+                    phase_out.extend_from_slice(data);
+                }
+            }
+            let value = outputs
+                .get(names.audio.as_str())
+                .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
+            let (shape, data) = value.try_extract_tensor::<f32>()?;
+            let output_shape = i64_shape_to_usize(shape, "rvc output")?;
+            out.clear();
+            out.extend_from_slice(data);
+            output_shape
+        };
+        self.enable_cpu_output_binding(feats_shape_usize, pitch_shape, &output_shape)?;
+        Ok(())
+    }
+
+    // Keep the RVC tensor inputs explicit here: collapsing them into an ad-hoc
+    // struct would obscure the ONNX input contract this function validates.
+    #[cfg(feature = "ort")]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_with_cpu_output_binding(
+        &mut self,
+        feats: &[f32],
+        feats_shape: &[i64],
+        feats_shape_usize: &[usize],
+        frame_len: usize,
+        pitch: &[i64],
+        pitchf: &[f32],
+        speaker_id: i64,
+        pitch_shape: &[usize; 2],
+        rnd: Option<&[f32]>,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        let p_len_value = [frame_len as i64];
+        let sid_value = [speaker_id];
+        let feats = TensorRef::from_array_view((feats_shape, feats))?;
+        let p_len = TensorRef::from_array_view(([1usize], p_len_value.as_slice()))?;
+        let pitch = TensorRef::from_array_view((*pitch_shape, pitch))?;
+        let pitchf = TensorRef::from_array_view((*pitch_shape, pitchf))?;
+        let sid = TensorRef::from_array_view(([1usize], sid_value.as_slice()))?;
+        let provider = self.provider;
+        let names = &self.io_names;
+        let rnd = resolve_rnd_input(names, frame_len, rnd)?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+        let binding = self
+            .cpu_output_binding
+            .as_mut()
+            .ok_or_else(|| anyhow!("CPU RVC output IoBinding is not initialized"))?;
+        let rnd = match rnd {
+            Some((name, shape, data)) => Some((name, TensorRef::from_array_view((shape, data))?)),
+            None => None,
+        };
+        let run_start = Instant::now();
+        // IoBinding retains bound input OrtValues after the run. These TensorRefs
+        // borrow worker buffers, so clear inputs before returning on both success
+        // and error paths; only the preallocated CPU output stays bound.
+        let run_result: Result<()> = (|| {
+            binding
+                .binding
+                .bind_input(names.feats.as_str(), &feats)
+                .context("failed to bind CPU RVC input 'feats'")?;
+            binding
+                .binding
+                .bind_input(names.p_len.as_str(), &p_len)
+                .context("failed to bind CPU RVC input 'p_len'")?;
+            binding
+                .binding
+                .bind_input(names.pitch.as_str(), &pitch)
+                .context("failed to bind CPU RVC input 'pitch'")?;
+            binding
+                .binding
+                .bind_input(names.pitchf.as_str(), &pitchf)
+                .context("failed to bind CPU RVC input 'pitchf'")?;
+            binding
+                .binding
+                .bind_input(names.sid.as_str(), &sid)
+                .context("failed to bind CPU RVC input 'sid'")?;
+            if let Some((rnd_name, rnd)) = rnd.as_ref() {
+                binding
+                    .binding
+                    .bind_input(*rnd_name, rnd)
+                    .context("failed to bind CPU RVC input 'rnd'")?;
+            }
+            let _outputs = session.run_binding(&binding.binding)?;
+            binding
+                .binding
+                .synchronize_outputs()
+                .context("failed to synchronize CPU RVC bound output")?;
+            Ok(())
+        })();
+        binding.binding.clear_inputs();
+        run_result?;
+        debug!(
+            "rvc session.run_binding backend={} cpu_output_binding=true feats_shape={} pitch_shape={} output_shape={} elapsed_us={}",
+            provider.label(),
+            format_usize_shape(feats_shape_usize),
+            format_usize_shape(pitch_shape),
+            format_usize_shape(&binding.output_shape),
+            run_start.elapsed().as_micros()
+        );
+        let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+        let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
+        if actual_shape != binding.output_shape {
+            bail!(
+                "CPU RVC bound output shape changed from {} to {}",
+                format_usize_shape(&binding.output_shape),
+                format_usize_shape(&actual_shape)
+            );
+        }
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    // Inputs mirror the ONNX RVC contract (feats/pitch/pitchf/sid/rnd, plus the
+    // streaming NSF noise/phase I/O) and the reused output buffer; an ad-hoc
+    // struct would only obscure that contract.
+    #[cfg(feature = "ort")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn infer_with_binding(
+        &mut self,
+        feats: &[f32],
+        frame_len: usize,
+        pitch: &[i64],
+        pitchf: &[f32],
+        speaker_id: i64,
+        rnd: Option<&[f32]>,
+        // Streaming-export NSF source noise `[1, audio_len, 1]` and window-start
+        // phase; bound by the pinned-CPU path, rejected by the CUDA-graph path.
+        nsf_noise: Option<&[f32]>,
+        phase_in: Option<f32>,
+        // Filled (when streaming) with the model's per-sample `streaming_nsf_phase`
+        // output for the caller to pick the next chunk's `phase_in`.
+        phase_out: Option<&mut Vec<f32>>,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        // Resolve the caller-supplied noise window (name/shape validation) before
+        // borrowing the binding/session below; the model's `rnd` channel count
+        // lives in `io_names`.
+        let rnd = resolve_rnd_input(&self.io_names, frame_len, rnd)?;
+        let binding = self
+            .tensor_rt_binding
+            .as_mut()
+            .ok_or_else(|| anyhow!("TensorRT RVC IoBinding is not initialized"))?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
+        match binding {
+            RvcTensorRtBinding::Pinned(binding) => {
+                copy_f32_tensor(&mut binding.feats, feats, "feats")?;
+                copy_i64_tensor(&mut binding.pitch, pitch, "pitch")?;
+                copy_f32_tensor(&mut binding.pitchf, pitchf, "pitchf")?;
+                binding.bind_fixed_scalars_if_changed(frame_len as i64, speaker_id)?;
+                binding
+                    .binding
+                    .bind_input(binding.names.feats.as_str(), &binding.feats)
+                    .context("failed to bind TensorRT RVC input 'feats'")?;
+                binding
+                    .binding
+                    .bind_input(binding.names.pitch.as_str(), &binding.pitch)
+                    .context("failed to bind TensorRT RVC input 'pitch'")?;
+                binding
+                    .binding
+                    .bind_input(binding.names.pitchf.as_str(), &binding.pitchf)
+                    .context("failed to bind TensorRT RVC input 'pitchf'")?;
+                // Latent noise: stage the caller-supplied N(0,1) window into the
+                // pinned buffer and re-bind it (the pinned path copies inputs at
+                // bind time). The buffer exists iff the model takes `rnd`, which is
+                // exactly when `resolve_rnd_input` returned `Some`.
+                if let Some(rnd_tensor) = binding.rnd.as_mut() {
+                    let (rnd_name, _shape, rnd_data) = rnd.ok_or_else(|| {
+                        anyhow!("RVC model has an 'rnd' input but no noise was provided")
+                    })?;
+                    copy_f32_tensor(rnd_tensor, rnd_data, "rnd")?;
+                    binding
+                        .binding
+                        .bind_input(rnd_name, rnd_tensor)
+                        .context("failed to bind TensorRT RVC input 'rnd'")?;
+                }
+                // Streaming NSF source noise + window-start phase: stage into the
+                // pinned input buffers and re-bind (the pinned path copies inputs
+                // at bind time). Both buffers exist iff the model is a streaming
+                // export; the per-sample phase output stays bound from construction.
+                if let Some(nsf_tensor) = binding.nsf_noise.as_mut() {
+                    let nsf_data = nsf_noise.ok_or_else(|| {
+                        anyhow!(
+                            "RVC streaming model has an 'nsf_noise' input but none was provided"
+                        )
+                    })?;
+                    let nsf_name = binding.names.nsf_noise.as_deref().ok_or_else(|| {
+                        anyhow!("RVC streaming binding is missing its 'nsf_noise' input name")
+                    })?;
+                    copy_f32_tensor(nsf_tensor, nsf_data, "nsf_noise")?;
+                    binding
+                        .binding
+                        .bind_input(nsf_name, nsf_tensor)
+                        .context("failed to bind TensorRT RVC input 'nsf_noise'")?;
+                }
+                if let Some(phase_tensor) = binding.phase_in.as_mut() {
+                    let phase_name = binding.names.phase_in.as_deref().ok_or_else(|| {
+                        anyhow!("RVC streaming binding is missing its 'phase_in' input name")
+                    })?;
+                    copy_f32_tensor(phase_tensor, &[phase_in.unwrap_or(0.0)], "phase_in")?;
+                    binding
+                        .binding
+                        .bind_input(phase_name, phase_tensor)
+                        .context("failed to bind TensorRT RVC input 'phase_in'")?;
+                }
+                let run_start = Instant::now();
+                let _outputs = session.run_binding(&binding.binding)?;
+                binding
+                    .binding
+                    .synchronize_outputs()
+                    .context("failed to synchronize TensorRT RVC bound output")?;
+                // Streaming: read back the per-sample `streaming_nsf_phase` so the
+                // caller can pick the next window's `phase_in`. The output buffer
+                // exists iff the export emits it.
+                if let (Some(phase_out), Some(phase_tensor)) =
+                    (phase_out, binding.phase_out.as_ref())
+                {
+                    let (_, data) = phase_tensor.try_extract_tensor::<f32>()?;
+                    phase_out.clear();
+                    phase_out.extend_from_slice(data);
+                }
+                debug!(
+                    "rvc session.run_binding backend={} cuda_graph=false device_io=false feats_shape={} pitch_shape={} output_shape={} elapsed_us={}",
+                    self.provider.label(),
+                    format_usize_shape(&binding.feats_shape),
+                    format_usize_shape(&binding.pitch_shape),
+                    format_usize_shape(&binding.output_shape),
+                    run_start.elapsed().as_micros()
+                );
+                let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT RVC bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                out.clear();
+                out.extend_from_slice(data);
+                Ok(())
+            }
+            RvcTensorRtBinding::CudaGraph(binding) => {
+                // The CUDA-graph IoBinding does not bind streaming NSF noise/phase
+                // I/O (captured-graph device addresses + no phase read-back path);
+                // such models are rejected at load, so this is a defensive guard.
+                if nsf_noise.is_some() || phase_in.is_some() {
+                    bail!("the CUDA-graph IoBinding path does not support rvc-onnx-web streaming exports");
+                }
+                let _ = phase_out;
+                let h2d_start = Instant::now();
+                copy_f32_tensor(&mut binding.host_feats, feats, "feats")?;
+                copy_i64_tensor(&mut binding.host_pitch, pitch, "pitch")?;
+                copy_f32_tensor(&mut binding.host_pitchf, pitchf, "pitchf")?;
+                copy_f32_tensor_to_device(&binding.host_feats, &mut binding.device_feats, "feats")?;
+                copy_i64_tensor_to_device(&binding.host_pitch, &mut binding.device_pitch, "pitch")?;
+                copy_f32_tensor_to_device(
+                    &binding.host_pitchf,
+                    &mut binding.device_pitchf,
+                    "pitchf",
+                )?;
+                // Latent noise: stage the caller-supplied N(0,1) window into
+                // host_rnd, then copy into the already-bound device_rnd (its
+                // address stays stable for the captured graph; only its contents
+                // change). Both buffers exist iff the model takes `rnd`.
+                if let (Some(host_rnd), Some(device_rnd)) =
+                    (binding.host_rnd.as_mut(), binding.device_rnd.as_mut())
+                {
+                    let (_rnd_name, _shape, rnd_data) = rnd.ok_or_else(|| {
+                        anyhow!("RVC model has an 'rnd' input but no noise was provided")
+                    })?;
+                    copy_f32_tensor(host_rnd, rnd_data, "rnd")?;
+                    copy_f32_tensor_to_device(host_rnd, device_rnd, "rnd")?;
+                }
+                binding.copy_fixed_scalars_if_changed(frame_len as i64, speaker_id)?;
+                let h2d_us = h2d_start.elapsed().as_micros();
+                let run_start = Instant::now();
+                let _outputs = session.run_binding(&binding.binding)?;
+                let run_us = run_start.elapsed().as_micros();
+                let d2h_start = Instant::now();
+                copy_f32_tensor_to_host(&binding.device_output, &mut binding.host_output, "audio")?;
+                let d2h_us = d2h_start.elapsed().as_micros();
+                debug!(
+                    "rvc session.run_binding(device_io=true) backend={} cuda_graph={} feats_shape={} pitch_shape={} output_shape={} h2d_us={} run_us={} d2h_us={} elapsed_us={}",
+                    self.provider.label(),
+                    self.tensor_rt_run_mode.cuda_graph(),
+                    format_usize_shape(&binding.feats_shape),
+                    format_usize_shape(&binding.pitch_shape),
+                    format_usize_shape(&binding.output_shape),
+                    h2d_us,
+                    run_us,
+                    d2h_us,
+                    h2d_us + run_us + d2h_us
+                );
+                let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
+                if actual_shape != binding.output_shape {
+                    bail!(
+                        "TensorRT RVC bound output shape changed from {} to {}",
+                        format_usize_shape(&binding.output_shape),
+                        format_usize_shape(&actual_shape)
+                    );
+                }
+                out.clear();
+                out.extend_from_slice(data);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ort")]
+#[cfg(all(windows, feature = "windowsml"))]
+fn with_windows_ml_catalog_ep(
+    builder: ort::session::builder::SessionBuilder,
+    catalog_ep: crate::windows_ml::CatalogExecutionProvider,
+    path: &Path,
+    tensor_rt_profile: Option<&TensorRtSessionProfile>,
+    // Skip the NvTensorRtRtx runtime cache (its on-destroy write fast-fails for
+    // rvc-onnx-web streaming engines). Only set for streaming RVC sessions.
+    disable_runtime_cache: bool,
+) -> Result<ort::session::builder::SessionBuilder> {
+    let env = ort::environment::Environment::current()?;
+    let devices = env
+        .devices()
+        .filter(|device| {
+            device
+                .ep()
+                .ok()
+                .and_then(crate::windows_ml::CatalogExecutionProvider::from_catalog_name)
+                == Some(catalog_ep)
+        })
+        .collect::<Vec<_>>();
+    if devices.is_empty() {
+        bail!(
+            "Windows ML catalog EP {} was registered, but ONNX Runtime did not expose a matching EP device for {}",
+            catalog_ep.label(),
+            path.display()
+        );
+    }
+    let ep_name = devices[0].ep()?.to_string();
+    let mut options = Vec::<(String, String)>::new();
+    if catalog_ep == crate::windows_ml::CatalogExecutionProvider::NvTensorRtRtx {
+        let profile = tensor_rt_profile.ok_or_else(|| {
+            anyhow!(
+                "Windows ML NvTensorRtRtx requires a fixed-shape profile for {}",
+                path.display()
+            )
+        })?;
+        // TensorRT RTX falls back to a fully dynamic profile when these are
+        // omitted, which can generate invalid min/opt/max shapes for RVC models.
+        // Use the same fixed profile machinery as the native TensorRT backend.
+        for key in [
+            "nv_profile_min_shapes",
+            "nv_profile_opt_shapes",
+            "nv_profile_max_shapes",
+        ] {
+            options.push((format!("{ep_name}.{key}"), profile.profile_shapes.clone()));
+        }
+        // The TensorRT-RTX EP writes this runtime cache file when the session is
+        // destroyed. For rvc-onnx-web streaming engines that on-destroy write
+        // fast-fails the process (0xC0000409) — confirmed isolated to the EP's
+        // `trt_rtx_ep::utils::WriteFile` teardown path, independent of our
+        // IoBinding. Omitting the cache path for streaming models avoids the crash
+        // at the cost of rebuilding the engine each load. Non-streaming models keep
+        // the cache. See the streaming-export notes in docs/architecture.md.
+        if !disable_runtime_cache {
+            if let Ok(cache_root) = tensor_rt_cache_root() {
+                if let Ok(cache_dir) = profile.cache_dir_from_root(&cache_root) {
+                    std::fs::create_dir_all(&cache_dir).with_context(|| {
+                        format!(
+                            "failed to create Windows ML NvTensorRtRtx runtime cache dir {}",
+                            cache_dir.display()
+                        )
+                    })?;
+                    options.push((
+                        format!("{ep_name}.nv_runtime_cache_path"),
+                        cache_dir.display().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    info!(
+        "using Windows ML catalog EP {} via ORT EP device API for {} profile={} runtime_cache={}",
+        catalog_ep.label(),
+        path.display(),
+        tensor_rt_profile
+            .map(|profile| profile.profile_shapes.as_str())
+            .unwrap_or("-"),
+        options
+            .iter()
+            .find(|(key, _)| key.ends_with(".nv_runtime_cache_path"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("-")
+    );
+    let options = (!options.is_empty()).then_some(options);
+    builder
+        .with_devices(devices, options.as_deref())
+        .map_err(|err| {
+            anyhow!(
+                "failed to append Windows ML catalog EP {}: {err}",
+                catalog_ep.label()
+            )
+        })
+}
+
+#[cfg(feature = "ort")]
+pub(super) fn load_session(
+    path: &Path,
+    provider: Provider,
+    role: ModelRole,
+    tensor_rt_profile: Option<&TensorRtSessionProfile>,
+    tensor_rt_run_mode: TensorRtRunMode,
+    tensor_rt_session_purpose: TensorRtSessionPurpose,
+    // True for rvc-onnx-web streaming RVC sessions: skip the NvTensorRtRtx runtime
+    // cache whose on-destroy write fast-fails the process for those engines.
+    disable_nvtrtx_runtime_cache: bool,
+) -> Result<Session> {
+    // CUDA consumes the selected device ID from the fixed-shape profile.
+    // Windows ML consumes the same profile only for TensorRT-RTX shape options;
+    // its adapter selection remains owned by Windows ML.
+    #[cfg(not(any(feature = "cuda", all(windows, feature = "windowsml"))))]
+    let _ = tensor_rt_profile;
+    // Only the Windows ML NvTensorRtRtx path consumes this; reference it elsewhere
+    // so non-windowsml builds don't warn on the unused parameter.
+    #[cfg(not(all(windows, feature = "windowsml")))]
+    let _ = disable_nvtrtx_runtime_cache;
+    #[cfg(feature = "cuda")]
+    let gpu_device_id = tensor_rt_profile.map_or(0, |profile| profile.gpu_device_id);
+    #[cfg(feature = "cuda")]
+    let gpu_device_id_i32 = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
+
+    #[cfg(not(all(windows, feature = "windowsml")))]
+    if provider.is_windows_ml() {
+        bail!(
+            "provider {} is unavailable in this build; rebuild on Windows with the `windowsml` feature for {}",
+            provider.label(),
+            path.display()
+        );
+    }
+
+    // In the Windows ML build ORT is loaded dynamically from the Windows App SDK
+    // Runtime, so bootstrap it for *every* provider — not just windowsml* — and
+    // bind ORT to that runtime's onnxruntime.dll. Otherwise the plain `cpu`
+    // provider has no initialized dylib and fails to locate onnxruntime.dll on
+    // the default search path (the Windows ML package does not bundle it).
+    // `ensure_initialized` is idempotent (guarded by a OnceLock).
+    #[cfg(all(windows, feature = "windowsml"))]
+    crate::windows_ml::ensure_initialized()?;
+
+    let mut builder = Session::builder()?
+        .with_intra_threads(1)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    builder = builder
+        .with_optimization_level(GraphOptimizationLevel::All)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    match provider {
+        Provider::Cuda => {
+            #[cfg(not(feature = "cuda"))]
+            {
+                // The ONNX Runtime CUDA EP is compiled out of this build. Keep
+                // `tensor_rt_run_mode` referenced so the no-cuda build matches
+                // the cuda build's signature without an unused-variable warning.
+                let _ = tensor_rt_run_mode;
+                bail!(
+                    "Provider::Cuda is unavailable in this build (compiled without the `cuda` feature); rebuild with `--features cuda` or select a CPU/TensorRT provider for {}",
+                    path.display()
+                );
+            }
+            #[cfg(feature = "cuda")]
+            {
+                info!(
+                    "requesting ONNX Runtime CUDA execution provider device_id={} cuda_graph={} device_io={} run_mode={}",
+                    gpu_device_id,
+                    tensor_rt_run_mode.cuda_graph(),
+                    tensor_rt_run_mode.device_io(),
+                    tensor_rt_run_mode.label()
+                );
+                if tensor_rt_run_mode.cuda_graph() {
+                    builder = builder.with_disable_cpu_fallback().map_err(|err| {
+                        anyhow!("failed to disable CPU fallback for CUDA backend: {err}")
+                    })?;
+                }
+                builder = builder
+                    .with_execution_providers([ep::CUDA::default()
+                        .with_device_id(gpu_device_id_i32)
+                        .with_cuda_graph(tensor_rt_run_mode.cuda_graph())
+                        .build()
+                        .error_on_failure()])
+                    .map_err(|err| anyhow!("failed to register CUDA execution provider: {err}"))?;
+            }
+        }
+        Provider::WindowsMl => {
+            #[cfg(not(all(windows, feature = "windowsml")))]
+            {
+                bail!(
+                    "provider {} is unavailable in this build; rebuild on Windows with the `windowsml` feature for {}",
+                    provider.label(),
+                    path.display()
+                );
+            }
+            #[cfg(all(windows, feature = "windowsml"))]
+            {
+                // Auto Windows ML optimizes for "works with the platform runtime":
+                // catalog EP if present/preparable, then DirectML, then ORT's CPU fallback.
+                // Explicit windowsml-* providers below intentionally fail
+                // instead of silently changing the requested accelerator.
+                match crate::windows_ml::try_register_best_catalog_ep()? {
+                    Some(catalog_ep) => {
+                        // The NvTensorRtRtx (TensorRT-RTX) EP cannot be combined
+                        // with the DirectML EP in one session — ORT rejects it with
+                        // "DML EP can only be used with CPU EPs". With its
+                        // fixed-shape profile it covers the whole graph on its own,
+                        // so skip the DirectML fallback for it. Other catalog EPs
+                        // keep DirectML for ops they do not implement.
+                        let with_directml_fallback = catalog_ep
+                            != crate::windows_ml::CatalogExecutionProvider::NvTensorRtRtx;
+                        info!(
+                            "using Windows ML catalog EP {} ({}) for {}",
+                            catalog_ep.label(),
+                            if with_directml_fallback {
+                                "with DirectML/CPU fallback"
+                            } else {
+                                "no DirectML fallback; TensorRT-RTX covers the full graph"
+                            },
+                            path.display()
+                        );
+                        builder = with_windows_ml_catalog_ep(
+                            builder,
+                            catalog_ep,
+                            path,
+                            tensor_rt_profile,
+                            disable_nvtrtx_runtime_cache,
+                        )?;
+                        if with_directml_fallback {
+                            builder = builder
+                                .with_execution_providers([ep::DirectML::default().build()])
+                                .map_err(|err| {
+                                    anyhow!(
+                                        "failed to configure Windows ML DirectML fallback EP: {err}"
+                                    )
+                                })?;
+                        }
+                    }
+                    None => {
+                        info!(
+                            "no usable Windows ML catalog EP found; using DirectML/CPU fallback for {}",
+                            path.display()
+                        );
+                        builder = builder
+                            .with_execution_providers([ep::DirectML::default().build()])
+                            .map_err(|err| {
+                                anyhow!(
+                                    "failed to configure Windows ML DirectML/CPU fallback EP: {err}"
+                                )
+                            })?;
+                    }
+                }
+            }
+        }
+        Provider::WindowsMlNvTensorRtRtx
+        | Provider::WindowsMlOpenVino
+        | Provider::WindowsMlQnn
+        | Provider::WindowsMlMiGraphX
+        | Provider::WindowsMlVitisAi => {
+            #[cfg(not(all(windows, feature = "windowsml")))]
+            {
+                bail!(
+                    "provider {} is unavailable in this build; rebuild on Windows with the `windowsml` feature for {}",
+                    provider.label(),
+                    path.display()
+                );
+            }
+            #[cfg(all(windows, feature = "windowsml"))]
+            {
+                let catalog_ep = provider.catalog_ep().ok_or_else(|| {
+                    anyhow!(
+                        "provider {} has no Windows ML catalog EP mapping for {}",
+                        provider.label(),
+                        path.display()
+                    )
+                })?;
+                if !crate::windows_ml::try_register_catalog_ep(catalog_ep)? {
+                    bail!(
+                        "Windows ML catalog EP {} requested by provider {} is not present or not ready for {}; install/enable that EP with Windows ML tooling, or use provider windowsml for DirectML/CPU fallback",
+                        catalog_ep.label(),
+                        provider.label(),
+                        path.display()
+                    );
+                }
+                builder = with_windows_ml_catalog_ep(
+                    builder,
+                    catalog_ep,
+                    path,
+                    tensor_rt_profile,
+                    disable_nvtrtx_runtime_cache,
+                )?;
+            }
+        }
+        Provider::WindowsMlDirectMl => {
+            #[cfg(not(all(windows, feature = "windowsml")))]
+            {
+                bail!(
+                    "provider {} is unavailable in this build; rebuild on Windows with the `windowsml` feature for {}",
+                    provider.label(),
+                    path.display()
+                );
+            }
+            #[cfg(all(windows, feature = "windowsml"))]
+            {
+                info!(
+                    "using Windows ML DirectML execution provider via Windows App SDK Runtime for {}",
+                    path.display()
+                );
+                builder = builder
+                    .with_execution_providers([ep::DirectML::default().build().error_on_failure()])
+                    .map_err(|err| {
+                        anyhow!("failed to register Windows ML DirectML execution provider: {err}")
+                    })?;
+            }
+        }
+        Provider::TensorRt => {
+            bail!(
+                "Provider::TensorRt is native-only; load a CPU inspection session or a native TensorRT engine for {}",
+                path.display()
+            );
+        }
+        Provider::Cpu | Provider::WindowsMlCpu => {
+            info!(
+                "using {} execution provider intra_threads={} inter_threads={} arena=true mem_pattern=true flush_to_zero=true",
+                if provider == Provider::WindowsMlCpu {
+                    "Windows ML CPU"
+                } else {
+                    "ONNX Runtime CPU"
+                },
+                CPU_ONNX_INTRA_THREADS,
+                CPU_ONNX_INTER_THREADS
+            );
+            // CPU inference still feeds a latency-sensitive pipeline. Keep
+            // these as load-time session options; per-chunk tuning here would
+            // add allocation/logging pressure near the realtime path.
+            builder = builder
+                .with_optimization_level(GraphOptimizationLevel::All)
+                .map_err(|err| anyhow!("failed to enable CPU graph optimizations: {err}"))?
+                .with_intra_threads(CPU_ONNX_INTRA_THREADS)
+                .map_err(|err| anyhow!("failed to set CPU intra-op threads: {err}"))?
+                .with_parallel_execution(true)
+                .map_err(|err| anyhow!("failed to enable CPU parallel execution: {err}"))?
+                .with_inter_threads(CPU_ONNX_INTER_THREADS)
+                .map_err(|err| anyhow!("failed to set CPU inter-op threads: {err}"))?
+                // Repeated realtime chunks are shape-stable after stream
+                // padding, so memory pattern plus the CPU arena avoids churn
+                // in ORT's internal allocators. Revisit if CPU runs become
+                // truly variable-shape.
+                .with_memory_pattern(true)
+                .map_err(|err| anyhow!("failed to enable CPU memory pattern: {err}"))?
+                .with_prepacking(true)
+                .map_err(|err| anyhow!("failed to enable CPU prepacking: {err}"))?
+                .with_flush_to_zero()
+                .map_err(|err| anyhow!("failed to enable CPU flush-to-zero: {err}"))?
+                .with_intra_op_spinning(true)
+                .map_err(|err| anyhow!("failed to enable CPU intra-op spinning: {err}"))?
+                .with_inter_op_spinning(true)
+                .map_err(|err| anyhow!("failed to enable CPU inter-op spinning: {err}"))?
+                .with_execution_providers([ep::CPU::default()
+                    .with_arena_allocator(true)
+                    .build()
+                    .error_on_failure()])
+                .map_err(|err| anyhow!("failed to register CPU execution provider: {err}"))?;
+        }
+    }
+    if provider.is_tensorrt() || provider.is_cuda() {
+        info!(
+            "starting {} session commit for {} session_purpose={} cuda_graph={}",
+            provider.label(),
+            role.label(),
+            tensor_rt_session_purpose.label(),
+            tensor_rt_run_mode.cuda_graph()
+        );
+    }
+    let session = builder
+        .commit_from_file(path)
+        .with_context(|| format!("failed to load ONNX model {}", path.display()))?;
+    info!(
+        "created ONNX Runtime session backend={} model_role={} session_purpose={} cuda_graph={} model={}",
+        provider.label(),
+        role.label(),
+        tensor_rt_session_purpose.label(),
+        provider_uses_fixed_shape(provider) && tensor_rt_run_mode.cuda_graph(),
+        path.display()
+    );
+    Ok(session)
+}
+
+/// Format an ORT output value type for the CLI `inspect` command. The pipeline's
+/// own structural checks live on `onnx_meta::ModelIo` and need no ORT.
+#[cfg(feature = "ort")]
+pub(super) fn describe_value_type(value_type: &ValueType) -> String {
+    match value_type {
+        ValueType::Tensor { ty, shape, .. } => format!("{ty:?} {shape}"),
+        other => format!("{other:?}"),
+    }
+}

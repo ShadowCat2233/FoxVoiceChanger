@@ -110,6 +110,11 @@ fn convert_audio() -> Result<()> {
     let model = required_path(&arguments, "--model")?;
     let embedder = required_path(&arguments, "--embedder")?;
     let f0_model = required_path(&arguments, "--f0")?;
+    let feature_index = option_value(&arguments, "--index").map(PathBuf::from);
+    let index_rate = option_value(&arguments, "--index-rate")
+        .map(str::parse).transpose().context("--index-rate 必须是数字")?
+        .unwrap_or(if feature_index.is_some() { 0.75 } else { 0.0 });
+    anyhow::ensure!((0.0..=1.0).contains(&index_rate), "--index-rate 必须在 0 到 1 之间");
     let pitch_shift = option_value(&arguments, "--pitch")
         .map(str::parse)
         .transpose()
@@ -133,8 +138,9 @@ fn convert_audio() -> Result<()> {
                 model,
                 embedder,
                 f0_model,
+                feature_index,
                 output,
-                (pitch_shift, provider),
+                (pitch_shift, provider, index_rate),
             )
         })
         .context("无法启动离线转换线程")?;
@@ -151,10 +157,11 @@ fn convert_wav_inner(
     model: PathBuf,
     embedder: PathBuf,
     f0_model: PathBuf,
+    feature_index: Option<PathBuf>,
     output: PathBuf,
-    runtime: (f32, Provider),
+    runtime: (f32, Provider, f32),
 ) -> Result<serde_json::Value> {
-    let (pitch_shift, provider) = runtime;
+    let (pitch_shift, provider, index_rate) = runtime;
     let sample_rate = 48_000;
     let timing = RvcChunkTiming::from_ms(160, sample_rate)?;
     let input = resample_linear(&source, source_rate, sample_rate);
@@ -164,6 +171,9 @@ fn convert_wav_inner(
         embedder: &embedder,
         embedder_output: None,
         f0_model: &f0_model,
+        feature_index: feature_index.as_deref(),
+        index_rate,
+        protect: 0.33,
         provider,
         gpu_priority: vc_core::model_rvc::GpuPriority::Normal,
         gpu_device_id: 0,
@@ -634,6 +644,9 @@ fn validate_rvc() -> Result<()> {
                 embedder: &embedder,
                 embedder_output: None,
                 f0_model: &f0_model,
+                feature_index: None,
+                index_rate: 0.0,
+                protect: 0.33,
                 provider,
                 gpu_priority: vc_core::model_rvc::GpuPriority::High,
                 gpu_device_id: 0,
@@ -763,6 +776,16 @@ fn run_engine(passthrough: bool) -> Result<()> {
         config.model = Some(required_path(&arguments, "--model")?);
         config.embedder = Some(required_path(&arguments, "--embedder")?);
         config.f0_model = Some(required_path(&arguments, "--f0")?);
+        config.feature_index = option_value(&arguments, "--index").map(PathBuf::from);
+        config.index_rate = option_value(&arguments, "--index-rate")
+            .map(str::parse)
+            .transpose()
+            .context("--index-rate 必须是数字")?
+            .unwrap_or(if config.feature_index.is_some() { 0.75 } else { 0.0 });
+        anyhow::ensure!((0.0..=1.0).contains(&config.index_rate), "--index-rate 必须在 0 到 1 之间");
+        config.protect = option_value(&arguments, "--protect")
+            .map(str::parse).transpose().context("--protect 必须是数字")?.unwrap_or(0.33);
+        anyhow::ensure!((0.0..=0.5).contains(&config.protect), "--protect 必须在 0 到 0.5 之间");
     }
     config.input_device = option_value(&arguments, "--input").map(ToOwned::to_owned);
     config.output_device = option_value(&arguments, "--output").map(ToOwned::to_owned);
