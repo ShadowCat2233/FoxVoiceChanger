@@ -56,7 +56,7 @@
 
             <Grid Grid.Row="1">
                 <ScrollViewer x:Name="StudioView" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <Grid Margin="28,26"><Grid.RowDefinitions><RowDefinition Height="520"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <Grid Margin="28,26"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                         <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="18"/><ColumnDefinition Width="292"/></Grid.ColumnDefinitions>
                             <Border Style="{StaticResource Panel}"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                                 <Grid><StackPanel><TextBlock Text="LIVE VOICE" Style="{StaticResource Eyebrow}"/><TextBlock Text="实时变声" Style="{StaticResource SectionTitle}"/></StackPanel><Border HorizontalAlignment="Right" VerticalAlignment="Top" Background="#12302D" BorderBrush="#1E574D" BorderThickness="1" CornerRadius="12" Padding="10,5"><StackPanel Orientation="Horizontal"><Ellipse x:Name="EngineDot" Width="7" Height="7" Fill="{StaticResource SuccessBrush}" Margin="0,0,7,0"/><TextBlock x:Name="EngineBadgeText" Text="正在检测" Foreground="#A7F5DC" FontSize="12"/></StackPanel></Border></Grid>
