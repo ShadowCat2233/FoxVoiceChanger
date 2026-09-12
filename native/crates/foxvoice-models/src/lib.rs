@@ -201,6 +201,37 @@ impl ModelLibrary {
         Ok(record)
     }
 
+    pub fn inherit_conversion_metadata(
+        &self,
+        source_id: &str,
+        converted_id: &str,
+    ) -> Result<ModelRecord> {
+        let source = self.read_record(source_id)?;
+        let mut converted = self.read_record(converted_id)?;
+        anyhow::ensure!(
+            source.format == ModelFormat::PytorchCheckpoint,
+            "转换来源必须是 .pth 检查点"
+        );
+        anyhow::ensure!(
+            converted.format == ModelFormat::Onnx,
+            "转换结果必须是 ONNX 模型"
+        );
+        anyhow::ensure!(
+            converted.source.as_deref() == Some(&format!("converted-from:{source_id}")),
+            "转换结果与来源模型不匹配"
+        );
+
+        converted.rights_confirmed_at_unix_ms = source.rights_confirmed_at_unix_ms;
+        if converted.author.is_none() {
+            converted.author = source.author;
+        }
+        if converted.license.is_none() {
+            converted.license = source.license;
+        }
+        self.save_record(&converted)?;
+        Ok(converted)
+    }
+
     pub fn import_huggingface(&self, source_url: &str) -> Result<ModelRecord> {
         let url = Url::parse(source_url).context("Hugging Face URL 无效")?;
         anyhow::ensure!(url.scheme() == "https", "模型下载只允许 HTTPS");
@@ -721,6 +752,125 @@ mod tests {
         let recycled = library.recycle(&first.id).unwrap();
         assert!(recycled.is_dir());
         assert!(library.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn converted_model_inherits_rights_and_provenance_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("models");
+        let source_id = "model-1111111111111111";
+        let converted_id = "model-2222222222222222";
+        let library = ModelLibrary::open(&root).unwrap();
+
+        let source = ModelRecord {
+            id: source_id.into(),
+            display_name: "Source".into(),
+            format: ModelFormat::PytorchCheckpoint,
+            state: ModelState::ConversionRequired,
+            file_name: "source.pth".into(),
+            size_bytes: 1,
+            sha256: "11".into(),
+            imported_at_unix_ms: 1,
+            source: Some("local".into()),
+            author: Some("Author".into()),
+            license: Some("Custom".into()),
+            tags: vec!["rvc".into(), "checkpoint".into()],
+            rvc_version: Some("v2".into()),
+            sample_rate: Some(48_000),
+            uses_f0: Some(true),
+            speaker_count: None,
+            recommended_provider: None,
+            test_status: None,
+            last_tested_at_unix_ms: None,
+            last_used_at_unix_ms: None,
+            rights_confirmed_at_unix_ms: Some(1234),
+        };
+        let converted = ModelRecord {
+            id: converted_id.into(),
+            display_name: "Converted".into(),
+            format: ModelFormat::Onnx,
+            state: ModelState::Ready,
+            file_name: "converted.onnx".into(),
+            size_bytes: 1,
+            sha256: "22".into(),
+            imported_at_unix_ms: 2,
+            source: Some(format!("converted-from:{source_id}")),
+            author: None,
+            license: None,
+            tags: vec!["rvc".into(), "onnx".into()],
+            rvc_version: Some("v2".into()),
+            sample_rate: Some(48_000),
+            uses_f0: Some(true),
+            speaker_count: None,
+            recommended_provider: None,
+            test_status: None,
+            last_tested_at_unix_ms: None,
+            last_used_at_unix_ms: None,
+            rights_confirmed_at_unix_ms: None,
+        };
+        for record in [&source, &converted] {
+            fs::create_dir_all(root.join(&record.id)).unwrap();
+            write_manifest(&root.join(&record.id).join(MANIFEST_FILE), record).unwrap();
+        }
+
+        let inherited = library
+            .inherit_conversion_metadata(source_id, converted_id)
+            .unwrap();
+        assert_eq!(inherited.rights_confirmed_at_unix_ms, Some(1234));
+        assert_eq!(inherited.author.as_deref(), Some("Author"));
+        assert_eq!(inherited.license.as_deref(), Some("Custom"));
+    }
+
+    #[test]
+    fn conversion_metadata_rejects_unrelated_result() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("models");
+        let library = ModelLibrary::open(&root).unwrap();
+        let source_id = "model-1111111111111111";
+        let converted_id = "model-2222222222222222";
+        for (id, format, source) in [
+            (source_id, ModelFormat::PytorchCheckpoint, None),
+            (
+                converted_id,
+                ModelFormat::Onnx,
+                Some("converted-from:model-3333333333333333".into()),
+            ),
+        ] {
+            let record = ModelRecord {
+                id: id.into(),
+                display_name: id.into(),
+                format,
+                state: if format == ModelFormat::Onnx {
+                    ModelState::Ready
+                } else {
+                    ModelState::ConversionRequired
+                },
+                file_name: "model.bin".into(),
+                size_bytes: 1,
+                sha256: "00".into(),
+                imported_at_unix_ms: 1,
+                source,
+                author: None,
+                license: None,
+                tags: Vec::new(),
+                rvc_version: None,
+                sample_rate: None,
+                uses_f0: None,
+                speaker_count: None,
+                recommended_provider: None,
+                test_status: None,
+                last_tested_at_unix_ms: None,
+                last_used_at_unix_ms: None,
+                rights_confirmed_at_unix_ms: Some(1),
+            };
+            fs::create_dir_all(root.join(id)).unwrap();
+            write_manifest(&root.join(id).join(MANIFEST_FILE), &record).unwrap();
+        }
+        assert!(
+            library
+                .inherit_conversion_metadata(source_id, converted_id)
+                .is_err()
+        );
     }
 
     #[test]

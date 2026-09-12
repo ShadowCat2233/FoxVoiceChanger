@@ -387,7 +387,9 @@ fn run_models_command() -> Result<()> {
                 .and_then(|value| value.as_str())
                 .map(PathBuf::from)
                 .context("模型转换器没有返回输出路径")?;
-            let result = library.import_file(&onnx, Some(format!("converted-from:{id}")));
+            let result = library
+                .import_file(&onnx, Some(format!("converted-from:{id}")))
+                .and_then(|record| library.inherit_conversion_metadata(&id, &record.id));
             if onnx.is_file() {
                 let _ = fs::remove_file(&onnx);
             }
