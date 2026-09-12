@@ -1,7 +1,9 @@
 use std::{
     env, fs,
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -105,6 +107,7 @@ pub fn install(root: &Path, backend: &str, accepted: bool) -> Result<TrainingSta
         matches!(backend, "cuda" | "cpu"),
         "训练后端仅支持 cuda 或 cpu"
     );
+    augment_windows_dependency_path();
     fs::create_dir_all(root).context("无法创建训练组件目录")?;
     ensure_command("git", "--version", "Git.Git")?;
     ensure_python312()?;
@@ -128,6 +131,7 @@ pub fn install(root: &Path, backend: &str, accepted: bool) -> Result<TrainingSta
     )?;
     anyhow::ensure!(
         origin
+            .trim()
             .trim_end_matches('/')
             .eq_ignore_ascii_case(RVC_REPOSITORY.trim_end_matches('/')),
         "训练目录不是受信任的 RVC 上游 checkout"
@@ -203,19 +207,22 @@ pub fn install(root: &Path, backend: &str, accepted: bool) -> Result<TrainingSta
         ]),
         "安装固定 PyTorch 训练运行时",
     )?;
+    let constraints = root.join("foxvoice-training-constraints.txt");
+    fs::write(
+        &constraints,
+        "numpy==1.26.4\nopencv-python-headless==4.10.0.84\nscipy==1.13.1\nscikit-learn==1.6.1\n",
+    )
+    .context("无法写入训练依赖版本约束")?;
     run(
-        Command::new(&python).current_dir(&source).args([
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            requirements,
-        ]),
+        Command::new(&python)
+            .current_dir(&source)
+            .args(["-m", "pip", "install", "-r", requirements, "-c"])
+            .arg(&constraints),
         "安装 RVC 训练依赖",
     )?;
     run(
-        Command::new(&python).args(["-m", "pip", "install", "--upgrade", "huggingface_hub"]),
-        "安装模型下载工具",
+        Command::new(&python).args(["-m", "pip", "install", "huggingface_hub==0.36.2"]),
+        "安装固定模型下载工具",
     )?;
     let hf = venv.join("Scripts").join("hf.exe");
     run(
@@ -379,7 +386,7 @@ fn ensure_command(command: &str, version_argument: &str, winget_id: &str) -> Res
         return Ok(());
     }
     run(
-        Command::new("winget").args([
+        Command::new(winget_executable()?).args([
             "install",
             "--id",
             winget_id,
@@ -415,7 +422,7 @@ fn ensure_python312() -> Result<()> {
         return Ok(());
     }
     run(
-        Command::new("winget").args([
+        Command::new(winget_executable()?).args([
             "install",
             "--id",
             "Python.Python.3.12",
@@ -433,8 +440,51 @@ fn ensure_python312() -> Result<()> {
     Ok(())
 }
 
+fn winget_executable() -> Result<PathBuf> {
+    if Command::new("winget")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return Ok(PathBuf::from("winget"));
+    }
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        let alias = PathBuf::from(local)
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("winget.exe");
+        if alias.is_file() {
+            return Ok(alias);
+        }
+    }
+    bail!("未找到 Windows Package Manager (winget)。请先从 Microsoft Store 安装‘应用安装程序’，然后重试")
+}
+
+fn augment_windows_dependency_path() {
+    let mut paths = env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        paths.push(local.join("Microsoft").join("WinGet").join("Links"));
+        paths.push(local.join("Programs").join("Python").join("Launcher"));
+        paths.push(local.join("Microsoft").join("WindowsApps"));
+    }
+    if let Some(program_files) = env::var_os("ProgramFiles") {
+        paths.push(PathBuf::from(program_files).join("Git").join("cmd"));
+    }
+    paths.retain(|path| path.is_dir());
+    paths.dedup();
+    if let Ok(joined) = env::join_paths(paths) {
+        // The supervisor is a single-threaded short-lived CLI. Updating its own PATH here
+        // lets dependencies installed by winget become visible without restarting FoxVoice.
+        unsafe { env::set_var("PATH", joined) };
+    }
+}
+
 fn run(command: &mut Command, label: &str) -> Result<()> {
     eprintln!("FOXVOICE_TRAINING_STAGE={label}");
+    apply_network_proxy(command);
     let status = command
         .status()
         .with_context(|| format!("无法启动：{label}"))?;
@@ -442,6 +492,21 @@ fn run(command: &mut Command, label: &str) -> Result<()> {
         bail!("{label}失败，退出码 {:?}", status.code());
     }
     Ok(())
+}
+
+fn apply_network_proxy(command: &mut Command) {
+    if env::var_os("HTTPS_PROXY").is_some() || env::var_os("https_proxy").is_some() {
+        return;
+    }
+    for port in [7897_u16, 7890_u16] {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if TcpStream::connect_timeout(&address, Duration::from_millis(120)).is_ok() {
+            let proxy = format!("http://127.0.0.1:{port}");
+            command.env("HTTPS_PROXY", &proxy).env("HTTP_PROXY", &proxy);
+            eprintln!("FOXVOICE_TRAINING_STAGE=已检测到本机网络代理，继续下载训练组件");
+            return;
+        }
+    }
 }
 
 fn command_text(command: &mut Command, label: &str) -> Result<String> {
