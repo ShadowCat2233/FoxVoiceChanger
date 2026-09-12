@@ -18,9 +18,10 @@ use vc_app::{AudioHost, DenoiserMode, EngineController, EngineState, LiveParams,
 use vc_core::{
     Provider,
     model_rvc::{
-        F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
-        VoiceModel,
+        ChunkConverter, ChunkOutputConfig, F0Config, NoiseGateShaping, OutputDynamicsConfig,
+        RvcPipeline, RvcPipelineConfig, VoiceModel, convert_finite,
     },
+    sola::SmoothingKind,
     validation::RvcChunkTiming,
 };
 
@@ -158,7 +159,7 @@ fn convert_wav_inner(
     let timing = RvcChunkTiming::from_ms(160, sample_rate)?;
     let input = resample_linear(&source, source_rate, sample_rate);
     let started = Instant::now();
-    let mut pipeline = RvcPipeline::load(RvcPipelineConfig {
+    let pipeline = RvcPipeline::load(RvcPipelineConfig {
         model: &model,
         embedder: &embedder,
         embedder_output: None,
@@ -182,32 +183,23 @@ fn convert_wav_inner(
         output_dynamics: OutputDynamicsConfig::default(),
         progress: None,
     })?;
-    let mut converted = Vec::new();
-    let mut chunk_audio = Vec::new();
-    let mut pitch = Vec::new();
-    let mut output_rate = sample_rate;
-    for (index, chunk) in input.chunks(timing.input_chunk_samples).enumerate() {
-        let mut padded = vec![0.0_f32; timing.input_chunk_samples];
-        padded[..chunk.len()].copy_from_slice(chunk);
-        let result = pipeline.process(&padded, sample_rate, &mut chunk_audio, &mut pitch)?;
-        output_rate = result.sample_rate;
-        let keep = if chunk.len() == timing.input_chunk_samples {
-            chunk_audio.len()
-        } else {
-            chunk_audio.len().saturating_mul(chunk.len()) / timing.input_chunk_samples
-        };
-        converted.extend_from_slice(&chunk_audio[..keep]);
-        if index % 10 == 0 {
-            eprintln!(
-                "FOXVOICE_PROGRESS={}",
-                json!({"chunks": index + 1, "totalChunks": input.len().div_ceil(timing.input_chunk_samples)})
-            );
-        }
-    }
-    write_offline_audio(&output, output_rate, &converted)?;
+    let converter = ChunkConverter::new(
+        pipeline,
+        ChunkOutputConfig {
+            kind: SmoothingKind::Sola,
+            output_sample_rate: sample_rate,
+            output_chunk_samples: timing.input_chunk_samples,
+            crossfade_ms: 40,
+            sola_search_ms: 12,
+            tail_discard_ms: 10,
+        },
+    );
+    let converted = convert_finite(converter, &input, sample_rate, timing.input_chunk_samples)?;
+    write_offline_audio(&output, sample_rate, &converted.audio)?;
     Ok(json!({
-        "ok": true, "output": output, "sampleRate": output_rate,
-        "samples": converted.len(), "elapsedMs": started.elapsed().as_secs_f64() * 1000.0
+        "ok": true, "output": output, "sampleRate": sample_rate,
+        "samples": converted.audio.len(), "chunks": converted.chunks.len(),
+        "elapsedMs": started.elapsed().as_secs_f64() * 1000.0
     }))
 }
 
