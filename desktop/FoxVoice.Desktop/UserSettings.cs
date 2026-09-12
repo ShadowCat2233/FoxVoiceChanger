@@ -14,6 +14,9 @@ internal sealed class UserSettings
     public string SelectedModelId { get; set; } = "";
     public string FeatureIndexPath { get; set; } = "";
     public double IndexRate { get; set; } = 0.75;
+    public double Protect { get; set; } = 0.33;
+    public bool F0Smoothing { get; set; }
+    public Dictionary<string, ModelProfile> ModelProfiles { get; set; } = [];
     public double Pitch { get; set; }
     public double OutputGainDb { get; set; }
     public bool NoiseGateEnabled { get; set; }
@@ -54,4 +57,12 @@ internal sealed class UserSettings
         File.WriteAllText(temporary, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         File.Move(temporary, SettingsPath, overwrite: true);
     }
+}
+
+internal sealed class ModelProfile
+{
+    public string FeatureIndexPath { get; set; } = "";
+    public double IndexRate { get; set; } = 0.75;
+    public double Protect { get; set; } = 0.33;
+    public bool F0Smoothing { get; set; }
 }

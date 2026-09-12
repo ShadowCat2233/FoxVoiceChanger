@@ -95,6 +95,9 @@ public partial class MainWindow : Window
         F0Path.Text = _settings.F0Path;
         PitchSlider.Value = _settings.Pitch;
         OutputGainSlider.Value = _settings.OutputGainDb;
+        IndexRateSlider.Value = _settings.IndexRate;
+        ProtectSlider.Value = _settings.Protect;
+        F0SmoothingToggle.IsChecked = _settings.F0Smoothing;
         NoiseGateToggle.IsChecked = _settings.NoiseGateEnabled;
         GameGuardToggle.IsChecked = _settings.GameGuardEnabled;
         MonitorToggle.IsEnabled = false;
@@ -1198,9 +1201,14 @@ public partial class MainWindow : Window
 
     private void SelectModel(ModelItem? model, bool persist)
     {
+        if (_selectedModel is not null) SaveCurrentModelProfile();
         _selectedModel = model?.IsUsable == true ? model : null;
         ActiveModelText.Text = _selectedModel?.DisplayName ?? "尚未选择";
-        if (_selectedModel is not null) ModelsList.SelectedItem = _selectedModel;
+        if (_selectedModel is not null)
+        {
+            ModelsList.SelectedItem = _selectedModel;
+            ApplyCurrentModelProfile();
+        }
         if (persist)
         {
             _settings.SelectedModelId = _selectedModel?.Id ?? "";
@@ -1560,11 +1568,16 @@ public partial class MainWindow : Window
 
     private void AddFeatureIndexArguments(List<string> arguments)
     {
-        if (!File.Exists(_settings.FeatureIndexPath)) return;
+        var profile = _selectedModel is not null && _settings.ModelProfiles.TryGetValue(_selectedModel.Id, out var value)
+            ? value
+            : new ModelProfile { FeatureIndexPath = _settings.FeatureIndexPath, IndexRate = _settings.IndexRate, Protect = _settings.Protect };
+        if (!File.Exists(profile.FeatureIndexPath)) return;
         arguments.AddRange([
-            "--index", _settings.FeatureIndexPath,
-            "--index-rate", _settings.IndexRate.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
+            "--index", profile.FeatureIndexPath,
+            "--index-rate", profile.IndexRate.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture),
+            "--protect", profile.Protect.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
         ]);
+        if (profile.F0Smoothing) arguments.Add("--f0-smoothing");
     }
 
     private void StartAudioProcess(params string[] arguments)
@@ -2059,6 +2072,7 @@ public partial class MainWindow : Window
             _settings.Pitch = PitchSlider.Value;
             _settings.OutputGainDb = OutputGainSlider.Value;
             _settings.NoiseGateEnabled = NoiseGateToggle.IsChecked == true;
+            SaveCurrentModelProfile();
             _settings.GameGuardEnabled = GameGuardToggle.IsChecked == true;
             _settings.Save();
         }
@@ -2066,6 +2080,54 @@ public partial class MainWindow : Window
         {
             FooterStatus.Text = $"设置保存失败：{FriendlyError(error)}";
         }
+    }
+
+    private void ApplyCurrentModelProfile()
+    {
+        if (_selectedModel is null) return;
+        if (!_settings.ModelProfiles.TryGetValue(_selectedModel.Id, out var profile))
+        {
+            profile = new ModelProfile {
+                FeatureIndexPath = _settings.FeatureIndexPath,
+                IndexRate = _settings.IndexRate,
+                Protect = _settings.Protect,
+                F0Smoothing = _settings.F0Smoothing
+            };
+            _settings.ModelProfiles[_selectedModel.Id] = profile;
+        }
+        IndexRateSlider.Value = Math.Clamp(profile.IndexRate, 0, 1);
+        ProtectSlider.Value = Math.Clamp(profile.Protect, 0, 0.5);
+        F0SmoothingToggle.IsChecked = profile.F0Smoothing;
+        UpdateProfileLabels();
+    }
+
+    private void SaveCurrentModelProfile()
+    {
+        if (_selectedModel is null || !_ready) return;
+        _settings.ModelProfiles[_selectedModel.Id] = new ModelProfile {
+            FeatureIndexPath = _settings.FeatureIndexPath,
+            IndexRate = IndexRateSlider.Value,
+            Protect = ProtectSlider.Value,
+            F0Smoothing = F0SmoothingToggle.IsChecked == true
+        };
+        _settings.IndexRate = IndexRateSlider.Value;
+        _settings.Protect = ProtectSlider.Value;
+        _settings.F0Smoothing = F0SmoothingToggle.IsChecked == true;
+    }
+
+    private void ProfileControl_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_ready || _selectedModel is null) return;
+        UpdateProfileLabels();
+        SaveCurrentModelProfile();
+        TrySaveSettings();
+        FooterStatus.Text = "模型参数已保存；F0 平滑和索引参数将在下次启动引擎时生效";
+    }
+
+    private void UpdateProfileLabels()
+    {
+        if (IndexRateValueText is not null) IndexRateValueText.Text = IndexRateSlider.Value.ToString("0.00");
+        if (ProtectValueText is not null) ProtectValueText.Text = ProtectSlider.Value.ToString("0.00");
     }
 
     private async Task<string> RunSupervisorAsync(params string[] arguments)

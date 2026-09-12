@@ -772,6 +772,7 @@ fn run_engine(passthrough: bool) -> Result<()> {
         denoiser_mode: DenoiserMode::NoiseGate,
         ..RealtimeConfig::default()
     };
+    config.f0.postprocess.enabled = arguments.iter().any(|argument| argument == "--f0-smoothing");
     if !passthrough {
         config.model = Some(required_path(&arguments, "--model")?);
         config.embedder = Some(required_path(&arguments, "--embedder")?);
