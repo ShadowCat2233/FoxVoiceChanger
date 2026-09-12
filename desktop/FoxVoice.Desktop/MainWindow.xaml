@@ -33,11 +33,25 @@
         </Style>
         <Style TargetType="Slider"><Setter Property="Foreground" Value="{StaticResource AccentBrush}"/><Setter Property="VerticalAlignment" Value="Center"/></Style>
         <Style TargetType="ComboBox">
+            <Setter Property="OverridesDefaultStyle" Value="True"/>
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
             <Setter Property="Background" Value="#151B27"/>
             <Setter Property="BorderBrush" Value="#334158"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox">
+                <Grid>
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
+                        <Grid><ContentPresenter Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" VerticalAlignment="Center" Margin="0,0,22,0"/><Path Data="M 0 0 L 5 5 L 10 0" Stroke="{StaticResource TextSecondary}" StrokeThickness="1.5" HorizontalAlignment="Right" VerticalAlignment="Center"/></Grid>
+                    </Border>
+                    <ToggleButton Background="Transparent" BorderThickness="0" IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}" Focusable="False" Opacity="0"/>
+                    <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False">
+                        <Border Background="#151B27" BorderBrush="#334158" BorderThickness="1" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+                            <ScrollViewer MaxHeight="300"><ItemsPresenter/></ScrollViewer>
+                        </Border>
+                    </Popup>
+                </Grid>
+            </ControlTemplate></Setter.Value></Setter>
         </Style>
         <Style TargetType="ComboBoxItem">
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
