@@ -58,6 +58,23 @@
             <Setter Property="Background" Value="#151B27"/>
             <Setter Property="Padding" Value="10,7"/>
         </Style>
+        <Style TargetType="ScrollBar">
+            <Setter Property="Width" Value="10"/>
+            <Setter Property="Height" Value="10"/>
+            <Setter Property="Background" Value="#0A0D13"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ScrollBar">
+                <Grid Background="{TemplateBinding Background}">
+                    <Track x:Name="PART_Track" IsDirectionReversed="True">
+                        <Track.DecreaseRepeatButton><RepeatButton x:Name="DecreaseButton" Command="ScrollBar.PageUpCommand" Background="Transparent" BorderThickness="0" Focusable="False"/></Track.DecreaseRepeatButton>
+                        <Track.Thumb><Thumb x:Name="ScrollThumb" Background="#43516A" MinHeight="32"><Thumb.Template><ControlTemplate TargetType="Thumb"><Border x:Name="ThumbBorder" Background="{TemplateBinding Background}" CornerRadius="5" Margin="2"/><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ThumbBorder" Property="Background" Value="{StaticResource AccentBrush}"/></Trigger><Trigger Property="IsDragging" Value="True"><Setter TargetName="ThumbBorder" Property="Background" Value="#75EFCF"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+                        <Track.IncreaseRepeatButton><RepeatButton x:Name="IncreaseButton" Command="ScrollBar.PageDownCommand" Background="Transparent" BorderThickness="0" Focusable="False"/></Track.IncreaseRepeatButton>
+                    </Track>
+                </Grid>
+                <ControlTemplate.Triggers>
+                    <Trigger Property="Orientation" Value="Horizontal"><Setter Property="Height" Value="10"/><Setter Property="Width" Value="Auto"/><Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False"/><Setter TargetName="DecreaseButton" Property="Command" Value="ScrollBar.PageLeftCommand"/><Setter TargetName="IncreaseButton" Property="Command" Value="ScrollBar.PageRightCommand"/><Setter TargetName="ScrollThumb" Property="MinHeight" Value="0"/><Setter TargetName="ScrollThumb" Property="MinWidth" Value="32"/></Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate></Setter.Value></Setter>
+        </Style>
     </Window.Resources>
 
     <Grid>
