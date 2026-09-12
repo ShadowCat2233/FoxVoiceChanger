@@ -631,8 +631,13 @@ public partial class MainWindow : Window
         };
         _trainingProcess = process;
         SetTrainingButtons(true);
-        _trainingProgressText.Text = $"正在安装 {label} 训练环境";
+        var installButton = backend == "cuda" ? _installCudaTrainingButton : _installCpuTrainingButton;
+        var originalButtonText = installButton.Content;
+        installButton.Content = "正在下载并安装…";
+        _trainingProgressText.Text = $"正在准备 {label} 训练环境";
         _trainingProgress.IsIndeterminate = true;
+        FooterStatus.Text = $"正在准备 {label} 训练环境，请勿关闭 FoxVoice";
+        await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Render);
         try
         {
             process.Start();
@@ -641,7 +646,7 @@ public partial class MainWindow : Window
             while (await process.StandardError.ReadLineAsync() is { } line)
             {
                 if (line.StartsWith("FOXVOICE_TRAINING_STAGE="))
-                    FooterStatus.Text = line["FOXVOICE_TRAINING_STAGE=".Length..];
+                    UpdateTrainingStage(line["FOXVOICE_TRAINING_STAGE=".Length..]);
             }
             await process.WaitForExitAsync();
             var output = await outputTask;
@@ -654,12 +659,19 @@ public partial class MainWindow : Window
         {
             FooterStatus.Text = "训练组件安装已取消；下次安装会复用已下载内容";
         }
-        catch (Exception error) { FooterStatus.Text = FriendlyError(error); }
+        catch (Exception error)
+        {
+            var message = FriendlyError(error);
+            _trainingProgressText.Text = "训练环境安装失败";
+            FooterStatus.Text = message;
+            MessageBox.Show(this, message, "训练环境安装失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
         finally
         {
             if (ReferenceEquals(_trainingProcess, process)) _trainingProcess = null;
             process.Dispose();
             _trainingProgress.IsIndeterminate = false;
+            installButton.Content = originalButtonText;
             SetTrainingButtons(false);
         }
     }
@@ -723,7 +735,9 @@ public partial class MainWindow : Window
 
     private void UpdateTrainingStage(string stage)
     {
-        _trainingProgress.IsIndeterminate = false;
+        var numberedStage = stage.Length >= 3 && stage[1] == '/' && stage[2] == '4';
+        var terminalStage = stage.Contains("完成", StringComparison.Ordinal) || stage.Contains("失败", StringComparison.Ordinal);
+        _trainingProgress.IsIndeterminate = !numberedStage && !terminalStage;
         _trainingProgressText.Text = stage;
         _trainingProgress.Value = stage.StartsWith("1/4", StringComparison.Ordinal) ? 10
             : stage.StartsWith("2/4", StringComparison.Ordinal) ? 30
