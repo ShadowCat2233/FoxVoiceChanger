@@ -9,7 +9,7 @@
 
 - WASAPI 实时麦克风输入和虚拟声卡输出；
 - 标准 RVC v2 F0 ONNX 实时推理，支持 ContentVec、RMVPE 和 Generator 三模型自检；
-- 本地及 Hugging Face 模型导入、SHA-256 去重、授权确认和可恢复删除；
+- 本地及远程模型仓库导入、SHA-256 去重、授权确认和可恢复删除；
 - 每模型独立保存音高、索引混合率、清辅音保护和 F0 平滑设置；
 - `.index` 特征检索、离线 WAV 转换和音效板混音；
 - DirectML/Windows ML 后端，以及自检通过后启用的可选 TensorRT RTX 后端；
@@ -20,15 +20,15 @@
 ## 快速开始
 
 1. 从 [Releases](https://github.com/ShadowCat2233/FoxVoiceChanger/releases) 下载安装器或便携版。
-2. 安装 [VB-CABLE](https://vb-audio.com/Cable/) 或兼容虚拟音频设备。
-3. FoxVoice 输入选择物理麦克风，主输出选择 `CABLE Input`。
-4. KOOK、Discord 或游戏的麦克风选择 `CABLE Output`。
+2. 安装兼容的虚拟音频设备。
+3. FoxVoice 输入选择物理麦克风，主输出选择虚拟音频设备的播放端。
+4. 在语音聊天或游戏中，将麦克风设为该虚拟音频设备的录音端。
 5. 在“组件中心”安装并自检 RVC 基础模型。
 6. 导入你有权使用的标准 RVC v2 F0 模型，选择模型后启动变声。
 
 ```text
-物理麦克风 → FoxVoice → CABLE Input → CABLE Output → KOOK / Discord / 游戏
-                                      └→ 可选物理耳机监听
+物理麦克风 → FoxVoice → 虚拟播放端 → 虚拟录音端 → 语音聊天 / 游戏
+                                  └→ 可选物理耳机监听
 ```
 
 本地监听默认应关闭。需要监听时请选择独立物理耳机，避免重复监听、回声或扬声器啸叫。
@@ -72,15 +72,14 @@ CUDA 后端。选择包含 WAV/FLAC 的授权数据集后，程序会执行数�
 
 ## 当前限制
 
-- 尚未接入 Seed-VC 独立高质量引擎；
 - 不保证所有社区 RVC 模型都能兼容或获得理想音质；
-- 尚未完成覆盖所有游戏、KOOK/Discord 版本和 GPU 满载场景的系统性验收；
+- 尚未完成覆盖所有游戏、语音聊天软件版本和 GPU 满载场景的系统性验收；
 - TensorRT 仅在依赖、硬件和三模型真实推理自检全部通过后启用；
 - Windows 原生环境不提供 AMD ROCm 训练后端。
 
 ## 隐私与安全
 
-实时音频、模型和训练数据默认只在本机处理。设置保存在 `%LOCALAPPDATA%\FoxVoice`。Hugging Face
+实时音频、模型和训练数据默认只在本机处理。设置保存在 `%LOCALAPPDATA%\FoxVoice`。远程模型
 下载会在导入前进行地址、体积、哈希和模型结构检查。提交问题时请移除用户名、绝对路径、模型哈希及
 无权公开的音频或模型。
 
